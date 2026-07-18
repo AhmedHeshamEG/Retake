@@ -51,7 +51,15 @@ open project directly through the browser. It works after restarting Retake and
 shows a prompt to export first when no media export exists. Text exports such
 as EDL, CSV, TXT, and SRT are not selected.
 
-Edited preview uses native range-aware file delivery and seeks across cuts without pausing first. Cut jumps retry silently when decoding is briefly delayed. Safe local reads/autosaves retry transient connection failures; job-starting actions such as AI and export are never duplicated automatically.
+Edited preview uses native range-aware file delivery and seeks across cuts
+without pausing first. For high-bitrate 4K phone media, `Smooth Preview` can
+prepare a reusable 720p H.264/AAC proxy with NVIDIA decoding, scaling, and
+encoding. This is an explicit one-time job, remains valid when edits change, and
+automatically falls back to the original if proxy playback fails. The source and
+final export never use or depend on this disposable proxy. Cut jumps retry
+silently when decoding is briefly delayed. Safe local reads/autosaves retry
+transient connection failures; job-starting actions such as AI, preview
+preparation, and export are never duplicated automatically.
 
 Consecutive deleted words are composed as one continuous backend cut from the first deleted word's start to the last deleted word's end, even across sentence boundaries. This removes breaths, noise, and unreported timestamp holes inside deleted passages while a kept spoken word always splits the cut.
 

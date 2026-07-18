@@ -407,6 +407,7 @@ header{
           <div id="playerTime">00:00:00.000 / 00:00:00.000</div>
           <div class="playerActions">
             <button id="previewToggle" class="small" hidden>Preview: <b>edited</b></button>
+            <button id="smoothPreview" class="small" hidden>Smooth Preview: prepare</button>
             <button id="scrollToggle" class="small" hidden>Auto-scroll: on</button>
             <button id="fullscreenBtn" class="small" hidden>⛶ Fullscreen</button>
             <span class="spacer"></span>
@@ -547,6 +548,10 @@ const S = {
   lastClicked: null,        // token id anchor for shift-ranges
   sel: new Set(),           // last shift-range (X key target)
   edited: true,             // preview mode
+  smoothPreview: {
+    ready:false, running:false, active:false, gpuUsable:null, error:null,
+    activateWhenReady:false, generation:0, fallingBack:false,
+  },
   autoscroll: true,
   cutIvs: [], keeps: [],    // derived intervals
   transcriptCutIvs: [],     // authoritative backend-composed transcript cuts
@@ -1041,6 +1046,93 @@ $("gapWave").addEventListener("pointerup",finishGapDrag);$("gapWave").addEventLi
 
 /* ================================================================== preview */
 const player = $("player");
+function renderSmoothPreviewControl() {
+  const state = S.smoothPreview, button = $("smoothPreview");
+  if (!S.proj?.probe?.has_video) { button.hidden = true; return; }
+  button.hidden = false;
+  if (state.ready) {
+    button.disabled = false;
+    button.innerHTML = `Smooth Preview: <b>${state.active ? "on" : "off"}</b>`;
+    button.title = state.active ? "Using the reusable optimized preview" : "Use the optimized preview";
+  } else if (state.running) {
+    button.disabled = true;
+    button.textContent = "Smooth Preview: preparing…";
+    button.title = "The original preview remains usable while the GPU prepares this once";
+  } else if (state.gpuUsable === false) {
+    button.disabled = true;
+    button.textContent = "Smooth Preview: unavailable";
+    button.title = state.error || "An NVIDIA GPU with NVENC is required";
+  } else {
+    button.disabled = false;
+    button.textContent = state.error ? "Smooth Preview: retry" : "Smooth Preview: prepare";
+    button.title = state.error || "One-time GPU preparation; reusable across all edits";
+  }
+}
+function switchPlayerMedia(useProxy, preserveState = true) {
+  if (!S.proj) return;
+  const saved = {
+    time: preserveState && Number.isFinite(player.currentTime) ? player.currentTime : 0,
+    paused: preserveState ? player.paused : true,
+    muted: player.muted, volume: player.volume, rate: player.playbackRate,
+  };
+  const generation = ++S.smoothPreview.generation;
+  S.smoothPreview.active = !!useProxy;
+  clearSkipState();
+  player.addEventListener("loadedmetadata", () => {
+    if (generation !== S.smoothPreview.generation) return;
+    player.muted = saved.muted;
+    player.volume = saved.volume;
+    player.playbackRate = saved.rate;
+    if (saved.time > 0)
+      player.currentTime = Math.min(saved.time, Math.max(0, (player.duration || saved.time) - .01));
+    if (!saved.paused) player.play().catch(() => {});
+    S.smoothPreview.fallingBack = false;
+    renderSmoothPreviewControl();
+  }, {once:true});
+  player.src = (useProxy ? "/preview/media" : "/media") + "?v=" + Date.now();
+  player.load();
+  renderSmoothPreviewControl();
+}
+function applySmoothPreviewStatus(status, autoActivate = false) {
+  if (!status) return;
+  const state = S.smoothPreview;
+  state.ready = !!status.ready;
+  state.running = !!status.running;
+  state.gpuUsable = status.gpu_usable;
+  state.error = status.error || null;
+  if (status.state === "failed") state.activateWhenReady = false;
+  renderSmoothPreviewControl();
+  if (state.ready && !state.active && (autoActivate || state.activateWhenReady)) {
+    state.activateWhenReady = false;
+    switchPlayerMedia(true);
+  }
+}
+async function refreshSmoothPreview(autoActivate = false) {
+  try {
+    applySmoothPreviewStatus(await api("/preview/status"), autoActivate);
+  } catch (error) {
+    S.smoothPreview.error = error.message;
+    renderSmoothPreviewControl();
+  }
+}
+$("smoothPreview").addEventListener("click", async () => {
+  const state = S.smoothPreview;
+  if (state.ready) { switchPlayerMedia(!state.active); return; }
+  if (state.running || state.gpuUsable === false) return;
+  try {
+    await api("/preview/create", {});
+    state.running = true;
+    state.error = null;
+    state.activateWhenReady = true;
+    renderSmoothPreviewControl();
+    toast("GPU Smooth Preview preparation started. You can keep editing.");
+  } catch (error) {
+    state.activateWhenReady = false;
+    state.error = error.message;
+    renderSmoothPreviewControl();
+    toast(error.message, "warn");
+  }
+});
 function insideCut(t) {
   let lo = 0, hi = S.cutIvs.length - 1;
   while (lo <= hi) {
@@ -1125,6 +1217,13 @@ if (player.requestVideoFrameCallback) {
 }
 player.addEventListener("error", () => {
   clearSkipState();
+  if (S.smoothPreview.active && !S.smoothPreview.fallingBack) {
+    S.smoothPreview.fallingBack = true;
+    S.smoothPreview.activateWhenReady = false;
+    toast("Smooth Preview could not play, so the original preview was restored.", "warn");
+    switchPlayerMedia(false);
+    return;
+  }
   if (S.proj) {
     $("codecNotice").textContent = "The browser could not decode this media stream. Editing and export still work.";
     $("codecNotice").classList.add("on");
@@ -1587,6 +1686,12 @@ async function loadProject() {
   $("toolbar").hidden = false;
   $("workspace").hidden = false;
   $("previewToggle").hidden = false;
+  S.smoothPreview = {
+    ready:false, running:false, active:false, gpuUsable:null, error:null,
+    activateWhenReady:false, generation:S.smoothPreview.generation + 1,
+    fallingBack:false,
+  };
+  $("smoothPreview").hidden = !P.probe.has_video;
   $("scrollToggle").hidden = false;
   $("fullscreenBtn").hidden = !P.probe.has_video;
   $("pathInput").value = P.source_path;
@@ -1597,6 +1702,9 @@ async function loadProject() {
   $("codecNotice").classList.remove("on");
   clearSkipState();
   player.src = "/media?v=" + Date.now();
+  player.load();
+  renderSmoothPreviewControl();
+  await refreshSmoothPreview(true);
   showWelcome(false);
   initAI();
   toast(`loaded · ${P.segments.length} sentences · ${P.clusters.length} retake cluster${P.clusters.length===1?"":"s"}`);
@@ -1610,14 +1718,14 @@ function showWelcome(on) {
 /* ================================================================== polling */
 let wasPhase = "idle";
 function updateGlobalProgress(st) {
-  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","export"].includes(st.phase);
+  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","export","preview"].includes(st.phase);
   const bar = $("globalProgress"), fill = $("globalProgressFill"), label = $("globalProgressLabel");
   bar.classList.toggle("on", busy);
   const indeterminate = busy && (st.phase === "load_model" || Number(st.pct) <= 0);
   bar.classList.toggle("indeterminate", indeterminate);
   if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
   label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
-  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",export:"Exporting",ready:"Ready",idle:"Ready"};
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
   $("readyPill").textContent = phaseName[st.phase] || "Working";
   const exporting = st.phase === "export";
   document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
@@ -1628,6 +1736,7 @@ async function poll() {
   try {
     const st = await api("/status");
     updateGlobalProgress(st);
+    applySmoothPreviewStatus(st.preview);
     if (st.err_seq > S.errSeq) {
       S.errSeq = st.err_seq;
       if (st.error) toast(st.error, "error", 9000);
@@ -1658,7 +1767,7 @@ async function poll() {
       if (st.phase === "ready" && S.aiRunning) await aiFinished();
       wasPhase = st.phase;
     }
-    if (["export","ai","gaps"].includes(st.phase) && st.msg)
+    if (["export","ai","gaps","preview"].includes(st.phase) && st.msg)
       $("durations").title = `${st.msg} (${st.pct}%)`;
   } catch (_) { /* server briefly unreachable; keep polling */ }
   setTimeout(poll, 500);

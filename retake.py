@@ -78,6 +78,7 @@ AI_INSTRUCTION_MAX_CHARS = 50_000
 UPLOAD_CHUNK_MAX_BYTES = 2 * 1024 * 1024
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
+PREVIEW_PROXY_VERSION = 1
 
 # --------------------------------------------------------------------------
 # ffmpeg / ffprobe resolution
@@ -222,7 +223,8 @@ JOB_LOCK = threading.Lock()  # one heavy job at a time
 PROJECT_ALLOC_LOCK = threading.Lock()
 
 STATUS: dict[str, Any] = {
-    "phase": "idle",  # idle|probe|load_model|transcribe|cluster|ready|ai|export|error
+    # idle|probe|load_model|transcribe|cluster|ready|ai|export|preview|error
+    "phase": "idle",
     "pct": 0.0,
     "msg": "",
     "error": None,
@@ -235,6 +237,10 @@ AI_STATE: dict[str, Any] = {
     "running": False, "proposals": [], "warnings": [], "done": False, "mode": None,
 }
 LAST_EXPORT: dict[str, Any] = {"path": None, "warning": None}
+PREVIEW_STATE: dict[str, Any] = {
+    "running": False, "identity": None, "error": None,
+}
+_PREVIEW_GPU_USABLE: Optional[bool] = None
 
 
 def set_status(phase: str, pct: float = 0.0, msg: str = "", error: Optional[str] = None) -> None:
@@ -2117,7 +2123,12 @@ def _audio_codec_args(acodec: Optional[str]) -> list[str]:
     return AUDIO_CODEC_MAP.get(acodec or "", ["-c:a", "aac", "-b:a", "192k"])
 
 
-def _run_ffmpeg_with_progress(cmd: list[str], edited_duration: float, label: str) -> None:
+def _run_ffmpeg_with_progress(
+    cmd: list[str],
+    edited_duration: float,
+    label: str,
+    phase: str = "export",
+) -> None:
     """Run ffmpeg, parsing -progress pipe:1 into /status. Raises on failure."""
     proc = subprocess.Popen(
         cmd + ["-progress", "pipe:1", "-nostats"],
@@ -2131,7 +2142,7 @@ def _run_ffmpeg_with_progress(cmd: list[str], edited_duration: float, label: str
             try:
                 us = int(line.split("=", 1)[1])
                 pct = 5 + min(1.0, (us / 1e6) / max(0.01, edited_duration)) * 90
-                set_status("export", pct, label)
+                set_status(phase, pct, label)
             except ValueError:
                 pass
     proc.wait()
@@ -2164,6 +2175,284 @@ def _ffmpeg_encoder_usable(encoder: str) -> bool:
         "-an", "-c:v", encoder, "-f", "null", "-",
     ])
     return result.returncode == 0
+
+
+def preview_gpu_usable() -> bool:
+    """Cache a real NVENC device probe for the optional preview job."""
+    global _PREVIEW_GPU_USABLE
+    with _STATE_LOCK:
+        cached = _PREVIEW_GPU_USABLE
+    if cached is not None:
+        return cached
+    usable = _ffmpeg_encoder_usable("h264_nvenc")
+    with _STATE_LOCK:
+        _PREVIEW_GPU_USABLE = usable
+    return usable
+
+
+def preview_source_identity(source_path: str) -> dict[str, Any]:
+    source = Path(source_path).resolve()
+    stat = source.stat()
+    return {
+        "version": PREVIEW_PROXY_VERSION,
+        "source_name": source.name,
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def preview_proxy_paths(source_path: str) -> tuple[Path, Path, Path]:
+    """Return project-confined final, temporary, and metadata proxy paths."""
+    project_dir = project_directory_for_media(source_path)
+    if project_dir is None:
+        raise RuntimeError("preview folder is unavailable")
+    preview_dir = (project_dir / "preview").resolve()
+    preview_dir.relative_to(project_dir.resolve())
+    return (
+        preview_dir / "smooth-preview.mp4",
+        preview_dir / "smooth-preview.partial.mp4",
+        preview_dir / "smooth-preview.json",
+    )
+
+
+def preview_target_dimensions(properties: dict[str, Any]) -> tuple[int, int]:
+    """Even display dimensions fitted inside a 1280x720 orientation box."""
+    width, height = display_dimensions(properties)
+    if not width or not height:
+        raise RuntimeError("source dimensions are unavailable")
+    max_width, max_height = ((720, 1280) if height > width else (1280, 720))
+    scale = min(1.0, max_width / width, max_height / height)
+    target_width = max(2, int(width * scale) // 2 * 2)
+    target_height = max(2, int(height * scale) // 2 * 2)
+    return target_width, target_height
+
+
+def _preview_proxy_record(source_path: str) -> Optional[dict[str, Any]]:
+    """Validated lightweight discovery without probing media on every UI poll."""
+    try:
+        final, _partial, metadata = preview_proxy_paths(source_path)
+        if final.is_symlink() or metadata.is_symlink() or not final.is_file():
+            return None
+        stored = json.loads(metadata.read_text(encoding="utf-8"))
+        if stored.get("source") != preview_source_identity(source_path):
+            return None
+        stat = final.stat()
+        if (
+            int(stored.get("proxy_size", -1)) != stat.st_size
+            or int(stored.get("proxy_mtime_ns", -1)) != stat.st_mtime_ns
+        ):
+            return None
+        return {"path": final, "metadata": stored}
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _preview_proxy_artifacts_exist(source_path: str) -> bool:
+    try:
+        final, partial, metadata = preview_proxy_paths(source_path)
+        return final.exists() or partial.exists() or metadata.exists()
+    except (OSError, RuntimeError):
+        return False
+
+
+def preview_status_payload() -> dict[str, Any]:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        running = bool(PREVIEW_STATE["running"])
+        running_identity = PREVIEW_STATE["identity"]
+        error = PREVIEW_STATE["error"]
+    if proj is None:
+        return {
+            "state": "no_project", "ready": False, "running": False,
+            "gpu_usable": None, "error": None,
+        }
+
+    source_path = str(proj.get("source_path", ""))
+    try:
+        identity = preview_source_identity(source_path)
+    except (FileNotFoundError, OSError):
+        return {
+            "state": "unavailable", "ready": False, "running": False,
+            "gpu_usable": False, "error": "Source media is unavailable.",
+        }
+    record = _preview_proxy_record(source_path)
+    if record is not None:
+        stat = record["path"].stat()
+        return {
+            "state": "ready", "ready": True, "running": False,
+            "gpu_usable": True, "error": None, "size": stat.st_size,
+        }
+    if running and running_identity == identity:
+        return {
+            "state": "preparing", "ready": False, "running": True,
+            "gpu_usable": True, "error": None,
+        }
+    if not proj.get("probe", {}).get("has_video"):
+        return {
+            "state": "unavailable", "ready": False, "running": False,
+            "gpu_usable": False, "error": "Smooth Preview requires video media.",
+        }
+    if error and running_identity == identity:
+        return {
+            "state": "failed", "ready": False, "running": False,
+            "gpu_usable": preview_gpu_usable(), "error": str(error),
+        }
+    usable = preview_gpu_usable()
+    return {
+        "state": (
+            "stale" if usable and _preview_proxy_artifacts_exist(source_path)
+            else "absent" if usable else "unavailable"
+        ),
+        "ready": False, "running": False, "gpu_usable": usable,
+        "error": None if usable else "An NVIDIA GPU with NVENC is required.",
+    }
+
+
+def _preview_video_filter(
+    properties: dict[str, Any], target_width: int, target_height: int,
+) -> str:
+    """GPU scale in stored orientation, then normalize rotation if necessary."""
+    rotation = int(properties.get("rotation") or 0) % 360
+    stored_width, stored_height = (
+        (target_height, target_width) if rotation in (90, 270)
+        else (target_width, target_height)
+    )
+    filters = [f"scale_cuda=w={stored_width}:h={stored_height}:format=nv12"]
+    if rotation in (90, 270):
+        direction = "clock" if rotation == 90 else "cclock"
+        filters.extend(["hwdownload", "format=nv12", f"transpose={direction}"])
+    elif rotation == 180:
+        filters.extend(["hwdownload", "format=nv12", "hflip", "vflip"])
+    else:
+        # NVENC reliably accepts these downloaded NV12 frames on every tested
+        # FFmpeg build; direct CUDA-frame negotiation fails on some builds.
+        filters.extend(["hwdownload", "format=nv12"])
+    return ",".join(filters)
+
+
+def preview_proxy_command(proj: dict[str, Any], out: Path) -> list[str]:
+    # Saved projects created by older builds may not include rotation metadata.
+    # Probe the immutable source again so portrait media is never flattened wrong.
+    properties = probe_media(proj["source_path"])
+    target_width, target_height = preview_target_dimensions(properties)
+    fps = min(30.0, max(1.0, float(properties.get("fps") or 25.0)))
+    fps_fraction = Fraction(fps).limit_denominator(1001)
+    fps_expr = (
+        str(fps_fraction.numerator)
+        if fps_fraction.denominator == 1
+        else f"{fps_fraction.numerator}/{fps_fraction.denominator}"
+    )
+    keyframe_interval = max(1, round(fps * 0.5))
+    has_audio = bool(properties.get("audio_streams") or properties.get("acodec"))
+    audio_args = (
+        ["-map", "0:a:0", "-c:a", "aac", "-b:a", "96k",
+         "-af", "aresample=async=1:first_pts=0"]
+        if has_audio else ["-an"]
+    )
+    return [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-noautorotate", "-display_rotation", "0",
+        "-i", proj["source_path"],
+        "-map", "0:v:0", *audio_args,
+        "-vf", _preview_video_filter(properties, target_width, target_height),
+        "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
+        "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
+        "-rc", "vbr", "-cq", "24", "-b:v", "0",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
+        "-g", str(keyframe_interval), "-keyint_min", str(keyframe_interval),
+        "-sc_threshold", "0",
+        "-r", fps_expr, "-fps_mode", "cfr",
+        "-metadata:s:v:0", "rotate=0",
+        "-max_muxing_queue_size", "4096", "-shortest",
+        "-movflags", "+faststart", str(out),
+    ]
+
+
+def preview_proxy_integrity_errors(
+    source_path: str, output_path: str,
+) -> list[str]:
+    source = probe_media(source_path)
+    output = probe_media(output_path)
+    expected_width, expected_height = preview_target_dimensions(source)
+    expected_duration = float(source.get("duration_s") or 0.0)
+    expected_fps = min(30.0, max(1.0, float(source.get("fps") or 25.0)))
+    errors: list[str] = []
+    if output.get("vcodec") != "h264" or output.get("video_streams") != 1:
+        errors.append("proxy must contain exactly one H.264 video stream")
+    expected_audio = 1 if source.get("audio_streams") else 0
+    if output.get("audio_streams") != expected_audio:
+        errors.append(
+            f"audio stream count is {output.get('audio_streams')}, expected {expected_audio}"
+        )
+    if expected_audio and output.get("acodec") != "aac":
+        errors.append("proxy audio codec must be AAC")
+    if display_dimensions(output) != (expected_width, expected_height):
+        errors.append(
+            f"proxy display dimensions are {display_dimensions(output)}, "
+            f"expected {(expected_width, expected_height)}"
+        )
+    if int(output.get("rotation") or 0) % 360:
+        errors.append("proxy rotation metadata was not normalized")
+    actual_duration = float(output.get("duration_s") or 0.0)
+    if abs(actual_duration - expected_duration) > max(0.5, 3.0 / expected_fps):
+        errors.append(
+            f"proxy duration is {actual_duration:.3f}s, expected {expected_duration:.3f}s"
+        )
+    actual_fps = float(output.get("fps") or 0.0)
+    if actual_fps <= 0 or actual_fps > 30.01 or abs(actual_fps - expected_fps) > 0.01:
+        errors.append(f"proxy frame rate is {actual_fps:g}, expected {expected_fps:g}")
+    errors.extend(validate_video_timeline(output_path, expected_fps, expected_duration))
+    decode = _run([
+        FFMPEG, "-v", "error", "-i", output_path, "-t", "2",
+        "-map", "0:v:0", "-f", "null", "-",
+    ])
+    if decode.returncode != 0:
+        errors.append(f"proxy decode probe failed: {decode.stderr.strip()[-200:]}")
+    return errors
+
+
+def preview_proxy_job(proj: dict[str, Any], identity: dict[str, Any]) -> None:
+    final: Optional[Path] = None
+    partial: Optional[Path] = None
+    try:
+        final, partial, metadata = preview_proxy_paths(proj["source_path"])
+        final.parent.mkdir(parents=True, exist_ok=True)
+        partial.unlink(missing_ok=True)
+        set_status("preview", 3, "preparing GPU smooth preview")
+        command = preview_proxy_command(proj, partial)
+        _run_ffmpeg_with_progress(
+            command, float(proj["duration_s"]), "preparing GPU smooth preview",
+            phase="preview",
+        )
+        set_status("preview", 96, "verifying smooth preview")
+        errors = preview_proxy_integrity_errors(proj["source_path"], str(partial))
+        if errors:
+            raise RuntimeError("integrity check failed: " + " | ".join(errors))
+        os.replace(partial, final)
+        partial = None
+        stat = final.stat()
+        atomic_write_json(metadata, {
+            "source": identity,
+            "proxy_size": stat.st_size,
+            "proxy_mtime_ns": stat.st_mtime_ns,
+            "created_at": utc_now(),
+        })
+        with _STATE_LOCK:
+            PREVIEW_STATE.update(running=False, identity=identity, error=None)
+        set_status("ready", 100, "GPU smooth preview ready")
+        log.info("smooth preview ready: %s", final)
+    except Exception as exc:
+        if partial is not None:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove partial smooth preview: %s", partial)
+        with _STATE_LOCK:
+            PREVIEW_STATE.update(running=False, identity=identity, error=str(exc))
+        fail(f"smooth preview failed: {exc}")
+    finally:
+        JOB_LOCK.release()
 
 
 def _reliable_video_command(
@@ -2545,6 +2834,7 @@ def get_status() -> JSONResponse:
         s = dict(STATUS)
         s["has_project"] = CURRENT["project"] is not None
         s["export"] = dict(LAST_EXPORT)
+    s["preview"] = preview_status_payload()
     return JSONResponse(s)
 
 
@@ -2792,6 +3082,61 @@ def media(request: Request) -> Response:
     mime = MIME_EXTRA.get(ext) or mimetypes.guess_type(path)[0] or "application/octet-stream"
     return FileResponse(
         path, media_type=mime, headers={"Cache-Control": "no-cache"},
+        stat_result=os.stat(path),
+    )
+
+
+@app.get("/preview/status")
+def get_preview_status() -> JSONResponse:
+    return JSONResponse(preview_status_payload())
+
+
+@app.post("/preview/create")
+def create_preview_proxy() -> JSONResponse:
+    with _STATE_LOCK:
+        current = CURRENT["project"]
+        proj = dict(current) if current is not None else None
+    if proj is None:
+        return JSONResponse({"error": "Open a project first."}, status_code=404)
+    if not proj.get("probe", {}).get("has_video"):
+        return JSONResponse(
+            {"error": "Smooth Preview requires video media."}, status_code=400
+        )
+    try:
+        identity = preview_source_identity(proj["source_path"])
+    except (FileNotFoundError, OSError):
+        return JSONResponse({"error": "Source media is unavailable."}, status_code=404)
+    if _preview_proxy_record(proj["source_path"]) is not None:
+        return JSONResponse({"ok": True, "ready": True})
+    if not preview_gpu_usable():
+        return JSONResponse(
+            {"error": "An NVIDIA GPU with NVENC is required for Smooth Preview."},
+            status_code=409,
+        )
+    if not JOB_LOCK.acquire(blocking=False):
+        return JSONResponse({"error": "another job is running"}, status_code=409)
+    with _STATE_LOCK:
+        PREVIEW_STATE.update(running=True, identity=identity, error=None)
+    set_status("preview", 1, "starting GPU smooth preview")
+    threading.Thread(
+        target=preview_proxy_job, args=(proj, identity), daemon=True
+    ).start()
+    return JSONResponse({"ok": True, "ready": False})
+
+
+@app.api_route("/preview/media", methods=["GET", "HEAD"])
+def preview_media(request: Request) -> Response:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        source_path = str(proj.get("source_path", "")) if proj is not None else ""
+    if not source_path:
+        return JSONResponse({"error": "Open a project first."}, status_code=404)
+    record = _preview_proxy_record(source_path)
+    if record is None:
+        return JSONResponse({"error": "Smooth Preview is not ready."}, status_code=404)
+    path = record["path"]
+    return FileResponse(
+        path, media_type="video/mp4", headers={"Cache-Control": "no-cache"},
         stat_result=os.stat(path),
     )
 

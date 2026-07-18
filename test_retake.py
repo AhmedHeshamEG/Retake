@@ -433,6 +433,205 @@ def test_media_uses_native_http_range_delivery() -> None:
             retake.CURRENT.update(old_current)
 
 
+def _write_ready_preview(source: Path, payload: bytes = b"preview-data") -> Path:
+    final, _partial, metadata = retake.preview_proxy_paths(str(source))
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(payload)
+    stat = final.stat()
+    retake.atomic_write_json(metadata, {
+        "source": retake.preview_source_identity(str(source)),
+        "proxy_size": stat.st_size,
+        "proxy_mtime_ns": stat.st_mtime_ns,
+        "created_at": retake.utc_now(),
+    })
+    return final
+
+
+def test_preview_paths_and_identity_are_project_confined() -> None:
+    with temporary_project_root() as root:
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.mov"
+        source.write_bytes(b"source")
+        final, partial, metadata = retake.preview_proxy_paths(str(source))
+        for path in (final, partial, metadata):
+            path.resolve().relative_to(project_dir.resolve())
+            assert path.parent == project_dir / "preview"
+        before = retake.preview_source_identity(str(source))
+        source.write_bytes(b"changed-source")
+        after = retake.preview_source_identity(str(source))
+        assert before != after
+        assert before["version"] == retake.PREVIEW_PROXY_VERSION
+        assert project_dir.parent == root
+
+
+def test_preview_command_uses_gpu_seek_optimized_browser_media() -> None:
+    properties = {
+        "duration_s": 60.0, "vcodec": "h264", "acodec": "aac",
+        "has_video": True, "fps": 60.0, "width": 3840, "height": 2160,
+        "rotation": 90, "video_streams": 1, "audio_streams": 1,
+    }
+    old_ffmpeg, old_probe = retake.FFMPEG, retake.probe_media
+    try:
+        retake.FFMPEG = "ffmpeg"
+        retake.probe_media = lambda _path: properties
+        command = retake.preview_proxy_command(
+            {"source_path": "phone.MOV", "probe": properties}, Path("proxy.mp4")
+        )
+        joined = " ".join(command)
+        assert "-hwaccel cuda -hwaccel_output_format cuda" in joined
+        assert "-noautorotate -display_rotation 0" in joined
+        assert "scale_cuda=w=1280:h=720:format=nv12" in joined
+        assert "hwdownload,format=nv12,transpose=clock" in joined
+        assert "-c:v h264_nvenc" in joined and "-cq 24" in joined
+        assert "-c:a aac -b:a 96k" in joined
+        assert "-r 30 -fps_mode cfr" in joined
+        assert "-g 15 -keyint_min 15" in joined
+        assert "-pix_fmt yuv420p" in joined and "-movflags +faststart" in joined
+        assert retake.preview_target_dimensions(properties) == (720, 1280)
+        assert retake._preview_video_filter(
+            {**properties, "rotation": 0}, 1280, 720
+        ).endswith("hwdownload,format=nv12")
+    finally:
+        retake.FFMPEG, retake.probe_media = old_ffmpeg, old_probe
+
+
+def test_preview_status_and_media_delivery_reject_stale_proxy() -> None:
+    old_current = dict(retake.CURRENT)
+    old_preview = dict(retake.PREVIEW_STATE)
+    old_gpu = retake._PREVIEW_GPU_USABLE
+    with temporary_project_root():
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.mov"
+        source.write_bytes(b"source")
+        project = {
+            "source_path": str(source), "probe": {"has_video": True},
+            "duration_s": 10.0,
+        }
+        try:
+            retake.CURRENT.update(
+                project=project, media_path=str(source), project_dir=str(project_dir),
+                source_filename=source.name,
+            )
+            retake.PREVIEW_STATE.update(running=False, identity=None, error=None)
+            retake._PREVIEW_GPU_USABLE = True
+            client = TestClient(app)
+            absent = client.get("/preview/status")
+            assert absent.status_code == 200 and absent.json()["state"] == "absent"
+            assert client.get("/preview/media").status_code == 404
+
+            final = _write_ready_preview(source)
+            ready = client.get("/preview/status").json()
+            assert ready["state"] == "ready" and ready["size"] == final.stat().st_size
+            middle = client.get("/preview/media", headers={"Range": "bytes=2-6"})
+            assert middle.status_code == 206 and middle.content == b"eview"
+            assert middle.headers["content-type"].startswith("video/mp4")
+            head = client.head("/preview/media")
+            assert head.status_code == 200 and head.content == b""
+
+            source.write_bytes(b"source changed")
+            assert client.get("/preview/status").json()["state"] == "stale"
+            assert client.get("/preview/media").status_code == 404
+        finally:
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.PREVIEW_STATE.clear()
+            retake.PREVIEW_STATE.update(old_preview)
+            retake._PREVIEW_GPU_USABLE = old_gpu
+
+
+def test_preview_create_requires_gpu_and_respects_heavy_job_lock() -> None:
+    old_current = dict(retake.CURRENT)
+    old_preview = dict(retake.PREVIEW_STATE)
+    old_gpu = retake._PREVIEW_GPU_USABLE
+    with temporary_project_root():
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.mov"
+        source.write_bytes(b"source")
+        try:
+            retake.CURRENT.update(
+                project={
+                    "source_path": str(source), "probe": {"has_video": True},
+                    "duration_s": 10.0,
+                },
+                media_path=str(source), project_dir=str(project_dir),
+                source_filename=source.name,
+            )
+            retake.PREVIEW_STATE.update(running=False, identity=None, error=None)
+            client = TestClient(app)
+            retake._PREVIEW_GPU_USABLE = False
+            unavailable = client.post("/preview/create")
+            assert unavailable.status_code == 409
+            assert "NVIDIA GPU" in unavailable.json()["error"]
+
+            retake._PREVIEW_GPU_USABLE = True
+            assert retake.JOB_LOCK.acquire(blocking=False)
+            try:
+                busy = client.post("/preview/create")
+                assert busy.status_code == 409
+                assert busy.json()["error"] == "another job is running"
+            finally:
+                retake.JOB_LOCK.release()
+        finally:
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.PREVIEW_STATE.clear()
+            retake.PREVIEW_STATE.update(old_preview)
+            retake._PREVIEW_GPU_USABLE = old_gpu
+
+
+def test_preview_job_publishes_atomically_after_validation() -> None:
+    old_current = dict(retake.CURRENT)
+    old_preview = dict(retake.PREVIEW_STATE)
+    old_status = dict(retake.STATUS)
+    old_command = retake.preview_proxy_command
+    old_progress = retake._run_ffmpeg_with_progress
+    old_integrity = retake.preview_proxy_integrity_errors
+    with temporary_project_root():
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.mov"
+        source.write_bytes(b"source")
+        project = {
+            "source_path": str(source), "duration_s": 10.0,
+            "probe": {"has_video": True},
+        }
+        identity = retake.preview_source_identity(str(source))
+        try:
+            retake.CURRENT.update(
+                project=project, media_path=str(source), project_dir=str(project_dir),
+                source_filename=source.name,
+            )
+            retake.PREVIEW_STATE.update(running=True, identity=identity, error=None)
+            retake.preview_proxy_command = (
+                lambda _proj, out: ["fake-ffmpeg", str(out)]
+            )
+
+            def fake_progress(command, *_args, **_kwargs):
+                Path(command[-1]).write_bytes(b"verified-proxy")
+
+            retake._run_ffmpeg_with_progress = fake_progress
+            retake.preview_proxy_integrity_errors = lambda *_: []
+            assert retake.JOB_LOCK.acquire(blocking=False)
+            retake.preview_proxy_job(project, identity)
+            final, partial, _metadata = retake.preview_proxy_paths(str(source))
+            assert final.read_bytes() == b"verified-proxy"
+            assert not partial.exists()
+            assert retake._preview_proxy_record(str(source)) is not None
+            assert retake.PREVIEW_STATE["running"] is False
+            assert retake.STATUS["phase"] == "ready"
+        finally:
+            if retake.JOB_LOCK.locked():
+                retake.JOB_LOCK.release()
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.PREVIEW_STATE.clear()
+            retake.PREVIEW_STATE.update(old_preview)
+            retake.STATUS.clear()
+            retake.STATUS.update(old_status)
+            retake.preview_proxy_command = old_command
+            retake._run_ffmpeg_with_progress = old_progress
+            retake.preview_proxy_integrity_errors = old_integrity
+
+
 def test_real_project_folders_increment_without_hashes() -> None:
     with temporary_project_root() as root:
         one = retake.next_project_directory()
@@ -480,6 +679,19 @@ def test_preview_has_single_flight_seek_controller() -> None:
     assert "function armCutSeekRecovery()" in html
     assert "skipState.retries < 2" in html
     assert "skipState.wasPlaying = !player.paused; skipState.retries = 0;\n  player.currentTime = target;" in html
+
+
+def test_gpu_smooth_preview_ui_only_switches_backend_media_sources() -> None:
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert 'id="smoothPreview"' in html
+    assert 'await api("/preview/create", {})' in html
+    assert 'api("/preview/status")' in html
+    assert 'useProxy ? "/preview/media" : "/media"' in html
+    assert "function switchPlayerMedia(useProxy, preserveState = true)" in html
+    assert "muted: player.muted, volume: player.volume, rate: player.playbackRate" in html
+    assert "player.currentTime = Math.min(saved.time" in html
+    assert "Smooth Preview could not play, so the original preview was restored." in html
+    assert 'preview:"Smooth Preview"' in html
 
 
 def test_safe_api_calls_retry_but_side_effecting_jobs_do_not() -> None:
