@@ -550,7 +550,8 @@ const S = {
   edited: true,             // preview mode
   smoothPreview: {
     ready:false, running:false, active:false, gpuUsable:null, error:null,
-    activateWhenReady:false, generation:0, fallingBack:false,
+    device:null, fallback:false, activateWhenReady:false, generation:0,
+    fallingBack:false,
   },
   autoscroll: true,
   cutIvs: [], keeps: [],    // derived intervals
@@ -1057,15 +1058,13 @@ function renderSmoothPreviewControl() {
   } else if (state.running) {
     button.disabled = true;
     button.textContent = "Smooth Preview: preparing…";
-    button.title = "The original preview remains usable while the GPU prepares this once";
-  } else if (state.gpuUsable === false) {
-    button.disabled = true;
-    button.textContent = "Smooth Preview: unavailable";
-    button.title = state.error || "An NVIDIA GPU with NVENC is required";
+    button.title = state.fallback
+      ? "GPU was unavailable; preparing once on the CPU fallback"
+      : "The original preview remains usable while the GPU prepares this once";
   } else {
     button.disabled = false;
     button.textContent = state.error ? "Smooth Preview: retry" : "Smooth Preview: prepare";
-    button.title = state.error || "One-time GPU preparation; reusable across all edits";
+    button.title = state.error || "One-time preparation: GPU first, CPU fallback";
   }
 }
 function switchPlayerMedia(useProxy, preserveState = true) {
@@ -1099,6 +1098,8 @@ function applySmoothPreviewStatus(status, autoActivate = false) {
   state.ready = !!status.ready;
   state.running = !!status.running;
   state.gpuUsable = status.gpu_usable;
+  state.fallback = !!status.fallback;
+  state.device = status.device || null;
   state.error = status.error || null;
   if (status.state === "failed") state.activateWhenReady = false;
   renderSmoothPreviewControl();
@@ -1118,14 +1119,14 @@ async function refreshSmoothPreview(autoActivate = false) {
 $("smoothPreview").addEventListener("click", async () => {
   const state = S.smoothPreview;
   if (state.ready) { switchPlayerMedia(!state.active); return; }
-  if (state.running || state.gpuUsable === false) return;
+  if (state.running) return;
   try {
     await api("/preview/create", {});
     state.running = true;
     state.error = null;
     state.activateWhenReady = true;
     renderSmoothPreviewControl();
-    toast("GPU Smooth Preview preparation started. You can keep editing.");
+    toast("Smooth Preview preparation started (GPU first, CPU fallback). You can keep editing.");
   } catch (error) {
     state.activateWhenReady = false;
     state.error = error.message;

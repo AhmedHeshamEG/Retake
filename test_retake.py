@@ -4,6 +4,7 @@ Run with:  python test_retake.py   (or pytest test_retake.py)
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -464,7 +465,7 @@ def test_preview_paths_and_identity_are_project_confined() -> None:
         assert project_dir.parent == root
 
 
-def test_preview_command_uses_gpu_seek_optimized_browser_media() -> None:
+def test_preview_commands_use_correct_rotation_and_gpu_first_formats() -> None:
     properties = {
         "duration_s": 60.0, "vcodec": "h264", "acodec": "aac",
         "has_video": True, "fps": 60.0, "width": 3840, "height": 2160,
@@ -475,13 +476,14 @@ def test_preview_command_uses_gpu_seek_optimized_browser_media() -> None:
         retake.FFMPEG = "ffmpeg"
         retake.probe_media = lambda _path: properties
         command = retake.preview_proxy_command(
-            {"source_path": "phone.MOV", "probe": properties}, Path("proxy.mp4")
+            {"source_path": "phone.MOV", "probe": properties}, Path("proxy.mp4"),
+            device="gpu",
         )
         joined = " ".join(command)
         assert "-hwaccel cuda -hwaccel_output_format cuda" in joined
         assert "-noautorotate -display_rotation 0" in joined
         assert "scale_cuda=w=1280:h=720:format=nv12" in joined
-        assert "hwdownload,format=nv12,transpose=clock" in joined
+        assert "hwdownload,format=nv12,transpose=cclock" in joined
         assert "-c:v h264_nvenc" in joined and "-cq 24" in joined
         assert "-c:a aac -b:a 96k" in joined
         assert "-r 30 -fps_mode cfr" in joined
@@ -489,8 +491,22 @@ def test_preview_command_uses_gpu_seek_optimized_browser_media() -> None:
         assert "-pix_fmt yuv420p" in joined and "-movflags +faststart" in joined
         assert retake.preview_target_dimensions(properties) == (720, 1280)
         assert retake._preview_video_filter(
-            {**properties, "rotation": 0}, 1280, 720
+            {**properties, "rotation": 0}, 1280, 720, device="gpu"
         ).endswith("hwdownload,format=nv12")
+        assert retake._preview_video_filter(
+            {**properties, "rotation": 270}, 720, 1280, device="gpu"
+        ).endswith("transpose=clock")
+
+        cpu = retake.preview_proxy_command(
+            {"source_path": "phone.MOV", "probe": properties},
+            Path("proxy.mp4"), device="cpu",
+        )
+        cpu_joined = " ".join(cpu)
+        assert "-hwaccel" not in cpu
+        assert "scale=w=1280:h=720:flags=fast_bilinear" in cpu_joined
+        assert "transpose=cclock" in cpu_joined
+        assert "-c:v libx264 -preset veryfast -crf 25" in cpu_joined
+        assert "-pix_fmt yuv420p" in cpu_joined
     finally:
         retake.FFMPEG, retake.probe_media = old_ffmpeg, old_probe
 
@@ -539,7 +555,7 @@ def test_preview_status_and_media_delivery_reject_stale_proxy() -> None:
             retake._PREVIEW_GPU_USABLE = old_gpu
 
 
-def test_preview_create_requires_gpu_and_respects_heavy_job_lock() -> None:
+def test_preview_create_allows_cpu_fallback_and_respects_heavy_job_lock() -> None:
     old_current = dict(retake.CURRENT)
     old_preview = dict(retake.PREVIEW_STATE)
     old_gpu = retake._PREVIEW_GPU_USABLE
@@ -559,11 +575,6 @@ def test_preview_create_requires_gpu_and_respects_heavy_job_lock() -> None:
             retake.PREVIEW_STATE.update(running=False, identity=None, error=None)
             client = TestClient(app)
             retake._PREVIEW_GPU_USABLE = False
-            unavailable = client.post("/preview/create")
-            assert unavailable.status_code == 409
-            assert "NVIDIA GPU" in unavailable.json()["error"]
-
-            retake._PREVIEW_GPU_USABLE = True
             assert retake.JOB_LOCK.acquire(blocking=False)
             try:
                 busy = client.post("/preview/create")
@@ -602,7 +613,7 @@ def test_preview_job_publishes_atomically_after_validation() -> None:
             )
             retake.PREVIEW_STATE.update(running=True, identity=identity, error=None)
             retake.preview_proxy_command = (
-                lambda _proj, out: ["fake-ffmpeg", str(out)]
+                lambda _proj, out, device="gpu": ["fake-ffmpeg", device, str(out)]
             )
 
             def fake_progress(command, *_args, **_kwargs):
@@ -617,6 +628,8 @@ def test_preview_job_publishes_atomically_after_validation() -> None:
             assert not partial.exists()
             assert retake._preview_proxy_record(str(source)) is not None
             assert retake.PREVIEW_STATE["running"] is False
+            assert retake.PREVIEW_STATE["device"] == "gpu"
+            assert retake.PREVIEW_STATE["fallback"] is False
             assert retake.STATUS["phase"] == "ready"
         finally:
             if retake.JOB_LOCK.locked():
@@ -627,6 +640,67 @@ def test_preview_job_publishes_atomically_after_validation() -> None:
             retake.PREVIEW_STATE.update(old_preview)
             retake.STATUS.clear()
             retake.STATUS.update(old_status)
+            retake.preview_proxy_command = old_command
+            retake._run_ffmpeg_with_progress = old_progress
+            retake.preview_proxy_integrity_errors = old_integrity
+
+
+def test_preview_job_retries_once_on_cpu_after_gpu_failure() -> None:
+    old_preview = dict(retake.PREVIEW_STATE)
+    old_status = dict(retake.STATUS)
+    old_gpu = retake._PREVIEW_GPU_USABLE
+    old_command = retake.preview_proxy_command
+    old_progress = retake._run_ffmpeg_with_progress
+    old_integrity = retake.preview_proxy_integrity_errors
+    with temporary_project_root():
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.mov"
+        source.write_bytes(b"source")
+        project = {
+            "source_path": str(source), "duration_s": 10.0,
+            "probe": {"has_video": True},
+        }
+        identity = retake.preview_source_identity(str(source))
+        devices: list[str] = []
+        try:
+            retake._PREVIEW_GPU_USABLE = True
+            retake.PREVIEW_STATE.update(
+                running=True, identity=identity, error=None,
+                device=None, fallback=False,
+            )
+            retake.preview_proxy_command = (
+                lambda _proj, out, device="gpu": ["fake-ffmpeg", device, str(out)]
+            )
+
+            def fake_progress(command, *_args, **_kwargs):
+                device = command[1]
+                devices.append(device)
+                if device == "gpu":
+                    Path(command[-1]).write_bytes(b"failed-gpu-partial")
+                    raise RuntimeError("simulated CUDA failure")
+                Path(command[-1]).write_bytes(b"verified-cpu-proxy")
+
+            retake._run_ffmpeg_with_progress = fake_progress
+            retake.preview_proxy_integrity_errors = lambda *_: []
+            assert retake.JOB_LOCK.acquire(blocking=False)
+            retake.preview_proxy_job(project, identity)
+            final, partial, metadata = retake.preview_proxy_paths(str(source))
+            assert devices == ["gpu", "cpu"]
+            assert final.read_bytes() == b"verified-cpu-proxy"
+            assert not partial.exists()
+            assert retake.PREVIEW_STATE["device"] == "cpu"
+            assert retake.PREVIEW_STATE["fallback"] is True
+            saved = json.loads(metadata.read_text(encoding="utf-8"))
+            assert saved["device"] == "cpu"
+            assert saved["fallback"] is True
+        finally:
+            if retake.JOB_LOCK.locked():
+                retake.JOB_LOCK.release()
+            retake.PREVIEW_STATE.clear()
+            retake.PREVIEW_STATE.update(old_preview)
+            retake.STATUS.clear()
+            retake.STATUS.update(old_status)
+            retake._PREVIEW_GPU_USABLE = old_gpu
             retake.preview_proxy_command = old_command
             retake._run_ffmpeg_with_progress = old_progress
             retake.preview_proxy_integrity_errors = old_integrity

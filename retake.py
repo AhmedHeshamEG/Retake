@@ -78,7 +78,7 @@ AI_INSTRUCTION_MAX_CHARS = 50_000
 UPLOAD_CHUNK_MAX_BYTES = 2 * 1024 * 1024
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
-PREVIEW_PROXY_VERSION = 1
+PREVIEW_PROXY_VERSION = 2
 
 # --------------------------------------------------------------------------
 # ffmpeg / ffprobe resolution
@@ -239,6 +239,7 @@ AI_STATE: dict[str, Any] = {
 LAST_EXPORT: dict[str, Any] = {"path": None, "warning": None}
 PREVIEW_STATE: dict[str, Any] = {
     "running": False, "identity": None, "error": None,
+    "device": None, "fallback": False,
 }
 _PREVIEW_GPU_USABLE: Optional[bool] = None
 
@@ -2261,6 +2262,8 @@ def preview_status_payload() -> dict[str, Any]:
         running = bool(PREVIEW_STATE["running"])
         running_identity = PREVIEW_STATE["identity"]
         error = PREVIEW_STATE["error"]
+        active_device = PREVIEW_STATE.get("device")
+        fallback = bool(PREVIEW_STATE.get("fallback"))
     if proj is None:
         return {
             "state": "no_project", "ready": False, "running": False,
@@ -2280,12 +2283,15 @@ def preview_status_payload() -> dict[str, Any]:
         stat = record["path"].stat()
         return {
             "state": "ready", "ready": True, "running": False,
-            "gpu_usable": True, "error": None, "size": stat.st_size,
+            "gpu_usable": preview_gpu_usable(), "error": None, "size": stat.st_size,
+            "device": record["metadata"].get("device"),
+            "fallback": bool(record["metadata"].get("fallback")),
         }
     if running and running_identity == identity:
         return {
             "state": "preparing", "ready": False, "running": True,
-            "gpu_usable": True, "error": None,
+            "gpu_usable": preview_gpu_usable(), "error": None,
+            "device": active_device, "fallback": fallback,
         }
     if not proj.get("probe", {}).get("has_video"):
         return {
@@ -2300,37 +2306,54 @@ def preview_status_payload() -> dict[str, Any]:
     usable = preview_gpu_usable()
     return {
         "state": (
-            "stale" if usable and _preview_proxy_artifacts_exist(source_path)
-            else "absent" if usable else "unavailable"
+            "stale" if _preview_proxy_artifacts_exist(source_path) else "absent"
         ),
         "ready": False, "running": False, "gpu_usable": usable,
-        "error": None if usable else "An NVIDIA GPU with NVENC is required.",
+        "error": None, "device": None, "fallback": not usable,
     }
 
 
 def _preview_video_filter(
     properties: dict[str, Any], target_width: int, target_height: int,
+    device: str = "gpu",
 ) -> str:
-    """GPU scale in stored orientation, then normalize rotation if necessary."""
+    """Scale in stored orientation, then normalize FFmpeg display rotation."""
     rotation = int(properties.get("rotation") or 0) % 360
     stored_width, stored_height = (
         (target_height, target_width) if rotation in (90, 270)
         else (target_width, target_height)
     )
-    filters = [f"scale_cuda=w={stored_width}:h={stored_height}:format=nv12"]
-    if rotation in (90, 270):
-        direction = "clock" if rotation == 90 else "cclock"
-        filters.extend(["hwdownload", "format=nv12", f"transpose={direction}"])
-    elif rotation == 180:
-        filters.extend(["hwdownload", "format=nv12", "hflip", "vflip"])
+    if device == "gpu":
+        filters = [f"scale_cuda=w={stored_width}:h={stored_height}:format=nv12"]
+    elif device == "cpu":
+        filters = [
+            f"scale=w={stored_width}:h={stored_height}:flags=fast_bilinear",
+            "format=nv12",
+        ]
     else:
+        raise ValueError(f"unknown preview device: {device}")
+    if rotation in (90, 270):
+        # FFprobe display-matrix rotation has the opposite sign from FFmpeg's
+        # transpose filter. This mapping was verified against decoded source
+        # frames, not inferred from dimensions alone.
+        direction = "cclock" if rotation == 90 else "clock"
+        if device == "gpu":
+            filters.extend(["hwdownload", "format=nv12"])
+        filters.append(f"transpose={direction}")
+    elif rotation == 180:
+        if device == "gpu":
+            filters.extend(["hwdownload", "format=nv12"])
+        filters.extend(["hflip", "vflip"])
+    elif device == "gpu":
         # NVENC reliably accepts these downloaded NV12 frames on every tested
         # FFmpeg build; direct CUDA-frame negotiation fails on some builds.
         filters.extend(["hwdownload", "format=nv12"])
     return ",".join(filters)
 
 
-def preview_proxy_command(proj: dict[str, Any], out: Path) -> list[str]:
+def preview_proxy_command(
+    proj: dict[str, Any], out: Path, device: str = "gpu",
+) -> list[str]:
     # Saved projects created by older builds may not include rotation metadata.
     # Probe the immutable source again so portrait media is never flattened wrong.
     properties = probe_media(proj["source_path"])
@@ -2349,16 +2372,30 @@ def preview_proxy_command(proj: dict[str, Any], out: Path) -> list[str]:
          "-af", "aresample=async=1:first_pts=0"]
         if has_audio else ["-an"]
     )
+    if device == "gpu":
+        input_args = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        video_args = [
+            "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
+            "-rc", "vbr", "-cq", "24", "-b:v", "0",
+        ]
+    elif device == "cpu":
+        input_args = []
+        video_args = [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
+        ]
+    else:
+        raise ValueError(f"unknown preview device: {device}")
     return [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        *input_args,
         "-noautorotate", "-display_rotation", "0",
         "-i", proj["source_path"],
         "-map", "0:v:0", *audio_args,
-        "-vf", _preview_video_filter(properties, target_width, target_height),
+        "-vf", _preview_video_filter(
+            properties, target_width, target_height, device=device
+        ),
         "-map_metadata", "-1", "-map_chapters", "-1", "-sn", "-dn",
-        "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
-        "-rc", "vbr", "-cq", "24", "-b:v", "0",
+        *video_args,
         "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-g", str(keyframe_interval), "-keyint_min", str(keyframe_interval),
         "-sc_threshold", "0",
@@ -2418,30 +2455,73 @@ def preview_proxy_job(proj: dict[str, Any], identity: dict[str, Any]) -> None:
     try:
         final, partial, metadata = preview_proxy_paths(proj["source_path"])
         final.parent.mkdir(parents=True, exist_ok=True)
-        partial.unlink(missing_ok=True)
-        set_status("preview", 3, "preparing GPU smooth preview")
-        command = preview_proxy_command(proj, partial)
-        _run_ffmpeg_with_progress(
-            command, float(proj["duration_s"]), "preparing GPU smooth preview",
-            phase="preview",
-        )
-        set_status("preview", 96, "verifying smooth preview")
-        errors = preview_proxy_integrity_errors(proj["source_path"], str(partial))
-        if errors:
-            raise RuntimeError("integrity check failed: " + " | ".join(errors))
+        attempts = ["gpu", "cpu"] if preview_gpu_usable() else ["cpu"]
+        attempt_errors: list[str] = []
+        selected_device: Optional[str] = None
+        for device in attempts:
+            partial.unlink(missing_ok=True)
+            fallback = device == "cpu"
+            with _STATE_LOCK:
+                PREVIEW_STATE.update(device=device, fallback=fallback)
+            label = (
+                "preparing GPU smooth preview"
+                if device == "gpu"
+                else "preparing smooth preview on CPU fallback"
+            )
+            try:
+                set_status("preview", 3, label)
+                command = preview_proxy_command(proj, partial, device=device)
+                _run_ffmpeg_with_progress(
+                    command, float(proj["duration_s"]), label, phase="preview",
+                )
+                set_status("preview", 96, f"verifying {device.upper()} smooth preview")
+                errors = preview_proxy_integrity_errors(
+                    proj["source_path"], str(partial)
+                )
+                if errors:
+                    raise RuntimeError(
+                        "integrity check failed: " + " | ".join(errors)
+                    )
+                selected_device = device
+                break
+            except Exception as attempt_error:
+                attempt_errors.append(f"{device}: {attempt_error}")
+                partial.unlink(missing_ok=True)
+                if device == "gpu":
+                    log.warning(
+                        "GPU smooth preview failed; retrying on CPU: %s",
+                        attempt_error,
+                    )
+                    continue
+                raise RuntimeError(" | ".join(attempt_errors)) from attempt_error
+        if selected_device is None:
+            raise RuntimeError(" | ".join(attempt_errors) or "no preview device")
         os.replace(partial, final)
         partial = None
         stat = final.stat()
+        fallback = selected_device == "cpu"
         atomic_write_json(metadata, {
             "source": identity,
             "proxy_size": stat.st_size,
             "proxy_mtime_ns": stat.st_mtime_ns,
             "created_at": utc_now(),
+            "device": selected_device,
+            "fallback": fallback,
         })
         with _STATE_LOCK:
-            PREVIEW_STATE.update(running=False, identity=identity, error=None)
-        set_status("ready", 100, "GPU smooth preview ready")
-        log.info("smooth preview ready: %s", final)
+            PREVIEW_STATE.update(
+                running=False, identity=identity, error=None,
+                device=selected_device, fallback=fallback,
+            )
+        set_status(
+            "ready", 100,
+            (
+                "GPU smooth preview ready"
+                if selected_device == "gpu"
+                else "smooth preview ready on CPU fallback"
+            ),
+        )
+        log.info("smooth preview ready on %s: %s", selected_device, final)
     except Exception as exc:
         if partial is not None:
             try:
@@ -3108,16 +3188,22 @@ def create_preview_proxy() -> JSONResponse:
         return JSONResponse({"error": "Source media is unavailable."}, status_code=404)
     if _preview_proxy_record(proj["source_path"]) is not None:
         return JSONResponse({"ok": True, "ready": True})
-    if not preview_gpu_usable():
-        return JSONResponse(
-            {"error": "An NVIDIA GPU with NVENC is required for Smooth Preview."},
-            status_code=409,
-        )
     if not JOB_LOCK.acquire(blocking=False):
         return JSONResponse({"error": "another job is running"}, status_code=409)
+    gpu_usable = preview_gpu_usable()
     with _STATE_LOCK:
-        PREVIEW_STATE.update(running=True, identity=identity, error=None)
-    set_status("preview", 1, "starting GPU smooth preview")
+        PREVIEW_STATE.update(
+            running=True, identity=identity, error=None,
+            device="gpu" if gpu_usable else "cpu", fallback=not gpu_usable,
+        )
+    set_status(
+        "preview", 1,
+        (
+            "starting GPU smooth preview"
+            if gpu_usable
+            else "starting smooth preview on CPU fallback"
+        ),
+    )
     threading.Thread(
         target=preview_proxy_job, args=(proj, identity), daemon=True
     ).start()
