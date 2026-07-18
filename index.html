@@ -1,0 +1,1712 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RETAKE</title>
+<style>
+/* ------------------------------------------------------------------ tokens */
+:root{
+  --bg:#111113; --surface:#1A1A1E; --surface2:#222228; --text:#EDEDEF;
+  --dim:#8A8A93; --accent:#FF6B4A; --strike:#E5484D; --amber:#FFB224;
+  --line:#2A2A31; --ok:#3DD68C;
+  /* 12-hue pastel cluster palette (hue values used by JS too) */
+  --font:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--text); font-family:var(--font);
+  font-size:15px; overflow:hidden;
+}
+button{
+  font:inherit; color:var(--text); background:var(--surface2);
+  border:1px solid var(--line); border-radius:7px; padding:5px 11px;
+  cursor:pointer; transition:background .12s, border-color .12s;
+}
+button:hover{background:#2b2b33; border-color:#3a3a44}
+button:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
+button.primary{background:var(--accent); border-color:var(--accent); color:#16100e; font-weight:600}
+button.primary:hover{background:#ff7d60}
+button.small{padding:2px 8px; font-size:12.5px}
+input[type=text],textarea,select{
+  font:inherit; color:var(--text); background:var(--bg);
+  border:1px solid var(--line); border-radius:7px; padding:5px 10px;
+}
+input[type=text]:focus,textarea:focus,select:focus{outline:none; border-color:var(--accent)}
+::selection{background:rgba(255,107,74,.35)}
+
+/* ------------------------------------------------------------------ layout */
+#app{display:flex; flex-direction:column; height:100vh}
+header{
+  display:flex; align-items:center; gap:12px; padding:10px 16px;
+  background:var(--surface); border-bottom:1px solid var(--line); flex:none;
+  flex-wrap:wrap;
+}
+#brand{font-weight:800; letter-spacing:.14em; font-size:15px}
+#brand em{color:var(--accent); font-style:normal}
+#pathInput{width:min(380px,34vw)}
+#durations{font-variant-numeric:tabular-nums; color:var(--dim); font-size:14px; white-space:nowrap}
+#durations b{color:var(--text); font-weight:600}
+#durations .arrow{color:var(--accent); margin:0 4px}
+.spacer{flex:1}
+
+#toolbar{
+  display:flex; align-items:center; gap:14px; padding:8px 16px;
+  background:var(--surface); border-bottom:1px solid var(--line);
+  flex:none; flex-wrap:wrap; font-size:13.5px;
+}
+#toolbar .group{display:flex; align-items:center; gap:8px}
+#toolbar label{color:var(--dim)}
+#gapSlider{accent-color:var(--accent); width:150px}
+#gapVal{font-variant-numeric:tabular-nums; min-width:88px; color:var(--text)}
+#aiBar{display:none}
+#aiBar.on{display:flex}
+#aiInstructions{width:min(260px,26vw)}
+#aiBtn{border-color:var(--amber); color:var(--amber); background:transparent}
+#aiBtn:hover{background:rgba(255,178,36,.12)}
+
+main{display:flex; flex:1; min-height:0}
+#left{flex:1; display:flex; flex-direction:column; min-width:0}
+#playerWrap{flex:none; background:#000; position:relative; border-bottom:1px solid var(--line)}
+#player{display:block; width:100%; max-height:34vh; background:#000}
+#playerWrap.audio #player{height:56px; max-height:56px}
+#codecNotice{
+  display:none; position:absolute; inset:auto 0 0 0; padding:5px 12px; font-size:12.5px;
+  color:var(--amber); background:rgba(17,17,19,.92);
+}
+#codecNotice.on{display:block}
+
+#transcript{
+  flex:1; overflow-y:auto; padding:26px 34px 46vh;
+  line-height:1.9; font-size:16.5px; user-select:text;
+}
+#transcript .w{
+  cursor:pointer; border-radius:4px; padding:1px 2px;
+  border-bottom:2px solid transparent; transition:background .1s;
+}
+#transcript .w:hover{background:#26262d}
+#transcript .w.chip{background:var(--chipbg)}
+#transcript .w.cl{border-bottom-color:var(--clc)}
+#transcript .w.cut{color:#5a5a63; text-decoration:line-through; text-decoration-color:var(--strike); text-decoration-thickness:2px; opacity:.66}
+#transcript .w.cur{background:rgba(255,107,74,.28); border-radius:4px}
+#transcript .w.sel{outline:1px dashed #55555f}
+#transcript .w.prop{box-shadow:inset 0 -3px 0 var(--amber)}
+#transcript .w.propkeep{box-shadow:inset 0 -3px 0 #3dd68c}
+#transcript .g{
+  cursor:pointer; color:var(--dim); font-size:12.5px; margin:0 3px; padding:1px 7px;
+  background:var(--surface2); border:1px solid var(--line); border-radius:999px;
+  white-space:nowrap; vertical-align:1px;
+}
+#transcript .g:hover{border-color:#494952}
+#transcript .g.cut{color:#4c4c55; text-decoration:line-through; text-decoration-color:var(--strike); opacity:.6; background:#1c1c21}
+#transcript .g.prop{box-shadow:inset 0 -3px 0 var(--amber)}
+#transcript .g.propkeep{box-shadow:inset 0 -3px 0 #3dd68c}
+#transcript .sx{
+  cursor:pointer; color:#55555f; font-size:12px; margin:0 6px 0 2px; padding:0 4px;
+  border-radius:4px; vertical-align:2px;
+}
+#transcript .sx:hover{color:var(--strike); background:#26262d}
+#transcript .badge{
+  font-size:10.5px; font-weight:700; letter-spacing:.04em; padding:1px 7px; margin-right:6px;
+  border-radius:999px; color:#111; background:var(--clc); vertical-align:3px; white-space:nowrap;
+}
+
+/* markers panel */
+#side{
+  width:288px; flex:none; background:var(--surface); border-left:1px solid var(--line);
+  display:flex; flex-direction:column; min-height:0;
+}
+#side h2{font-size:12px; letter-spacing:.12em; color:var(--dim); font-weight:700;
+  padding:12px 14px 8px; text-transform:uppercase; display:flex; align-items:center; gap:8px}
+#side h2 .spacer{flex:1}
+#markerList{flex:1; overflow-y:auto; padding:0 10px 14px}
+.marker{
+  display:flex; align-items:center; gap:8px; padding:7px 6px; border-radius:8px;
+  border:1px solid transparent;
+}
+.marker:hover{background:var(--surface2)}
+.mdot{width:13px; height:13px; border-radius:50%; flex:none; cursor:pointer; border:2px solid rgba(255,255,255,.15)}
+.mtime{font-variant-numeric:tabular-nums; font-size:12.5px; color:var(--dim); cursor:pointer; flex:none}
+.mtime:hover{color:var(--accent)}
+.mnote{flex:1; min-width:0; background:transparent; border:none; color:var(--text); font-size:13.5px}
+.mnote:focus{outline:none; border-bottom:1px solid var(--accent)}
+.mdel{color:#55555f; cursor:pointer; padding:0 3px; flex:none; background:none; border:none; font-size:14px}
+.mdel:hover{color:var(--strike)}
+#markerEmpty{color:#55555f; font-size:13px; padding:8px 14px}
+
+/* AI proposal bar */
+#propBar{
+  display:none; position:absolute; left:50%; bottom:24px; transform:translateX(-50%);
+  background:var(--surface); border:1px solid var(--amber); border-radius:12px;
+  padding:10px 16px; gap:12px; align-items:center; z-index:40;
+  box-shadow:0 10px 32px rgba(0,0,0,.55);
+}
+#propBar.on{display:flex}
+#propBar b{color:var(--amber)}
+
+/* welcome + progress */
+#welcome{
+  position:absolute; inset:0; display:flex; flex-direction:column; gap:20px;
+  align-items:center; justify-content:center; background:var(--bg); z-index:30; padding:24px;
+}
+#welcome.off{display:none}
+#dropbox{
+  width:min(620px,86vw); border:2px dashed #3a3a44; border-radius:16px;
+  padding:56px 30px; text-align:center; color:var(--dim); transition:border-color .15s, background .15s;
+}
+#dropbox.hot{border-color:var(--accent); background:rgba(255,107,74,.06); color:var(--text)}
+#dropbox h1{font-size:24px; color:var(--text); letter-spacing:.1em; margin-bottom:8px}
+#dropbox h1 em{color:var(--accent); font-style:normal}
+#welcome .row{display:flex; gap:8px; width:min(620px,86vw)}
+#welcome .row input{flex:1}
+#progressPanel{display:none; width:min(620px,86vw)}
+#progressPanel.on{display:block}
+#progressBar{height:8px; background:var(--surface2); border-radius:999px; overflow:hidden; margin:10px 0 8px}
+#progressFill{height:100%; width:0%; background:var(--accent); border-radius:999px; transition:width .3s}
+#progressMsg{color:var(--dim); font-size:13.5px; min-height:18px}
+
+/* toasts */
+#toasts{position:fixed; right:18px; bottom:18px; display:flex; flex-direction:column; gap:8px; z-index:100; max-width:min(460px,86vw)}
+.toast{
+  background:var(--surface); border:1px solid var(--line); border-left:4px solid var(--accent);
+  border-radius:10px; padding:10px 14px; font-size:13.5px; box-shadow:0 8px 26px rgba(0,0,0,.5);
+  animation:tin .18s ease-out; word-break:break-all;
+}
+.toast.error{border-left-color:var(--strike)}
+.toast.warn{border-left-color:var(--amber)}
+@keyframes tin{from{transform:translateY(8px); opacity:0} to{transform:none; opacity:1}}
+
+/* help overlay */
+#help{position:fixed; inset:0; background:rgba(10,10,12,.78); display:none; z-index:90;
+  align-items:center; justify-content:center}
+#help.on{display:flex}
+#helpCard{background:var(--surface); border:1px solid var(--line); border-radius:14px;
+  padding:22px 26px; width:min(460px,90vw)}
+#helpCard h3{margin-bottom:12px; letter-spacing:.08em}
+#helpCard table{width:100%; border-collapse:collapse; font-size:14px}
+#helpCard td{padding:5px 4px; border-bottom:1px solid var(--line); color:var(--dim)}
+#helpCard td:first-child{color:var(--text); font-family:ui-monospace,Menlo,Consolas,monospace; width:150px}
+kbd{background:var(--surface2); border:1px solid #3a3a44; border-radius:5px; padding:1px 6px; font-size:12px}
+
+/* drag overlay (whole window) */
+#dragOverlay{position:fixed; inset:0; z-index:80; display:none; align-items:center; justify-content:center;
+  background:rgba(255,107,74,.10); border:3px dashed var(--accent); font-size:22px; color:var(--text)}
+#dragOverlay.on{display:flex}
+
+/* ------------------------------------------------------- approved editor UI */
+:root{
+  --bg:#0c0e11; --surface:#111419; --surface2:#171b21; --surface3:#1c2128;
+  --line:#292f38; --dim:#9299a5; --text:#f1f2f4; --accent:#ff6b55;
+  --amber:#f3aa23; --strike:#f05a55; --ok:#42cf82;
+}
+body{font-size:14px;background:radial-gradient(circle at 75% 0,#15191f 0,var(--bg) 34%)}
+#app{min-width:0}
+header{
+  height:68px; padding:0 28px; flex-wrap:nowrap; gap:18px; background:rgba(12,14,17,.96);
+  border-bottom-color:#232831;
+}
+#brand{font-size:22px;letter-spacing:-.02em;text-transform:none;display:flex;align-items:center;gap:11px}
+#brand::before{content:"";width:30px;height:28px;background:
+  linear-gradient(90deg,transparent 0 2px,var(--accent) 2px 5px,transparent 5px 8px,var(--accent) 8px 11px,transparent 11px 14px,var(--accent) 14px 18px,transparent 18px 21px,var(--accent) 21px 24px,transparent 24px 27px,var(--accent) 27px 30px);
+  clip-path:polygon(0 40%,10% 40%,10% 20%,20% 20%,20% 0,30% 0,30% 27%,40% 27%,40% 8%,53% 8%,53% 27%,64% 27%,64% 0,76% 0,76% 20%,87% 20%,87% 40%,100% 40%,100% 60%,87% 60%,87% 80%,76% 80%,76% 100%,64% 100%,64% 73%,53% 73%,53% 92%,40% 92%,40% 73%,30% 73%,30% 100%,20% 100%,20% 80%,10% 80%,10% 60%,0 60%)}
+#brand em{color:inherit}
+.head-divider{width:1px;height:32px;background:var(--line)}
+#pathInput{width:min(300px,28vw);border:0;background:transparent;padding:7px 4px;font-size:15px;text-overflow:ellipsis}
+#pathInput:focus{background:var(--surface);border-color:var(--line)}
+.head-action{height:40px;padding:0 16px;background:var(--surface);border-color:var(--line);font-weight:600}
+.ready-pill{display:flex;align-items:center;gap:8px;height:40px;padding:0 14px;border:1px solid var(--line);border-radius:9px;background:var(--surface);font-weight:600}
+.ready-pill::before{content:"";width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px rgba(66,207,130,.35)}
+#durations{font-size:17px;margin:0 14px;color:var(--text)}
+#durations .arrow{color:var(--dim)}
+#durEdit{color:var(--accent)!important}
+#headerExport{height:42px;padding:0 22px;box-shadow:0 0 20px rgba(255,107,85,.22)}
+#helpBtn{width:40px;height:40px;padding:0;font-size:18px}
+#globalProgress{height:3px;background:transparent;position:relative;overflow:hidden;flex:none}
+#globalProgressFill{height:100%;width:0;background:var(--accent);transition:width .25s ease}
+#globalProgress.on{background:#1c2027}
+#globalProgress.indeterminate #globalProgressFill{width:35%!important;animation:progressSweep 1.15s infinite ease-in-out}
+#globalProgress.error #globalProgressFill{background:var(--strike)}
+@keyframes progressSweep{from{transform:translateX(-120%)}to{transform:translateX(340%)}}
+#globalProgressLabel{position:fixed;top:70px;right:28px;z-index:70;padding:5px 9px;border-radius:7px;background:#0d1014;border:1px solid var(--line);font-size:11.5px;color:var(--dim);display:none;box-shadow:0 6px 20px #0008}
+#globalProgress.on + #globalProgressLabel{display:block}
+
+#workspace{display:grid;grid-template-columns:minmax(0,2.2fr) minmax(370px,1fr);gap:12px;padding:10px 12px 12px;flex:1;min-height:0}
+#workspace[hidden]{display:none}
+#left{border:1px solid var(--line);border-radius:13px;overflow:hidden;background:rgba(16,19,24,.92);min-height:0}
+#toolbar{display:flex!important;min-height:58px;padding:9px 14px;background:var(--surface);border-bottom:1px solid var(--line);flex-wrap:nowrap}
+#toolbar[hidden]{display:none!important}
+#toolbar .group{gap:9px}
+#toolbar label{color:var(--text);font-weight:600}
+#gapApply,#gapScoped{height:34px}
+.gap-tools{position:relative}
+.toggle-button{display:inline-flex;align-items:center;gap:7px}.toggle-button i{width:8px;height:8px;border-radius:50%;background:#59616d}.toggle-button[aria-pressed="true"]{border-color:#536c61;background:#17241e}.toggle-button[aria-pressed="true"] i{background:var(--ok);box-shadow:0 0 8px #42cf8288}
+#gapSettingsPanel{position:absolute;z-index:65;top:42px;left:0;width:286px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
+#gapSettingsPanel label{display:grid;grid-template-columns:1fr 76px 24px;align-items:center;gap:6px;margin:8px 0;color:var(--dim);font-size:12px}
+#gapSettingsPanel input{width:76px;padding:6px 7px;font-variant-numeric:tabular-nums}.gap-settings-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:11px}
+.toolbar-count{color:var(--accent);font-weight:700;white-space:nowrap}
+.find-wrap{display:flex;align-items:center;gap:8px;margin-left:auto}
+#findInput{width:160px;background:#0e1115}
+#transcript{padding:16px 22px 150px;font-size:16px;line-height:2.05;background:linear-gradient(90deg,rgba(255,255,255,.008),transparent 65%)}
+.segment-row{display:grid;grid-template-columns:142px minmax(0,1fr);gap:10px;padding:5px 0;border-bottom:1px solid rgba(63,70,81,.32)}
+.seg-time{padding-top:8px;color:#747c88;font:12px ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+.segment-copy{min-width:0}
+#transcript .w{display:inline-block;border:1px solid #303640;border-bottom-width:2px;border-radius:5px;padding:0 8px;line-height:27px;margin:2px 1px;background:#13171c;position:relative}
+#transcript .w:hover,#transcript .w:focus{background:#20262e;border-color:#49515d;outline:none}
+#transcript .w.match{box-shadow:0 0 0 2px rgba(255,178,36,.5)}
+#transcript .w.cut{background:#14171b;color:#6f747c;border-color:#282d34}
+#transcript .w.prop{box-shadow:inset 0 -3px 0 var(--amber);border-bottom-color:var(--amber)}
+#transcript .g{display:none;padding:0 11px;line-height:27px;margin:3px 5px;background:#1b2027}
+#transcript.show-legacy-gaps .g{display:inline-block}
+#transcript .ag{display:inline-flex;align-items:center;gap:6px;padding:0 9px;line-height:25px;margin:3px 5px;border:1px solid #3d4652;border-radius:999px;background:#1a2027;color:#aab2be;font:11px ui-monospace,Consolas,monospace;cursor:pointer;vertical-align:middle}
+#transcript .ag:hover{border-color:#748091;color:#eef0f2}.ag .gap-edit{border:0;background:transparent;padding:0;color:#9299a5}.ag.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}.ag.manual::after{content:"•";color:var(--amber)}
+#transcript .ag.suggest{border-color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber);color:#f1c46d}
+#gapEditor{position:fixed;z-index:110;left:50%;bottom:24px;transform:translateX(-50%);width:min(720px,calc(100vw - 28px));padding:12px;border:1px solid #49515d;border-radius:12px;background:#0e1217;box-shadow:0 18px 48px #000c}
+.gap-editor-head,.gap-editor-fields{display:flex;align-items:center;gap:9px}.gap-editor-head{margin-bottom:8px}.gap-editor-head .spacer{flex:1}
+#gapWave{display:block;width:100%;height:118px;border:1px solid #2e3540;border-radius:8px;background:#090c10;cursor:ew-resize;touch-action:none}
+.gap-editor-fields{margin-top:9px;flex-wrap:wrap}.gap-editor-fields label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}.gap-editor-fields input{width:104px;font-variant-numeric:tabular-nums}
+#gapEditor>small{display:block;color:#747d89;margin-top:8px}
+#transcript .sx{display:inline-grid;place-items:center;width:22px;height:22px;margin-right:6px;border:1px solid transparent}
+#transcript .badge{display:inline-block;padding:1px 8px;margin:0 7px 0 2px}
+#transcriptFooter{height:58px;display:flex;align-items:center;gap:24px;padding:0 18px;background:var(--surface);border-top:1px solid var(--line);color:var(--dim);flex:none}
+.stat{display:flex;align-items:center;gap:7px;white-space:nowrap}.stat-dot{width:10px;height:10px;border-radius:3px;background:var(--c,#78808b)}
+.footer-spacer{flex:1}.footer-hint{font-size:12px}
+
+#side{width:auto;border:0;background:transparent;display:flex;gap:12px;overflow-y:auto;min-width:0}
+.card{border:1px solid var(--line);border-radius:13px;background:rgba(17,20,25,.95);overflow:hidden;flex:none}
+.card-head{height:45px;display:flex;align-items:center;padding:0 13px;font-size:14px;font-weight:700;border-bottom:1px solid #222831}
+.card-head .spacer{flex:1}.card-head button{font-size:12px}
+#playerCard{min-height:300px}
+#playerCard.audio{min-height:0}
+#playerWrap{border:0;background:#050607}
+#player{width:100%;height:min(27vh,285px);object-fit:contain;background:#050607}
+#playerWrap.audio #player{height:62px}
+#player:fullscreen,#player:-webkit-full-screen{width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;object-fit:contain!important;background:#000!important}
+.playerMeta{padding:8px 12px 10px;border-top:1px solid var(--line)}
+.playerActions{display:flex;align-items:center;gap:8px;margin-top:8px}
+.playerActions button{font-size:12px;padding:5px 9px}.playerActions .spacer{flex:1}
+
+#aiBar{display:block!important;padding:10px 11px 11px}
+#aiBar.unavailable{opacity:.72}
+.ai-input-row{display:grid;grid-template-columns:auto 1fr auto;gap:7px;align-items:center}
+#aiAttachBtn{width:38px;height:36px;padding:0;font-size:18px}
+#aiInstructions{width:100%;height:92px;background:#0d1014;resize:vertical;line-height:1.35;padding:9px 10px}
+.ai-input-row{align-items:start}
+#aiBtn{height:36px;min-width:42px;border-color:#5b3029;background:rgba(255,107,85,.13);color:var(--accent);font-size:17px}
+#aiBtn:hover{background:rgba(255,107,85,.22)}
+#aiStatus{margin-top:7px;color:var(--dim);font-size:11.5px;min-height:16px}
+#aiAttachmentList{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+.attachment-chip{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:4px 7px;border:1px solid #38404b;border-radius:7px;background:#171c22;color:#c8ccd2;font-size:11.5px}
+.attachment-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}.attachment-chip button{border:0;background:none;padding:0;color:var(--dim)}
+#propBar{display:none;position:static;transform:none;margin-top:9px;padding:0;border:1px solid #70500f;border-radius:9px;background:rgba(91,61,3,.18);box-shadow:none;overflow:hidden}
+#propBar.on{display:block}
+.proposal-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #5f460f;color:var(--amber);font-size:12.5px}
+.proposal-head .spacer{flex:1}.proposal-head button{padding:3px 8px;font-size:11.5px}
+#proposalList{max-height:190px;overflow:auto;padding:4px 7px 7px}
+.proposal-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 3px;border-bottom:1px solid rgba(243,170,35,.16)}
+.proposal-row:last-child{border-bottom:0}.proposal-row input{accent-color:var(--amber)}
+.proposal-row.unresolved{opacity:.78}.proposal-row.keep{border-left:2px solid #3dd68c;padding-left:6px}
+.proposal-copy{min-width:0;cursor:pointer}.proposal-instruction{color:#eee;font-size:11.5px;white-space:normal;line-height:1.35}.proposal-excerpt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aaa;font-size:10.5px;margin-top:3px}.proposal-meta{margin-top:2px;color:#a79063;font-size:10.5px}
+.proposal-source{font-size:10px;color:var(--amber);white-space:nowrap}
+.proposal-source.keep{color:#3dd68c}.proposal-source.bad{color:#ff7b72}.proposal-source.approximate{color:#f3aa23}
+
+#markersCard #markerList{max-height:180px;overflow:auto;padding:6px 8px}
+#markerEmpty{padding:10px 14px 14px}
+#exportCard .export-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:10px}
+.export-tile{min-height:72px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;text-align:center;background:#15191f}
+.export-tile.primary{border-color:#7c3d31;background:#181719;color:var(--text)}
+.export-tile small{color:var(--dim);font-size:10px;font-weight:400}
+
+#wordTooltip{position:fixed;z-index:120;display:none;pointer-events:none;padding:6px 8px;background:#080a0d;border:1px solid #4a515c;border-radius:6px;color:#f2f3f4;font:11px ui-monospace,Consolas,monospace;box-shadow:0 6px 20px #000b;white-space:nowrap}
+#wordTooltip.on{display:block}
+#welcome{background:radial-gradient(circle at center,#171b21 0,var(--bg) 62%);overflow:auto;justify-content:flex-start;padding-top:max(34px,7vh)}
+#homeShell{width:min(900px,94vw)}
+.home-title{display:flex;align-items:end;gap:14px;margin-bottom:18px}.home-title h1{font-size:25px;letter-spacing:.08em}.home-title h1 em{color:var(--accent);font-style:normal}.home-title p{color:var(--dim);padding-bottom:2px}
+.home-grid{display:grid;grid-template-columns:300px minmax(0,1fr);gap:14px}
+.home-card{background:rgba(17,20,25,.96);border:1px solid var(--line);border-radius:13px;padding:14px;min-width:0}
+.home-card h2{font-size:14px;margin-bottom:11px}.home-card h2 span{color:var(--dim);font-weight:400}
+#projectList{display:flex;flex-direction:column;gap:7px;max-height:430px;overflow:auto}
+.project-row{width:100%;display:grid;grid-template-columns:1fr auto;text-align:left;padding:10px 11px;background:#15191f}
+.project-row b{display:block;margin-bottom:3px}.project-row small{display:block;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px}.project-row .project-state{color:var(--ok);font-size:11px}.project-row.unavailable{opacity:.62}.project-row.unavailable .project-state{color:var(--strike)}
+#projectEmpty{color:var(--dim);font-size:13px;padding:16px 4px}
+#dropbox{width:100%;background:rgba(18,21,26,.75);padding:34px 20px;border-radius:11px}
+#dropbox h3{color:var(--text);font-size:17px;margin-bottom:5px}
+#chooseFile{margin-top:15px;height:40px;padding:0 16px}
+.media-meta{display:flex;gap:10px;align-items:center;margin:12px 0}.media-meta label{font-size:12px;color:var(--dim)}#languageSelect{height:38px;flex:1}
+#selectedFile{min-height:20px;color:var(--dim);font-size:12.5px;margin-top:10px;word-break:break-all}
+.upload-actions{display:flex;gap:8px;margin-top:8px}.upload-actions button{display:none}.upload-actions button.on{display:block}
+#progressPanel{width:100%}
+@media(max-width:720px){.home-grid{grid-template-columns:1fr}.home-title{align-items:start;flex-direction:column}.home-card{padding:11px}#welcome{padding-top:22px}}
+
+@media(max-width:980px){
+  body{overflow:auto}#app{height:auto;min-height:100vh}header{padding:0 14px;gap:10px}#pathInput{width:150px}.ready-pill{display:none}#durations{font-size:14px;margin:0}#workspace{grid-template-columns:1fr}#left{height:70vh;min-height:520px}#side{overflow:visible}#player{height:300px}
+}
+@media(max-width:660px){
+  header{height:auto;min-height:64px;flex-wrap:wrap;padding:10px 12px}.head-divider,#durations{display:none!important}#pathInput{flex:1;width:120px}#headerExport{padding:0 12px}#workspace{padding:7px;gap:8px}#toolbar{overflow-x:auto}.find-wrap{display:none}#transcript{padding:12px 10px 120px}#side{min-width:0}.export-grid{grid-template-columns:1fr!important}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div id="brand">Retake</div>
+    <div class="head-divider"></div>
+    <input id="pathInput" type="text" placeholder="No media open" spellcheck="false" title="Media path" readonly>
+    <div class="spacer"></div>
+    <button id="openBtn" class="head-action">←&nbsp; Projects</button>
+    <div id="readyPill" class="ready-pill">Ready</div>
+    <div id="durations" hidden><b id="durOrig">0:00</b><span class="arrow">→</span><b id="durEdit">0:00</b></div>
+    <button id="headerExport" class="primary">⇧&nbsp; Export</button>
+    <button id="helpBtn" title="Shortcuts and help">⚙</button>
+  </header>
+  <div id="globalProgress"><div id="globalProgressFill"></div></div>
+  <div id="globalProgressLabel"></div>
+
+  <main id="workspace" hidden>
+    <section id="left">
+      <div id="toolbar" hidden>
+        <div class="group gap-tools">
+          <button id="gapToggle" class="small toggle-button" aria-pressed="false"><i></i> Show gaps</button>
+          <button id="gapSettingsBtn" class="small" title="Gap detection settings" disabled>⚙</button>
+          <button id="gapApply" class="small" disabled>Remove all gaps</button>
+          <button id="gapScoped" class="small" title="Prepare gaps only in sentences that still contain kept words" hidden disabled>Remove gaps in kept sentences</button>
+          <button id="gapCancel" class="small" hidden>Cancel</button>
+          <span id="gapCount" class="toolbar-count">Off</span>
+          <div id="gapSettingsPanel" hidden>
+            <label>Minimum silence <input id="gapMin" type="number" min="0.05" max="30" step="0.05" value="0.35"><span>s</span></label>
+            <label>Sensitivity <input id="gapDb" type="number" min="-80" max="-10" step="1" value="-40"><span>dB</span></label>
+            <label>Natural pause kept <input id="gapKeep" type="number" min="0" max="5" step="0.01" value="0.12"><span>s</span></label>
+            <div class="gap-settings-actions"><button id="gapRedetect" class="small">Detect again</button><button id="gapSettingsClose" class="small">Done</button></div>
+          </div>
+        </div>
+        <div class="find-wrap">
+          <span>Aa</span>
+          <input id="findInput" type="text" placeholder="Find" spellcheck="false">
+        </div>
+      </div>
+
+      <div id="transcript" tabindex="0"></div>
+      <div id="transcriptFooter">
+        <span id="wordStat" class="stat">0 words</span>
+        <span class="stat"><i class="stat-dot" style="--c:#a974e8"></i><b id="takeStat">0</b> takes</span>
+        <span class="stat"><i class="stat-dot" style="--c:#f05a55"></i><b id="cutStat">0</b> cuts</span>
+        <span class="stat"><i class="stat-dot" style="--c:#87909b"></i><b id="gapStat">0</b> gaps</span>
+        <span class="stat"><i class="stat-dot" style="--c:#d9a85f"></i><b id="repeatStat">0</b> repeats</span>
+        <span class="footer-spacer"></span>
+        <span class="footer-hint">Alt+click a word to seek</span>
+      </div>
+    </section>
+
+    <aside id="side">
+      <section id="playerCard" class="card">
+        <div id="playerWrap">
+          <video id="player" preload="metadata" controls></video>
+          <div id="codecNotice">Preview unavailable for this codec — editing and export still work.</div>
+        </div>
+        <div class="playerMeta">
+          <div id="playerTime">00:00:00.000 / 00:00:00.000</div>
+          <div class="playerActions">
+            <button id="previewToggle" class="small" hidden>Preview: <b>edited</b></button>
+            <button id="scrollToggle" class="small" hidden>Auto-scroll: on</button>
+            <button id="fullscreenBtn" class="small" hidden>⛶ Fullscreen</button>
+            <span class="spacer"></span>
+            <span class="footer-hint">Click a word to cut · Alt+click to seek</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="aiCard" class="card">
+        <div class="card-head"><span style="color:var(--accent)">✦&nbsp; Cut with AI</span><span class="spacer"></span><button id="aiHistory" class="small">↶ History</button></div>
+        <div id="aiBar">
+          <div class="ai-input-row">
+            <button id="aiAttachBtn" title="Attach reference script">⌕</button>
+            <input id="aiFiles" type="file" accept=".txt,.md,.markdown,.srt,.vtt,.csv,.json,text/*" multiple hidden>
+            <textarea id="aiInstructions" spellcheck="true">This is an improvised video about [topic].
+
+Perform a conservative takes edit: group repeated attempts, discard false starts and weaker bad takes, and keep the clearest final usable take. Remove obvious filler and trim awkward dead air around kept takes. Preserve unique content and natural pacing. When uncertain, keep it.</textarea>
+            <button id="aiBtn" title="Analyze transcript">➤</button>
+          </div>
+          <div id="aiAttachmentList"></div>
+          <div id="aiStatus">Attach an optional reference script, or describe the cuts you want.</div>
+          <div id="propBar">
+            <div class="proposal-head">
+              <span>⚠ AI results <b id="propCount">0</b></span>
+              <span class="spacer"></span>
+              <button id="propAccept">Accept selected</button>
+              <button id="propReject">Reject</button>
+            </div>
+            <div id="proposalList"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="markersCard" class="card">
+        <div class="card-head">Markers<span class="spacer"></span><button id="markerAdd" class="small" title="Add at playhead (M)">＋ Add marker</button><button id="markerExport" class="small">Export</button></div>
+        <div id="markerList"></div>
+        <div id="markerEmpty">Press <kbd>M</kbd> during playback to drop a marker.</div>
+      </section>
+
+      <section id="exportCard" class="card">
+        <div class="card-head">Export</div>
+        <div class="export-grid">
+          <button id="expSmart" class="export-tile primary">✂<b>Exact Quality</b><small>Source copied · near-lossless boundaries</small></button>
+          <button id="expEdl" class="export-tile">▤<b>EDL / CSV</b><small>For NLEs</small></button>
+          <button id="expTxt" class="export-tile">T<b>Transcript</b><small>.txt / .srt</small></button>
+          <button id="expReenc" class="export-tile" title="Full re-encode; may change quality"><b>Compatibility</b><small>Full re-encode · may change quality</small></button>
+          <button id="expDownload" class="export-tile">↓<b>Download Latest Export</b><small>Newest completed media export</small></button>
+          <button id="expCsv" hidden>CSV</button>
+          <button id="expSrt" hidden>SRT</button>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="gapEditor" hidden>
+    <div class="gap-editor-head"><b id="gapEditorTitle">Gap</b><span class="spacer"></span><button id="gapEditorClose" class="small">✕</button></div>
+    <canvas id="gapWave" width="640" height="118" aria-label="Audio waveform with editable cut boundaries"></canvas>
+    <div class="gap-editor-fields">
+      <label>Cut from <input id="gapStart" type="number" min="0" step="0.001"></label>
+      <label>to <input id="gapEnd" type="number" min="0" step="0.001"></label>
+      <button id="gapReset" class="small">Reset</button>
+      <button id="gapCutToggle" class="small primary">Cut this gap</button>
+    </div>
+    <small>Drag either orange edge for visual adjustment, or enter exact timestamps.</small>
+  </div>
+  <div id="wordTooltip" role="tooltip"></div>
+
+  <div id="welcome">
+    <div id="homeShell">
+      <div class="home-title"><h1>RE<em>TAKE</em></h1><p>Your local projects</p></div>
+      <div class="home-grid">
+        <section class="home-card">
+          <h2>Projects <span id="projectCount"></span></h2>
+          <div id="projectList"></div>
+          <div id="projectEmpty">No saved projects yet.</div>
+        </section>
+        <section class="home-card">
+          <h2>New Project</h2>
+          <div id="dropbox">
+            <h3>Drop media here</h3>
+            <p>Video or audio — processed completely offline</p>
+            <input id="mediaFile" type="file" accept="video/*,audio/*" hidden>
+            <button id="chooseFile" class="primary">📁&nbsp; Choose File</button>
+            <div id="selectedFile">No file selected</div>
+          </div>
+          <div class="media-meta">
+            <label for="languageSelect">Spoken language</label>
+            <select id="languageSelect">
+              <option value="auto">Auto-detect</option><option value="en">English</option>
+              <option value="ar">Arabic</option><option value="de">German</option>
+              <option value="es">Spanish</option><option value="fr">French</option>
+              <option value="it">Italian</option><option value="pt">Portuguese</option>
+              <option value="ru">Russian</option><option value="tr">Turkish</option>
+              <option value="hi">Hindi</option><option value="zh">Chinese</option>
+              <option value="ja">Japanese</option><option value="ko">Korean</option>
+            </select>
+          </div>
+          <div id="progressPanel">
+            <div id="progressBar"><div id="progressFill"></div></div>
+            <div id="progressMsg"></div>
+            <div class="upload-actions"><button id="uploadRetry">Retry</button><button id="uploadCancel">Cancel</button></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div id="dragOverlay">Drop to upload &amp; transcribe</div>
+  <div id="toasts"></div>
+
+  <div id="help">
+    <div id="helpCard">
+      <h3>Shortcuts</h3>
+      <table>
+        <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+        <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>seek ±5 s</td></tr>
+        <tr><td>click word / gap</td><td>toggle cut</td></tr>
+        <tr><td><kbd>Shift</kbd>+click</td><td>toggle range from last click</td></tr>
+        <tr><td><kbd>Alt</kbd>+click / dbl-click</td><td>seek to word</td></tr>
+        <tr><td><kbd>X</kbd></td><td>strike text selection / last range</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>undo</td></tr>
+        <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>redo</td></tr>
+        <tr><td><kbd>M</kbd></td><td>marker at playhead</td></tr>
+        <tr><td><kbd>?</kbd></td><td>this overlay · <kbd>Esc</kbd> closes</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ==================================================================== state */
+const $ = (id) => document.getElementById(id);
+const S = {
+  proj: null,               // project JSON from the server
+  cut: new Set(),           // token ids currently cut
+  undo: [], redo: [],       // stacks of cut-set snapshots (arrays)
+  lastClicked: null,        // token id anchor for shift-ranges
+  sel: new Set(),           // last shift-range (X key target)
+  edited: true,             // preview mode
+  autoscroll: true,
+  cutIvs: [], keeps: [],    // derived intervals
+  transcriptCutIvs: [],     // authoritative backend-composed transcript cuts
+  cutsSynced: true,
+  cutRevision: 0,
+  segTokens: new Map(),     // seg id -> [word token ids]
+  gapIds: [],               // gap token ids
+  showGaps: false,
+  audioGaps: [],
+  gapSettings: {min_duration_s:.35,silence_db:-40,keep_pause_s:.12},
+  gapDetecting: false,
+  gapSuggestions: new Map(),
+  scopedGapIds: new Set(),
+  gapEditor: null,
+  markers: [],
+  markerColors: ["coral","amber","mint","sky","violet","pink","lime","slate"],
+  markerHex: {coral:"#FF6B4A",amber:"#FFB224",mint:"#3DD68C",sky:"#4CC3FF",
+              violet:"#9B7BFF",pink:"#FF7BC1",lime:"#C8E24A",slate:"#8A94A6"},
+  proposals: [],
+  lastProposals: [],
+  attachments: [],
+  errSeq: 0,
+  exporting: false,
+  aiRunning: false,
+  loading: false,           // transcription in flight
+  uploadFile: null,
+  uploadSession: null,
+  uploadAbort: null,
+  uploading: false,
+  wakeLock: null,
+};
+const HUES = [14,42,78,110,150,178,200,226,258,288,318,346];
+const clColor  = (i) => `hsl(${HUES[i % 12]},62%,66%)`;
+const chipBg   = (i) => `hsla(${HUES[i % 12]},55%,62%,0.18)`;
+const hashStr  = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h; };
+
+/* ==================================================================== utils */
+function fmtDur(t) {
+  t = Math.max(0, Math.round(t));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), s = t % 60;
+  return h ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`
+           : `${m}:${String(s).padStart(2,"0")}`;
+}
+function fmtTime(t) {
+  t = Math.max(0, Number(t) || 0);
+  const ms = Math.floor((t % 1) * 1000);
+  const whole = Math.floor(t), h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60), s = whole % 60;
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}.${String(ms).padStart(3,"0")}`;
+}
+function escHtml(value) {
+  return String(value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+function toast(msg, type = "info", ms = 6000) {
+  const el = document.createElement("div");
+  el.className = "toast" + (type !== "info" ? " " + type : "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+const RETRYABLE_STATE_POSTS = new Set(["/cuts","/gaps","/markers"]);
+async function api(url, body) {
+  const path = String(url).split("?",1)[0];
+  const safeToRetry = body === undefined || RETRYABLE_STATE_POSTS.has(path);
+  const attempts = safeToRetry ? 3 : 1;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const opts = body !== undefined
+        ? {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)}
+        : {};
+      const r = await fetch(url, opts);
+      let data = {};
+      try { data = await r.json(); } catch (_) {}
+      if (!r.ok) throw new Error(data.error || `${url} → HTTP ${r.status}`);
+      return data;
+    } catch (error) {
+      const networkFailure = error instanceof TypeError || /failed to fetch|networkerror/i.test(error.message || "");
+      if (!networkFailure || attempt + 1 >= attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 120 * (2 ** attempt)));
+    }
+  }
+}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+function fmtBytes(value) {
+  const units = ["B","KB","MB","GB","TB"]; let n = Number(value) || 0, i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+/* JS mirror of retake.merge_intervals / keep_list (feeds the live preview) */
+function mergeIntervals(ivs, eps = 0.001) {
+  const c = ivs.filter(([a,b]) => b > a).sort((x,y) => x[0] - y[0]);
+  const out = [];
+  for (const [a,b] of c) {
+    if (out.length && a <= out[out.length-1][1] + eps)
+      out[out.length-1][1] = Math.max(out[out.length-1][1], b);
+    else out.push([a,b]);
+  }
+  return out;
+}
+function keepList(cuts, dur, eps = 0.001) {
+  const merged = mergeIntervals(cuts, eps), keeps = [];
+  let cur = 0;
+  for (let [a,b] of merged) {
+    a = Math.min(Math.max(a,0), dur); b = Math.min(Math.max(b,0), dur);
+    if (a - cur > eps) keeps.push([cur, a]);
+    cur = Math.max(cur, b);
+  }
+  if (dur - cur > eps) keeps.push([cur, dur]);
+  return keeps;
+}
+
+/* ================================================================ transcript */
+function renderTranscript() {
+  const P = S.proj, T = $("transcript");
+  S.segTokens = new Map(); S.gapIds = [];
+  const seg2cl = new Map(), clOrd = new Map();   // seg id -> [cluster idx, pos, size]
+  P.clusters.forEach((c, ci) =>
+    c.members.forEach((sid, k) => { seg2cl.set(sid, ci); clOrd.set(sid, [k + 1, c.members.length]); }));
+  const chipOf = new Map();                       // token id -> hue idx
+  for (const rep of P.word_repeats) {
+    const hue = hashStr(rep.word) % 12;
+    rep.token_ids.forEach((tid) => chipOf.set(tid, hue));
+  }
+  const html = [];
+  const audioGaps = S.showGaps ? [...S.audioGaps].sort((a,b) => a.detected_start - b.detected_start) : [];
+  let audioGapIndex = 0;
+  const audioGapHtml = (gap) => {
+    const duration = Math.max(0, gap.detected_end - gap.detected_start).toFixed(2);
+    const classes = ["ag", gap.cut ? "cut" : "", gap.manual ? "manual" : "", S.gapSuggestions.has(gap.id) ? "suggest" : ""].filter(Boolean).join(" ");
+    return `<span class="${classes}" data-gap-id="${escHtml(gap.id)}" title="Detected silence ${fmtTime(gap.detected_start)} – ${fmtTime(gap.detected_end)}"><span>⋯ ${duration}s ⋯</span><button class="gap-edit" type="button" title="Edit exact gap boundaries">⌁</button></span> `;
+  };
+  let lastSeg = -1;
+  for (const t of P.tokens) {
+    if (t.kind === "gap") {
+      S.gapIds.push(t.id);
+      const secs = (t.end - t.start).toFixed(1);
+      html.push(`<span class="g" data-id="${t.id}" title="silence ${fmtTime(t.start)} – ${fmtTime(t.end)}">⋯ ${secs}s ⋯</span> `);
+      continue;
+    }
+    if (t.seg !== lastSeg) {
+      if (lastSeg !== -1) html.push(`</div></div>`);
+      lastSeg = t.seg;
+      html.push(`<div class="segment-row"><span class="seg-time">${fmtTime(t.start)}</span><div class="segment-copy">`);
+      html.push(`<span class="sx" data-seg="${t.seg}" title="strike / restore sentence">✕</span>`);
+      const cl = seg2cl.get(t.seg);
+      if (cl !== undefined) {
+        const [k, n] = clOrd.get(t.seg);
+        html.push(`<span class="badge" style="--clc:${clColor(cl)};background:${clColor(cl)}">take ${k}/${n}</span>`);
+      }
+    }
+    while (audioGapIndex < audioGaps.length &&
+           (audioGaps[audioGapIndex].detected_start + audioGaps[audioGapIndex].detected_end) / 2 <= t.start) {
+      html.push(audioGapHtml(audioGaps[audioGapIndex++]));
+    }
+    if (!S.segTokens.has(t.seg)) S.segTokens.set(t.seg, []);
+    S.segTokens.get(t.seg).push(t.id);
+    const cls = ["w"], style = [];
+    const cl = seg2cl.get(t.seg);
+    if (cl !== undefined) { cls.push("cl"); style.push(`--clc:${clColor(cl)}`); }
+    if (chipOf.has(t.id)) { cls.push("chip"); style.push(`--chipbg:${chipBg(chipOf.get(t.id))}`); }
+    const esc = escHtml(t.text), timing = `${fmtTime(t.start)} – ${fmtTime(t.end)}`;
+    html.push(`<span class="${cls.join(" ")}" tabindex="0" role="button" data-id="${t.id}" data-seg="${t.seg}" data-time="${timing}" aria-label="${esc}, ${timing}"${
+      style.length ? ` style="${style.join(";")}"` : ""}>${esc}</span> `);
+  }
+  while (audioGapIndex < audioGaps.length) html.push(audioGapHtml(audioGaps[audioGapIndex++]));
+  if (lastSeg !== -1) html.push(`</div></div>`);
+  T.innerHTML = html.join("");
+  T.classList.toggle("show-gaps", S.showGaps);
+  T.classList.toggle("show-legacy-gaps", S.showGaps && !S.audioGaps.length);
+  for (const id of S.cut) {
+    const el = tokenEl(id);
+    if (el) el.classList.add("cut");
+  }
+}
+const tokenEl = (id) => document.querySelector(`[data-id="${id}"]`);
+
+/* word timestamp tooltip + transcript search */
+function placeWordTooltip(el, x = null, y = null) {
+  if (!el?.classList.contains("w") || !el.dataset.time) return;
+  const tip = $("wordTooltip");
+  tip.textContent = el.dataset.time;
+  tip.classList.add("on");
+  const r = el.getBoundingClientRect(), tr = tip.getBoundingClientRect();
+  let left = x === null ? r.left + r.width / 2 - tr.width / 2 : x + 12;
+  let top = y === null ? r.top - tr.height - 8 : y + 14;
+  left = Math.max(8, Math.min(innerWidth - tr.width - 8, left));
+  if (top + tr.height > innerHeight - 8) top = r.top - tr.height - 8;
+  top = Math.max(8, top);
+  tip.style.left = `${left}px`; tip.style.top = `${top}px`;
+}
+$("transcript").addEventListener("pointerover", (e) => placeWordTooltip(e.target, e.clientX, e.clientY));
+$("transcript").addEventListener("pointermove", (e) => {
+  if (e.target.classList?.contains("w")) placeWordTooltip(e.target, e.clientX, e.clientY);
+});
+$("transcript").addEventListener("pointerout", (e) => {
+  if (e.target.classList?.contains("w")) $("wordTooltip").classList.remove("on");
+});
+$("transcript").addEventListener("focusin", (e) => placeWordTooltip(e.target));
+$("transcript").addEventListener("focusout", () => $("wordTooltip").classList.remove("on"));
+$("findInput").addEventListener("input", () => {
+  const q = $("findInput").value.trim().toLocaleLowerCase();
+  let first = null;
+  document.querySelectorAll("#transcript .w").forEach((el) => {
+    const hit = !!q && el.textContent.toLocaleLowerCase().includes(q);
+    el.classList.toggle("match", hit);
+    if (hit && !first) first = el;
+  });
+  first?.scrollIntoView({block:"center"});
+});
+
+/* ================================================================== editing */
+function captureEditState() {
+  return {cut:[...S.cut], audioGaps:S.audioGaps.map((gap) => ({...gap}))};
+}
+function snapshot() { S.undo.push(captureEditState()); if (S.undo.length > 200) S.undo.shift(); S.redo = []; }
+function applyCutSet(next) {
+  for (const id of next) if (!S.cut.has(id)) tokenEl(id)?.classList.add("cut");
+  for (const id of S.cut) if (!next.has(id)) tokenEl(id)?.classList.remove("cut");
+  S.cut = next;
+  S.cutsSynced = false; S.cutRevision++;
+  recompute();
+  saveCuts();
+}
+function toggleTokens(ids, force = null) {
+  snapshot();
+  const next = new Set(S.cut);
+  for (const id of ids) {
+    const on = force === null ? !next.has(id) : force;
+    on ? next.add(id) : next.delete(id);
+  }
+  applyCutSet(next);
+}
+function restoreEditState(state) {
+  S.cut = new Set(state.cut || []);
+  S.cutsSynced = false; S.cutRevision++;
+  S.audioGaps = (state.audioGaps || []).map((gap) => ({...gap}));
+  S.proj.audio_gaps = S.audioGaps;
+  renderTranscript(); recompute(); saveCuts(); saveAudioGaps();
+}
+function undo() { if (!S.undo.length) return; S.redo.push(captureEditState()); restoreEditState(S.undo.pop()); }
+function redo() { if (!S.redo.length) return; S.undo.push(captureEditState()); restoreEditState(S.redo.pop()); }
+
+function recompute() {
+  const P = S.proj; if (!P) return;
+  const ivs = S.cutsSynced ? S.transcriptCutIvs.map((iv) => [...iv]) : [];
+  // Keep the old per-token preview only while the authoritative autosave is pending.
+  if (!S.cutsSynced) for (const t of P.tokens) if (S.cut.has(t.id)) ivs.push([t.start, t.end]);
+  for (const gap of S.audioGaps) if (gap.cut && gap.end > gap.start) ivs.push([gap.start, gap.end]);
+  S.cutIvs = mergeIntervals(ivs);
+  S.keeps = keepList(S.cutIvs, P.duration_s);
+  const edited = S.keeps.reduce((a,[x,y]) => a + (y - x), 0);
+  $("durOrig").textContent = fmtDur(P.duration_s);
+  $("durEdit").textContent = fmtDur(edited);
+  $("cutStat").textContent = S.cut.size + S.audioGaps.filter((gap) => gap.cut).length;
+  $("wordStat").textContent = `${P.tokens.filter((t) => t.kind === "word").length.toLocaleString()} words`;
+  $("takeStat").textContent = P.clusters.reduce((n,c) => n + c.members.length, 0);
+  $("gapStat").textContent = S.audioGaps.length || P.tokens.filter((t) => t.kind === "gap").length;
+  $("repeatStat").textContent = P.word_repeats.length;
+  updateGapControls();
+}
+const saveCuts = debounce(async () => {
+  if (!S.proj) return;
+  const revision = S.cutRevision;
+  try {
+    const result = await api("/cuts", {cut_ids:[...S.cut], gap_threshold_s:S.proj.gap_threshold_s || .35});
+    if (revision !== S.cutRevision) return;
+    S.transcriptCutIvs = (result.transcript_cut_intervals || []).map((iv) => [...iv]);
+    S.proj.word_cut_intervals = result.word_cut_intervals || [];
+    S.proj.transcript_cut_intervals = result.transcript_cut_intervals || [];
+    S.proj.cut_intervals = result.cut_intervals || [];
+    S.scopedGapIds = new Set(result.scoped_gap_candidate_ids || []);
+    S.cutsSynced = true;
+    recompute();
+  } catch (e) { toast("autosave failed: " + e.message, "error"); }
+}, 500);
+const saveAudioGaps = debounce(() => {
+  if (!S.proj?.audio_gaps_analyzed) return;
+  api("/gaps", {gaps:S.audioGaps, settings:S.gapSettings})
+    .catch((e) => toast("gap autosave failed: " + e.message, "error"));
+}, 500);
+
+/* clicks on transcript (delegated) */
+$("transcript").addEventListener("click", (e) => {
+  const el = e.target;
+  const audioGap = el.closest?.(".ag");
+  if (audioGap) {
+    const gap = S.audioGaps.find((item) => item.id === audioGap.dataset.gapId);
+    if (!gap) return;
+    if (e.altKey) { player.currentTime = gap.detected_start + .001; return; }
+    if (el.classList.contains("gap-edit")) openGapEditor(gap.id, audioGap);
+    else toggleAudioGap(gap.id);
+    return;
+  }
+  if (el.classList.contains("sx")) {
+    const seg = +el.dataset.seg, ids = segAndInnerGaps(seg);
+    const allCut = S.segTokens.get(seg).every((id) => S.cut.has(id));
+    toggleTokens(ids, !allCut);
+    return;
+  }
+  if (!el.dataset.id) return;
+  const id = +el.dataset.id;
+  if (e.altKey) { seekToken(id); return; }
+  document.querySelectorAll(".sel").forEach((n) => n.classList.remove("sel"));
+  if (e.shiftKey && S.lastClicked !== null) {
+    const [a,b] = [Math.min(S.lastClicked, id), Math.max(S.lastClicked, id)];
+    const ids = []; for (let i = a; i <= b; i++) ids.push(i);
+    const force = !S.cut.has(id);
+    toggleTokens(ids, force);
+    S.sel = new Set(ids);
+    ids.forEach((i) => tokenEl(i)?.classList.add("sel"));
+  } else {
+    toggleTokens([id]);
+    S.sel = new Set([id]);
+  }
+  S.lastClicked = id;
+});
+$("transcript").addEventListener("dblclick", (e) => {
+  if (e.target.dataset.id) seekToken(+e.target.dataset.id);
+});
+function segAndInnerGaps(seg) {
+  const words = S.segTokens.get(seg) || [];
+  if (!words.length) return [];
+  const [lo, hi] = [words[0], words[words.length-1]];
+  const ids = [...words];
+  for (const gid of S.gapIds) if (gid > lo && gid < hi) ids.push(gid);
+  return ids;
+}
+function seekToken(id) {
+  const t = S.proj.tokens[id];
+  if (t) { $("player").currentTime = t.start + 0.001; }
+}
+
+/* selection → X key */
+function selectionTokenIds() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0), ids = [];
+  document.querySelectorAll("#transcript [data-id]").forEach((el) => {
+    if (range.intersectsNode(el)) ids.push(+el.dataset.id);
+  });
+  return ids.length ? ids : null;
+}
+
+/* ======================================================= real-audio gap layer */
+function updateGapControls() {
+  $("gapToggle").setAttribute("aria-pressed", String(S.showGaps));
+  $("gapToggle").innerHTML = `<i></i> ${S.showGaps ? "Hide" : "Show"} gaps`;
+  const analyzed = !!S.proj?.audio_gaps_analyzed;
+  const hasScopedGaps = S.audioGaps.some((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
+  $("gapSettingsBtn").disabled = !S.showGaps || S.gapDetecting;
+  $("gapApply").disabled = !S.showGaps || !analyzed || !S.audioGaps.length || S.gapDetecting;
+  $("gapScoped").hidden = !S.showGaps;
+  $("gapScoped").disabled = !analyzed || !hasScopedGaps || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
+  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove all gaps";
+  $("gapCancel").hidden = !S.gapSuggestions.size;
+  $("gapCount").textContent = S.gapDetecting ? "Detecting…" : !S.showGaps ? "Off" : `${S.audioGaps.length} gap${S.audioGaps.length === 1 ? "" : "s"}`;
+}
+function readGapSettings() {
+  return {min_duration_s:+$("gapMin").value,silence_db:+$("gapDb").value,keep_pause_s:+$("gapKeep").value};
+}
+function fillGapSettings() {
+  $("gapMin").value = Number(S.gapSettings.min_duration_s ?? .35).toFixed(2);
+  $("gapDb").value = Number(S.gapSettings.silence_db ?? -40).toFixed(0);
+  $("gapKeep").value = Number(S.gapSettings.keep_pause_s ?? .12).toFixed(2);
+}
+async function runGapDetection(settings = S.gapSettings) {
+  try {
+    clearGapSuggestions(false);
+    await api("/gaps/detect", {settings});
+    S.gapSettings = {...settings}; S.gapDetecting = true; updateGapControls();
+    toast("Detecting real silence from the audio…");
+  } catch (error) { toast(error.message, "error", 9000); }
+}
+async function refreshGapResults() {
+  const project = await api("/project");
+  S.proj.audio_gaps_analyzed = !!project.audio_gaps_analyzed;
+  S.proj.audio_gaps = project.audio_gaps || [];
+  S.proj.audio_gap_settings = project.audio_gap_settings || S.gapSettings;
+  S.audioGaps = S.proj.audio_gaps.map((gap) => ({...gap}));
+  S.gapSettings = {...S.proj.audio_gap_settings};
+  S.scopedGapIds = new Set(project.scoped_gap_candidate_ids || []);
+  if (S.cutsSynced) {
+    S.transcriptCutIvs = (project.transcript_cut_intervals || []).map((iv) => [...iv]);
+  }
+  S.gapSuggestions.clear();
+  S.gapDetecting = false; fillGapSettings(); renderTranscript(); recompute();
+}
+$("gapToggle").addEventListener("click", async () => {
+  S.showGaps = !S.showGaps;
+  if (!S.showGaps) { $("gapSettingsPanel").hidden = true; closeGapEditor(); clearGapSuggestions(false); }
+  renderTranscript(); updateGapControls();
+  if (S.showGaps && !S.proj.audio_gaps_analyzed && !S.gapDetecting) await runGapDetection();
+});
+$("gapSettingsBtn").addEventListener("click", () => { $("gapSettingsPanel").hidden = !$("gapSettingsPanel").hidden; });
+$("gapSettingsClose").addEventListener("click", () => { $("gapSettingsPanel").hidden = true; });
+$("gapRedetect").addEventListener("click", async () => {
+  if (S.audioGaps.some((gap) => gap.cut || gap.manual) && !confirm("Detect again? Existing gap adjustments will be replaced. Word edits are untouched.")) return;
+  const settings = readGapSettings();
+  if (!Number.isFinite(settings.min_duration_s) || !Number.isFinite(settings.silence_db) || !Number.isFinite(settings.keep_pause_s)) { toast("Enter valid gap settings", "warn"); return; }
+  $("gapSettingsPanel").hidden = true; await runGapDetection(settings);
+});
+function bulkBounds(gap) {
+  const keep = Math.max(0, Number(S.gapSettings.keep_pause_s) || 0), length = gap.detected_end - gap.detected_start;
+  if (length <= keep + .001) return null;
+  return [gap.detected_start + keep / 2, gap.detected_end - keep / 2];
+}
+function toggleAudioGap(id, force = null) {
+  const gap = S.audioGaps.find((item) => item.id === id); if (!gap) return;
+  snapshot();
+  S.gapSuggestions.delete(id);
+  const on = force === null ? !gap.cut : force;
+  if (on && !gap.manual) { const bounds = bulkBounds(gap); if (bounds) [gap.start,gap.end] = bounds; }
+  gap.cut = on; S.proj.audio_gaps = S.audioGaps;
+  renderTranscript(); recompute(); saveAudioGaps();
+}
+$("gapApply").addEventListener("click", () => {
+  if (S.gapSuggestions.size) {
+    snapshot();
+    for (const gap of S.audioGaps) {
+      const bounds = S.gapSuggestions.get(gap.id); if (!bounds) continue;
+      [gap.start,gap.end] = bounds; gap.cut = true;
+    }
+    const count = S.gapSuggestions.size; S.gapSuggestions.clear();
+    S.proj.audio_gaps = S.audioGaps; renderTranscript(); recompute(); saveAudioGaps();
+    toast(`Applied ${count} gap cuts · Ctrl+Z to undo`); return;
+  }
+  const eligible = S.audioGaps.filter((gap) => bulkBounds(gap));
+  if (!eligible.length) { toast("No gaps are longer than the natural pause you chose"); return; }
+  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  renderTranscript(); updateGapControls();
+  toast(`Reviewing ${eligible.length} suggested gap cuts with ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s natural pause`);
+});
+$("gapScoped").addEventListener("click", () => {
+  const eligible = S.audioGaps.filter((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
+  if (!eligible.length) { toast("No removable gaps belong to sentences with kept words"); return; }
+  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  renderTranscript(); updateGapControls();
+  toast(`Reviewing ${eligible.length} gaps from sentences that still contain kept words`);
+});
+function clearGapSuggestions(render = true) {
+  S.gapSuggestions.clear(); if (render && S.proj) renderTranscript(); updateGapControls();
+}
+$("gapCancel").addEventListener("click", () => clearGapSuggestions());
+
+function activeEditorGap() { return S.audioGaps.find((gap) => gap.id === S.gapEditor?.id); }
+function drawGapWave() {
+  const editor = S.gapEditor, gap = activeEditorGap(), canvas = $("gapWave"); if (!editor || !gap) return;
+  const ctx = canvas.getContext("2d"), w = canvas.width, h = canvas.height, span = editor.windowEnd - editor.windowStart;
+  ctx.clearRect(0,0,w,h); ctx.fillStyle="#090c10"; ctx.fillRect(0,0,w,h);
+  const x1 = (gap.start - editor.windowStart) / span * w, x2 = (gap.end - editor.windowStart) / span * w;
+  ctx.fillStyle = gap.cut ? "rgba(240,90,85,.18)" : "rgba(243,170,35,.10)"; ctx.fillRect(x1,0,Math.max(1,x2-x1),h);
+  const peaks = editor.peaks || [];
+  ctx.strokeStyle="#6c7684"; ctx.lineWidth=1; ctx.beginPath();
+  peaks.forEach((peak,i) => { const x=(i/(Math.max(1,peaks.length-1)))*w, amp=peak*(h*.42); ctx.moveTo(x,h/2-amp); ctx.lineTo(x,h/2+amp); }); ctx.stroke();
+  ctx.strokeStyle="#ff9e43"; ctx.lineWidth=3; for (const x of [x1,x2]) { ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke(); }
+}
+async function openGapEditor(id) {
+  const gap = S.audioGaps.find((item) => item.id === id); if (!gap) return;
+  const pad=.75, windowStart=Math.max(0,gap.detected_start-pad), windowEnd=Math.min(S.proj.duration_s,gap.detected_end+pad);
+  S.gapEditor={id,windowStart,windowEnd,peaks:[],drag:null,snapshotTaken:false};
+  $("gapEditor").hidden=false; $("gapEditorTitle").textContent=`Gap ${fmtTime(gap.detected_start)} – ${fmtTime(gap.detected_end)}`;
+  $("gapStart").value=gap.start.toFixed(3); $("gapEnd").value=gap.end.toFixed(3);
+  $("gapCutToggle").textContent=gap.cut?"Restore this gap":"Cut this gap"; drawGapWave();
+  try { const data=await api(`/waveform?start=${windowStart}&end=${windowEnd}&points=320`); if(S.gapEditor?.id===id){S.gapEditor.peaks=data.peaks||[];drawGapWave();} }
+  catch(error){toast("Waveform unavailable: "+error.message,"warn");}
+}
+function closeGapEditor(){S.gapEditor=null;$("gapEditor").hidden=true;}
+$("gapEditorClose").addEventListener("click",closeGapEditor);
+function applyGapEditorInputs(manual=true){
+  const gap=activeEditorGap(); if(!gap)return;
+  const start=+$("gapStart").value,end=+$("gapEnd").value;
+  if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||start<0||end>S.proj.duration_s){toast("The gap end must be after its start and inside the media","warn");return;}
+  snapshot(); gap.start=start;gap.end=end;gap.manual=manual;S.proj.audio_gaps=S.audioGaps;recompute();saveAudioGaps();drawGapWave();
+}
+$("gapStart").addEventListener("change",()=>applyGapEditorInputs()); $("gapEnd").addEventListener("change",()=>applyGapEditorInputs());
+$("gapReset").addEventListener("click",()=>{const gap=activeEditorGap();if(!gap)return;$("gapStart").value=gap.detected_start.toFixed(3);$("gapEnd").value=gap.detected_end.toFixed(3);applyGapEditorInputs(false);});
+$("gapCutToggle").addEventListener("click",()=>{const gap=activeEditorGap();if(!gap)return;toggleAudioGap(gap.id);openGapEditor(gap.id);});
+$("gapWave").addEventListener("pointerdown",(event)=>{
+  const editor=S.gapEditor,gap=activeEditorGap();if(!editor||!gap)return;
+  const rect=event.currentTarget.getBoundingClientRect(),time=editor.windowStart+(event.clientX-rect.left)/rect.width*(editor.windowEnd-editor.windowStart);
+  editor.drag=Math.abs(time-gap.start)<=Math.abs(time-gap.end)?"start":"end";editor.snapshotTaken=true;snapshot();event.currentTarget.setPointerCapture(event.pointerId);
+});
+$("gapWave").addEventListener("pointermove",(event)=>{
+  const editor=S.gapEditor,gap=activeEditorGap();if(!editor?.drag||!gap)return;
+  const rect=event.currentTarget.getBoundingClientRect(),time=Math.max(editor.windowStart,Math.min(editor.windowEnd,editor.windowStart+(event.clientX-rect.left)/rect.width*(editor.windowEnd-editor.windowStart)));
+  if(editor.drag==="start")gap.start=Math.min(time,gap.end-.01);else gap.end=Math.max(time,gap.start+.01);
+  gap.manual=true;$("gapStart").value=gap.start.toFixed(3);$("gapEnd").value=gap.end.toFixed(3);drawGapWave();recompute();
+});
+function finishGapDrag(){if(!S.gapEditor?.drag)return;S.gapEditor.drag=null;S.proj.audio_gaps=S.audioGaps;saveAudioGaps();document.querySelector(`[data-gap-id="${S.gapEditor.id}"]`)?.classList.add("manual");}
+$("gapWave").addEventListener("pointerup",finishGapDrag);$("gapWave").addEventListener("pointercancel",finishGapDrag);
+
+/* ================================================================== preview */
+const player = $("player");
+function insideCut(t) {
+  let lo = 0, hi = S.cutIvs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1, iv = S.cutIvs[mid];
+    if (t < iv[0]) hi = mid - 1;
+    else if (t >= iv[1]) lo = mid + 1;
+    else return iv;
+  }
+  return null;
+}
+const skipState = {pending:false, target:null, wasPlaying:false, timer:null, retries:0};
+function clearSkipState() {
+  if (skipState.timer) clearTimeout(skipState.timer);
+  skipState.pending = false; skipState.target = null; skipState.wasPlaying = false;
+  skipState.timer = null; skipState.retries = 0;
+}
+function finishCutSeek() {
+  if (!skipState.pending) return;
+  const resume = skipState.wasPlaying;
+  clearSkipState();
+  $("codecNotice").classList.remove("on");
+  if (resume && player.paused && !player.ended)
+    player.play().catch(() => { /* a later user Play remains available */ });
+}
+function armCutSeekRecovery() {
+  if (skipState.timer) clearTimeout(skipState.timer);
+  skipState.timer = setTimeout(() => {
+    if (!skipState.pending) return;
+    if (player.error) { clearSkipState(); return; }
+    const target = skipState.target, resume = skipState.wasPlaying;
+    if (skipState.retries < 2 && target !== null) {
+      skipState.retries += 1;
+      player.currentTime = Math.min(S.proj.duration_s, target + skipState.retries * .006);
+      if (resume && player.paused) player.play().catch(() => {});
+      armCutSeekRecovery();
+      return;
+    }
+    clearSkipState();
+    if (resume && player.paused && !player.ended) player.play().catch(() => {});
+  }, 1800);
+}
+function skipTick() {
+  if (!S.proj || !S.edited || player.paused || player.seeking || skipState.pending) return;
+  const iv = insideCut(player.currentTime);
+  if (!iv) return;
+  if (iv[1] >= S.proj.duration_s - 0.05) {
+    player.pause(); player.currentTime = S.proj.duration_s; clearSkipState(); return;
+  }
+  const target = Math.min(S.proj.duration_s, iv[1] + 0.04);
+  if (skipState.target !== null && Math.abs(skipState.target - target) < 0.02) return;
+  skipState.pending = true; skipState.target = target;
+  skipState.wasPlaying = !player.paused; skipState.retries = 0;
+  player.currentTime = target;
+  armCutSeekRecovery();
+}
+function updatePlayerTime() {
+  $("playerTime").textContent = `${fmtTime(player.currentTime)} / ${fmtTime(S.proj?.duration_s || player.duration || 0)}`;
+}
+player.addEventListener("timeupdate", () => { skipTick(); highlightWord(); updatePlayerTime(); });
+player.addEventListener("seeked", finishCutSeek);
+player.addEventListener("canplay", () => {
+  if (skipState.pending && skipState.target !== null &&
+      Math.abs(player.currentTime - skipState.target) < .15) finishCutSeek();
+});
+function handleFullscreenChange() {
+  clearSkipState();
+  player.style.transform = "translateZ(0)";
+  requestAnimationFrame(() => { player.style.transform = ""; });
+  $("fullscreenBtn").textContent = document.fullscreenElement || document.webkitFullscreenElement ? "⛶ Exit fullscreen" : "⛶ Fullscreen";
+}
+document.addEventListener("fullscreenchange", handleFullscreenChange);
+document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+$("fullscreenBtn").addEventListener("click", async () => {
+  try {
+    if (document.fullscreenElement || document.webkitFullscreenElement) await (document.exitFullscreen?.() || document.webkitExitFullscreen?.());
+    else await (player.requestFullscreen?.() || player.webkitRequestFullscreen?.());
+  } catch (error) { toast("Fullscreen could not start: " + error.message, "warn"); }
+});
+if (player.requestVideoFrameCallback) {
+  const onVideoFrame = () => { skipTick(); player.requestVideoFrameCallback(onVideoFrame); };
+  player.requestVideoFrameCallback(onVideoFrame);
+}
+player.addEventListener("error", () => {
+  clearSkipState();
+  if (S.proj) {
+    $("codecNotice").textContent = "The browser could not decode this media stream. Editing and export still work.";
+    $("codecNotice").classList.add("on");
+  }
+});
+player.addEventListener("loadedmetadata", () => { $("codecNotice").classList.remove("on"); updatePlayerTime(); });
+
+let curEl = null;
+function highlightWord() {
+  const P = S.proj; if (!P) return;
+  const t = player.currentTime;
+  const words = P._words || (P._words = P.tokens.filter((x) => x.kind === "word"));
+  let lo = 0, hi = words.length - 1, found = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1, w = words[mid];
+    if (t < w.start) hi = mid - 1;
+    else if (t >= w.end) lo = mid + 1;
+    else { found = w; break; }
+  }
+  const el = found ? tokenEl(found.id) : null;
+  if (el === curEl) return;
+  curEl?.classList.remove("cur");
+  curEl = el;
+  if (el) {
+    el.classList.add("cur");
+    if (S.autoscroll && !player.paused)
+      el.scrollIntoView({block:"center", behavior:"auto"});
+  }
+}
+$("previewToggle").addEventListener("click", () => {
+  S.edited = !S.edited;
+  $("previewToggle").innerHTML = `Preview: <b>${S.edited ? "edited" : "original"}</b>`;
+});
+$("scrollToggle").addEventListener("click", () => {
+  S.autoscroll = !S.autoscroll;
+  $("scrollToggle").textContent = `Auto-scroll: ${S.autoscroll ? "on" : "off"}`;
+});
+
+/* ================================================================== markers */
+function renderMarkers() {
+  const L = $("markerList");
+  L.innerHTML = "";
+  $("markerEmpty").style.display = S.markers.length ? "none" : "block";
+  [...S.markers].sort((a,b) => a.t - b.t).forEach((m) => {
+    const row = document.createElement("div");
+    row.className = "marker";
+    const dot = document.createElement("span");
+    dot.className = "mdot";
+    dot.style.background = S.markerHex[m.color] || m.color;
+    dot.title = "click to change color";
+    dot.onclick = () => {
+      const i = S.markerColors.indexOf(m.color);
+      m.color = S.markerColors[(i + 1) % S.markerColors.length];
+      renderMarkers(); saveMarkers();
+    };
+    const tm = document.createElement("span");
+    tm.className = "mtime"; tm.textContent = fmtDur(m.t); tm.title = "jump";
+    tm.onclick = () => { player.currentTime = m.t; };
+    const note = document.createElement("input");
+    note.className = "mnote"; note.value = m.note; note.placeholder = "note…";
+    note.oninput = () => { m.note = note.value; saveMarkers(); };
+    const del = document.createElement("button");
+    del.className = "mdel"; del.textContent = "✕"; del.title = "delete";
+    del.onclick = () => { S.markers = S.markers.filter((x) => x !== m); renderMarkers(); saveMarkers(); };
+    row.append(dot, tm, note, del);
+    L.appendChild(row);
+  });
+}
+const saveMarkers = debounce(() =>
+  api("/markers", {markers:S.markers}).catch((e) => toast("marker save failed: " + e.message, "error")), 500);
+function addMarker() {
+  if (!S.proj) return;
+  const m = {t: player.currentTime, color: S.markerColors[S.markers.length % 8], note: ""};
+  S.markers.push(m);
+  renderMarkers(); saveMarkers();
+  const inputs = $("markerList").querySelectorAll(".mnote");
+  const sorted = [...S.markers].sort((a,b) => a.t - b.t);
+  inputs[sorted.indexOf(m)]?.focus();
+}
+$("markerAdd").addEventListener("click", addMarker);
+$("markerExport").addEventListener("click", () =>
+  api("/export_text", {kind:"markers"}).then((d) => toast("markers.md → " + d.path))
+    .catch((e) => toast(e.message, "error")));
+
+/* ===================================================================== AI */
+async function initAI() {
+  try {
+    const d = await api("/ai/available");
+    $("aiBar").classList.toggle("unavailable", !d.available);
+    $("aiBtn").disabled = !d.available;
+    $("aiStatus").textContent = d.available
+      ? `Local model ready · ${d.model}`
+      : "Add an instruct .gguf model to models/llm to enable AI cuts.";
+    if (d.available) $("aiBtn").title = "Analyze with " + d.model;
+  } catch (e) { $("aiStatus").textContent = "AI availability could not be checked."; }
+}
+
+function renderAttachments() {
+  const host = $("aiAttachmentList"); host.innerHTML = "";
+  S.attachments.forEach((a, index) => {
+    const chip = document.createElement("div"); chip.className = "attachment-chip";
+    chip.innerHTML = `<span title="${escHtml(a.name)}">▤ ${escHtml(a.name)}</span><small>${Math.ceil(a.size/1024)} KB</small>`;
+    const remove = document.createElement("button"); remove.textContent = "×"; remove.title = "Remove attachment";
+    remove.onclick = () => { S.attachments.splice(index, 1); renderAttachments(); };
+    chip.appendChild(remove); host.appendChild(chip);
+  });
+}
+$("aiAttachBtn").addEventListener("click", () => $("aiFiles").click());
+$("aiFiles").addEventListener("change", async (e) => {
+  const files = [...e.target.files]; e.target.value = "";
+  let remaining = 12000 - S.attachments.reduce((n,a) => n + a.content.length, 0);
+  for (const file of files) {
+    if (S.attachments.length >= 5) { toast("Attach at most 5 reference files", "warn"); break; }
+    if (file.size > 512 * 1024) { toast(`${file.name} is larger than 512 KB`, "warn"); continue; }
+    let content;
+    try { content = await file.text(); } catch (_) { toast(`${file.name} could not be read as text`, "warn"); continue; }
+    if (!content.trim() || content.includes("\0")) { toast(`${file.name} is empty or not a text file`, "warn"); continue; }
+    if (remaining <= 0) { toast("Reference text limit reached (12,000 characters)", "warn"); break; }
+    if (content.length > remaining) {
+      content = content.slice(0, remaining);
+      toast(`${file.name} was trimmed to fit the local model context`, "warn");
+    }
+    S.attachments.push({name:file.name, size:file.size, content}); remaining -= content.length;
+  }
+  renderAttachments();
+});
+
+$("aiBtn").addEventListener("click", async () => {
+  try {
+    const result = await api("/ai/run", {
+      instructions: $("aiInstructions").value,
+      attachments: S.attachments.map(({name,content}) => ({name,content})),
+    });
+    result.warnings?.forEach((w) => toast("Reference: " + w, "warn"));
+    S.aiRunning = true;
+    $("aiBtn").disabled = true;
+    $("aiStatus").textContent = "Analyzing transcript locally…";
+    pollAIResult();
+  } catch (e) { toast(e.message, "error"); }
+});
+$("aiInstructions").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !$("aiBtn").disabled) {
+    e.preventDefault(); $("aiBtn").click();
+  }
+});
+
+function renderProposals() {
+  const list = $("proposalList"); list.innerHTML = "";
+  document.querySelectorAll(".prop,.propkeep").forEach((el) => el.classList.remove("prop","propkeep"));
+  S.proposals.forEach((p, index) => {
+    const ids = proposalTokenIds(p);
+    const executable = isExecutableProposal(p);
+    if (p.action === "keep_phrase" && ["exact","approximate"].includes(p.status))
+      ids.forEach((id) => tokenEl(id)?.classList.add("propkeep"));
+    else if (executable && p.selected !== false)
+      ids.forEach((id) => tokenEl(id)?.classList.add("prop"));
+    const row = document.createElement("div");
+    row.className = `proposal-row ${p.action === "keep_phrase" ? "keep" : ""} ${executable ? "" : "unresolved"}`;
+    const check = document.createElement("input"); check.type = "checkbox";
+    check.checked = executable && p.selected !== false; check.disabled = !executable;
+    check.onchange = () => { p.selected = check.checked; renderProposals(); };
+    const copy = document.createElement("div"); copy.className = "proposal-copy";
+    copy.innerHTML = `<div class="proposal-instruction">${escHtml(p.instruction || p.reason || "AI suggestion")}</div><div class="proposal-excerpt">Matched: ${escHtml(p.excerpt || "nothing")}</div><div class="proposal-meta">${fmtTime(p.start)} – ${fmtTime(p.end)} · ${escHtml(p.reason || "AI suggestion")}</div>`;
+    copy.title = ids.length ? "Seek to this exact match" : "This instruction was not executable";
+    copy.onclick = (event) => { if (ids.length) navigateProposal(ids, event.altKey); };
+    const source = document.createElement("span");
+    const status = p.status || "exact";
+    source.className = `proposal-source ${p.action === "keep_phrase" ? "keep" : ""} ${status === "approximate" ? "approximate" : ""} ${["ambiguous","not_found","needs_decision","conflict"].includes(status) ? "bad" : ""}`;
+    source.textContent = p.action === "keep_phrase" ? `KEEP · ${status}` : status.replaceAll("_", " ");
+    row.append(check, copy, source); list.appendChild(row);
+  });
+  $("propCount").textContent = S.proposals.length;
+  $("propBar").classList.toggle("on", S.proposals.length > 0);
+}
+
+function navigateProposal(ids, forceSeek = false) {
+  document.querySelectorAll("#transcript .sel").forEach((el) => el.classList.remove("sel"));
+  S.sel = new Set(ids);
+  ids.forEach((id) => tokenEl(id)?.classList.add("sel"));
+  const first = tokenEl(ids[0]);
+  first?.scrollIntoView({block:"center",behavior:"smooth"});
+  if (forceSeek || ids.length) seekToken(ids[0]);
+}
+
+async function pollAIResult() {
+  if (!S.aiRunning) return;
+  try {
+    const result = await api("/ai/result");
+    if (result.done && !result.running) { await aiFinished(); return; }
+  } catch (_) { /* the global status poll will surface server failures */ }
+  if (S.aiRunning) setTimeout(pollAIResult, 350);
+}
+
+function proposalTokenIds(p) {
+  if (Array.isArray(p.token_ids)) return p.token_ids.map(Number);
+  const ids = [];
+  (p.sentence_ids || []).forEach((seg) => ids.push(...segAndInnerGaps(seg)));
+  return ids;
+}
+function isExecutableProposal(p) {
+  return ["cut_phrase","cut_gap"].includes(p.action || "cut_phrase")
+    && ["exact","approximate"].includes(p.status || "exact")
+    && proposalTokenIds(p).length > 0;
+}
+
+async function aiFinished() {
+  S.aiRunning = false;
+  $("aiBtn").disabled = false;
+  try {
+    const r = await api("/ai/result");
+    r.warnings?.forEach((w) => toast("AI: " + w, "warn"));
+    S.proposals = (r.proposals || []).map((p) => ({
+      ...p, selected:p.selected ?? (p.source === "retake rule")
+    }));
+    S.lastProposals = S.proposals.map((p) => ({
+      ...p,
+      sentence_ids:[...(p.sentence_ids || [])],
+      token_ids:[...(p.token_ids || [])],
+    }));
+    renderProposals();
+    const counts = S.proposals.reduce((out,p) => (out[p.status || "exact"] = (out[p.status || "exact"] || 0) + 1, out), {});
+    const summary = Object.entries(counts).map(([status,count]) => `${count} ${status.replaceAll("_"," ")}`).join(" · ");
+    $("aiStatus").textContent = S.proposals.length
+      ? `${summary}. Review the exact highlights before accepting.`
+      : "No instructions were safely resolved. Your edit was left unchanged.";
+  } catch (e) { toast("AI result unreadable: " + e.message, "error"); }
+}
+$("propAccept").addEventListener("click", () => {
+  const selected = S.proposals.filter((p) => isExecutableProposal(p) && p.selected !== false);
+  if (!selected.length) { toast("Select at least one proposal", "warn"); return; }
+  const ids = [];
+  selected.forEach((p) => ids.push(...proposalTokenIds(p)));
+  toggleTokens(ids, true);            // one undoable batch
+  S.proposals = S.proposals.filter((p) => !selected.includes(p));
+  renderProposals();
+  $("aiStatus").textContent = `Accepted ${selected.length} cut${selected.length===1?"":"s"} · Ctrl+Z to undo.`;
+});
+$("propReject").addEventListener("click", clearProposals);
+function clearProposals() {
+  S.proposals = [];
+  $("propBar").classList.remove("on");
+  document.querySelectorAll(".prop,.propkeep").forEach((el) => el.classList.remove("prop","propkeep"));
+  $("proposalList").innerHTML = "";
+  if (S.proj) $("aiStatus").textContent = "No pending AI cuts.";
+}
+$("aiHistory").addEventListener("click", () => {
+  if (!S.lastProposals.length) { toast("No AI proposal history in this session"); return; }
+  S.proposals = S.lastProposals.map((p) => ({
+    ...p,
+    sentence_ids:[...(p.sentence_ids || [])],
+    token_ids:[...(p.token_ids || [])],
+  }));
+  renderProposals();
+  $("aiStatus").textContent = "Restored the latest AI proposals.";
+});
+
+/* =================================================================== export */
+function bindExport(btnId, mode) {
+  $(btnId).addEventListener("click", async () => {
+    try {
+      await api("/export", {mode});
+      S.exporting = true;
+      toast("export started…");
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+bindExport("expSmart", "smart");
+bindExport("expReenc", "reencode");
+$("headerExport").addEventListener("click", () => {
+  if (!S.proj) toast("Open media before exporting", "warn");
+  else $("expSmart").click();
+});
+function bindTextExports(btnId, kinds) {
+  $(btnId).addEventListener("click", async () => {
+    try {
+      const results = [];
+      for (const kind of kinds) results.push(await api("/export_text", {kind}));
+      toast(`${kinds.map((k) => k.toUpperCase()).join(" + ")} exported → ${results[0].path}`);
+    } catch (e) { toast(e.message, "error"); }
+  });
+}
+bindTextExports("expEdl", ["edl", "csv"]);
+bindTextExports("expTxt", ["txt", "srt"]);
+$("expDownload").addEventListener("click", async () => {
+  try {
+    const latest = await api("/export/latest");
+    toast(`downloading ${latest.name}…`);
+    window.location.assign("/export/latest/download");
+  } catch (e) { toast(e.message, "warn"); }
+});
+
+/* =============================================================== open files */
+async function openPath(path, language = "auto", sourceFilename = "") {
+  if (!path) { toast("enter a file path first", "warn"); return; }
+  try {
+    const d = await api("/open", {path, language, source_filename:sourceFilename});
+    if (d.loaded === "existing") await loadProject();
+    else {
+      S.loading = true;
+      $("workspace").hidden = true;
+      showWelcome(true);
+      $("progressPanel").classList.add("on");
+    }
+  } catch (e) { toast(e.message, "error"); }
+}
+$("openBtn").addEventListener("click", () => showWelcome(true));
+
+async function refreshProjects() {
+  try {
+    const data = await api("/projects"), host = $("projectList"); host.innerHTML = "";
+    $("projectCount").textContent = `(${data.projects.length})`;
+    $("projectEmpty").hidden = data.projects.length > 0;
+    for (const project of data.projects) {
+      const button = document.createElement("button");
+      button.className = "project-row" + (project.available ? "" : " unavailable");
+      const opened = project.last_opened_at ? new Date(project.last_opened_at).toLocaleDateString() : "";
+      button.innerHTML = `<span><b>${escHtml(project.name)}</b><small title="${escHtml(project.source_filename)}">${escHtml(project.source_filename)}${opened ? ` · ${escHtml(opened)}` : ""}</small></span><span class="project-state">${project.available ? "Open" : "Missing"}</span>`;
+      button.onclick = async () => {
+        if (!project.available) { toast("The source media for this project is unavailable", "error"); return; }
+        try { await api("/projects/open", {id:project.id}); await loadProject(); }
+        catch (error) { toast(error.message, "error", 9000); }
+      };
+      host.appendChild(button);
+    }
+  } catch (error) { toast("Projects could not be loaded: " + error.message, "error"); }
+}
+
+function setUploadActions(retry, cancel) {
+  $("uploadRetry").classList.toggle("on", retry);
+  $("uploadCancel").classList.toggle("on", cancel);
+}
+
+async function uploadSelectedFile(file) {
+  if (S.uploading) return;
+  S.uploading = true;
+  S.uploadFile = file;
+  $("selectedFile").textContent = `${file.name} · ${fmtBytes(file.size)}`;
+  $("progressPanel").classList.add("on"); setUploadActions(false, true);
+  const startedAt = performance.now();
+  const descriptor = {
+    name:file.name, size:file.size, fingerprint:`${file.lastModified}:${file.type}`,
+    lastModified:file.lastModified, type:file.type,
+  };
+  try {
+    if (navigator.wakeLock) {
+      try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+    }
+    const start = await api("/upload/start", descriptor);
+    S.uploadSession = start.session; let offset = Number(start.offset) || 0;
+    localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
+    S.uploadAbort = new AbortController();
+    const chunkSize = 1024 * 1024;
+    while (offset < file.size) {
+      let sent = false;
+      for (let attempt = 0; attempt < 6 && !sent; attempt++) {
+        try {
+          const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
+          const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
+            method:"POST", headers:{"X-Upload-Offset":String(offset)}, body:chunk,
+            signal:S.uploadAbort.signal,
+          });
+          const data = await response.json();
+          if (response.status === 409 && Number.isFinite(Number(data.offset))) {
+            offset = Number(data.offset); sent = true; continue;
+          }
+          if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+          offset = Number(data.offset); sent = true;
+        } catch (error) {
+          if (error.name === "AbortError") throw error;
+          if (attempt === 5) throw new Error(`connection kept dropping after 6 retries: ${error.message}`);
+          const delay = Math.min(8000, 500 * (2 ** attempt));
+          $("progressMsg").textContent = `Connection interrupted · retrying chunk ${attempt + 1}/6…`;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          try {
+            const resumed = await api("/upload/start", descriptor);
+            S.uploadSession = resumed.session;
+            offset = Number(resumed.offset) || 0;
+          } catch (resumeError) {
+            if (attempt === 5) throw resumeError;
+          }
+        }
+      }
+      const pct = file.size ? offset / file.size * 100 : 0;
+      const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
+      $("progressFill").style.width = `${pct}%`;
+      $("progressMsg").textContent = `Uploading ${fmtBytes(offset)} of ${fmtBytes(file.size)} · ${fmtBytes(offset / seconds)}/s`;
+    }
+    const complete = await api("/upload/finish", {session:start.session});
+    S.uploadSession = null; S.uploadAbort = null;
+    localStorage.removeItem("retakePendingTransfer");
+    $("progressMsg").textContent = "Upload complete · opening media";
+    setUploadActions(false, false);
+    await openPath(complete.path, $("languageSelect").value, complete.source_filename);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    $("progressMsg").textContent = `Upload paused: ${error.message}`;
+    setUploadActions(true, false);
+    toast(error.message, "error", 10000);
+  } finally {
+    S.uploading = false;
+    if (S.wakeLock) { await S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
+  }
+}
+
+$("chooseFile").addEventListener("click", () => $("mediaFile").click());
+$("mediaFile").addEventListener("change", (event) => {
+  const file = event.target.files?.[0]; event.target.value = "";
+  if (file) uploadSelectedFile(file);
+});
+$("uploadRetry").addEventListener("click", () => { if (S.uploadFile) uploadSelectedFile(S.uploadFile); });
+$("uploadCancel").addEventListener("click", async () => {
+  S.uploadAbort?.abort();
+  if (S.uploadSession) await api("/upload/cancel", {session:S.uploadSession}).catch(() => {});
+  S.uploadSession = null; S.uploadAbort = null; S.uploadFile = null;
+  localStorage.removeItem("retakePendingTransfer");
+  $("progressPanel").classList.remove("on"); $("selectedFile").textContent = "No file selected";
+  setUploadActions(false, false);
+});
+
+/* drag & drop anywhere */
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => { e.preventDefault(); if (++dragDepth) $("dragOverlay").classList.add("on"); });
+window.addEventListener("dragleave", (e) => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; $("dragOverlay").classList.remove("on"); } });
+window.addEventListener("dragover", (e) => { e.preventDefault(); $("dropbox")?.classList.add("hot"); });
+window.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  $("dragOverlay").classList.remove("on");
+  $("dropbox")?.classList.remove("hot");
+  const f = e.dataTransfer.files?.[0];
+  if (!f) return;
+  showWelcome(true);
+  uploadSelectedFile(f);
+});
+
+/* ============================================================= project load */
+async function loadProject() {
+  const P = await api("/project");
+  S.proj = P;
+  S.cut = new Set(P.tokens.filter((t) => t.cut).map((t) => t.id));
+  S.transcriptCutIvs = (P.transcript_cut_intervals || []).map((iv) => [...iv]);
+  S.scopedGapIds = new Set(P.scoped_gap_candidate_ids || []);
+  S.cutsSynced = true; S.cutRevision = 0;
+  S.showGaps = false;
+  S.audioGaps = (P.audio_gaps || []).map((gap) => ({...gap}));
+  S.gapSuggestions.clear();
+  S.gapSettings = {...(P.audio_gap_settings || {min_duration_s:.35,silence_db:-40,keep_pause_s:.12})};
+  S.gapDetecting = false; closeGapEditor(); fillGapSettings();
+  S.undo = []; S.redo = []; S.lastClicked = null; S.sel = new Set();
+  S.markers = P.markers || [];
+  clearProposals();
+  S.lastProposals = [];
+  S.attachments = [];
+  renderAttachments();
+  delete P._words;
+  renderTranscript();
+  renderMarkers();
+  recompute();
+  $("durations").hidden = false;
+  $("toolbar").hidden = false;
+  $("workspace").hidden = false;
+  $("previewToggle").hidden = false;
+  $("scrollToggle").hidden = false;
+  $("fullscreenBtn").hidden = !P.probe.has_video;
+  $("pathInput").value = P.source_path;
+  $("pathInput").title = P.source_path;
+  $("readyPill").textContent = "Ready";
+  $("playerWrap").classList.toggle("audio", !P.probe.has_video);
+  $("playerCard").classList.toggle("audio", !P.probe.has_video);
+  $("codecNotice").classList.remove("on");
+  clearSkipState();
+  player.src = "/media?v=" + Date.now();
+  showWelcome(false);
+  initAI();
+  toast(`loaded · ${P.segments.length} sentences · ${P.clusters.length} retake cluster${P.clusters.length===1?"":"s"}`);
+}
+function showWelcome(on) {
+  $("welcome").classList.toggle("off", !on);
+  if (on) { player.pause(); refreshProjects(); }
+  else $("progressPanel").classList.remove("on");
+}
+
+/* ================================================================== polling */
+let wasPhase = "idle";
+function updateGlobalProgress(st) {
+  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","export"].includes(st.phase);
+  const bar = $("globalProgress"), fill = $("globalProgressFill"), label = $("globalProgressLabel");
+  bar.classList.toggle("on", busy);
+  const indeterminate = busy && (st.phase === "load_model" || Number(st.pct) <= 0);
+  bar.classList.toggle("indeterminate", indeterminate);
+  if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
+  label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",export:"Exporting",ready:"Ready",idle:"Ready"};
+  $("readyPill").textContent = phaseName[st.phase] || "Working";
+  const exporting = st.phase === "export";
+  document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
+  $("headerExport").disabled = exporting;
+  if (st.phase === "ai" && st.msg) $("aiStatus").textContent = `${st.msg} · ${Math.round(st.pct || 0)}%`;
+}
+async function poll() {
+  try {
+    const st = await api("/status");
+    updateGlobalProgress(st);
+    if (st.err_seq > S.errSeq) {
+      S.errSeq = st.err_seq;
+      if (st.error) toast(st.error, "error", 9000);
+      S.exporting = false;
+      if (S.aiRunning) { S.aiRunning = false; $("aiBtn").disabled = false; }
+      if (S.gapDetecting) { S.gapDetecting = false; updateGapControls(); }
+      if (S.loading) { S.loading = false; $("progressPanel").classList.remove("on"); }
+    }
+    const busy = ["probe","load_model","transcribe","cluster"].includes(st.phase);
+    if (busy && S.loading) {
+      $("progressPanel").classList.add("on");
+      $("progressFill").style.width = st.pct + "%";
+      $("progressMsg").textContent = `${st.msg}  ·  ${st.pct}%`;
+    }
+    if (st.phase !== wasPhase) {
+      if (st.phase === "ready" && S.loading && st.has_project) {
+        S.loading = false;
+        await loadProject();
+      }
+      if (st.phase === "ready" && S.exporting) {
+        S.exporting = false;
+        if (st.export?.path) {
+          toast("exported → " + st.export.path, "info", 12000);
+          if (st.export.warning) toast(st.export.warning, "warn", 12000);
+        }
+      }
+      if (st.phase === "ready" && S.gapDetecting) await refreshGapResults();
+      if (st.phase === "ready" && S.aiRunning) await aiFinished();
+      wasPhase = st.phase;
+    }
+    if (["export","ai","gaps"].includes(st.phase) && st.msg)
+      $("durations").title = `${st.msg} (${st.pct}%)`;
+  } catch (_) { /* server briefly unreachable; keep polling */ }
+  setTimeout(poll, 500);
+}
+
+/* ================================================================= keyboard */
+document.addEventListener("keydown", (e) => {
+  const typing = ["INPUT","TEXTAREA"].includes(e.target.tagName);
+  if (e.key === "Escape") { $("help").classList.remove("on"); closeGapEditor(); return; }
+  if (typing) return;
+  if (e.key === " ") { e.preventDefault(); player.paused ? player.play() : player.pause(); }
+  else if (e.key === "ArrowLeft")  { e.preventDefault(); player.currentTime = Math.max(0, player.currentTime - 5); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); player.currentTime += 5; }
+  else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault(); e.shiftKey ? redo() : undo();
+  }
+  else if ((e.key === "y" || e.key === "Y") && (e.ctrlKey || e.metaKey)) { e.preventDefault(); redo(); }
+  else if (e.key === "x" || e.key === "X") {
+    const ids = selectionTokenIds() || (S.sel.size ? [...S.sel] : null);
+    if (ids) { toggleTokens(ids); window.getSelection()?.removeAllRanges(); }
+  }
+  else if (e.key === "m" || e.key === "M") addMarker();
+  else if (e.key === "?") $("help").classList.toggle("on");
+});
+$("helpBtn").addEventListener("click", () => $("help").classList.toggle("on"));
+$("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help").classList.remove("on"); });
+
+/* ==================================================================== boot */
+(async function boot() {
+  try {
+    const pending = JSON.parse(localStorage.getItem("retakePendingTransfer") || "null");
+    if (pending?.name && pending?.size) {
+      S.uploadSession = pending.session || null;
+      $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
+      $("progressPanel").classList.add("on");
+      $("progressMsg").textContent = "Transfer paused safely on the laptop.";
+      setUploadActions(false, true);
+    }
+    const st = await api("/status");
+    S.errSeq = st.err_seq;
+    if (st.has_project) await loadProject();
+    else if (["probe","load_model","transcribe","cluster"].includes(st.phase)) {
+      S.loading = true;
+      $("progressPanel").classList.add("on");
+    } else await refreshProjects();
+  } catch (_) {}
+  poll();
+})();
+</script>
+</body>
+</html>

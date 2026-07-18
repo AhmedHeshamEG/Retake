@@ -1,0 +1,9 @@
+services:
+  retake:
+    build: .
+    ports:
+      - "${RETAKE_PORT:-8710}:8710"
+    volumes:
+      - ./models:/app/models
+      - ./projects:/app/projects
+    restart: unless-stopped
