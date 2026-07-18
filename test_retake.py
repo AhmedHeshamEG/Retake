@@ -5,6 +5,7 @@ Run with:  python test_retake.py   (or pytest test_retake.py)
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -519,25 +520,76 @@ def test_real_audio_gaps_are_optional_and_old_slider_is_gone() -> None:
     assert 'id="gapSlider"' not in html
 
 
-def test_exact_quality_export_never_silently_falls_back() -> None:
+def test_default_and_legacy_smart_modes_use_reliable_export() -> None:
     source = Path(retake.__file__).read_text(encoding="utf-8")
     start = source.index("def export_job")
     end = source.index("def export_text", start)
     export_job_source = source[start:end]
-    assert "VideoExportQuality.NEAR_LOSSLESS" in source
-    assert "falling back to re-encode" not in export_job_source
-    assert "_ffmpeg_reencode_cut(proj, keeps, out)" in export_job_source
-    assert 'elif mode == "reencode"' in export_job_source
+    assert "_reliable_video_export(" in export_job_source
+    assert "_smartcut_export(" not in export_job_source
+    assert 'compatibility = mode == "reencode"' in export_job_source
+
+
+def test_reliable_export_command_enforces_continuous_mp4_timing() -> None:
+    proj = {
+        "source_path": "input.MOV",
+        "probe": {"fps": 30.0, "acodec": "aac"},
+    }
+    command = retake._reliable_video_command(
+        proj, [(1.0, 2.0), (4.0, 5.5)], Path("output.mp4"), "h264_nvenc"
+    )
+    joined = " ".join(command)
+    assert "h264_nvenc" in command and "-cq" in command and "18" in command
+    assert "-fps_mode cfr" in joined
+    assert "-r 30" in joined
+    assert "-video_track_timescale 30000" in joined
+    assert "-movflags +faststart" in joined
+    assert "setpts=N/(30*TB),fps=30" in joined
+    assert "-ss 1.000000 -t 4.500000" in joined
+    assert "atrim=start=0.000000:end=1.000000" in joined
+    assert "aresample=async=1:first_pts=0" in joined
+
+
+def test_display_dimensions_apply_phone_rotation() -> None:
+    assert retake.display_dimensions(
+        {"width": 3840, "height": 2160, "rotation": 90}
+    ) == (2160, 3840)
+    assert retake.display_dimensions(
+        {"width": 3840, "height": 2160, "rotation": 0}
+    ) == (3840, 2160)
+
+
+def test_video_timeline_validation_rejects_smartcut_style_gaps() -> None:
+    old_ffprobe, old_run = retake.FFPROBE, retake._run
+    try:
+        retake.FFPROBE = "ffprobe"
+        retake._run = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0,
+            stdout="-0.033333,0.033333\n0.000000,0.033333\n0.033333,0.033333\n",
+            stderr="",
+        )
+        assert retake.validate_video_timeline("good.mp4", 30.0, 0.1) == []
+
+        retake._run = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0,
+            stdout="0.000000,0.001667\n0.100000,0.001667\n0.101667,0.001667\n",
+            stderr="",
+        )
+        errors = retake.validate_video_timeline("bad.mov", 30.0, 0.135)
+        assert any("irregular frame interval" in error for error in errors)
+        assert any("incorrect packet duration" in error for error in errors)
+    finally:
+        retake.FFPROBE, retake._run = old_ffprobe, old_run
 
 
 def test_latest_media_export_is_discovered_and_downloaded_safely() -> None:
     old_current = dict(retake.CURRENT)
     with temporary_project_root() as root:
         project_dir = retake.next_project_directory()
-        source = project_dir / "media" / "original.mp4"
+        source = project_dir / "media" / "original.MOV"
         source.write_bytes(b"source")
         exports = project_dir / "exports"
-        older = exports / "original.retake_cut.mp4"
+        older = exports / "original.retake_cut.MOV"
         newer = exports / "original.retake_cut.1.mp4"
         older.write_bytes(b"older")
         newer.write_bytes(b"newest")
@@ -597,6 +649,8 @@ def test_download_latest_export_tile_uses_direct_browser_transfer() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
     assert 'id="expDownload"' in html
     assert "Download Latest Export" in html
+    assert "Reliable Quality" in html
+    assert 'bindExport("expSmart", "reliable")' in html
     assert 'await api("/export/latest")' in html
     assert 'window.location.assign("/export/latest/download")' in html
 

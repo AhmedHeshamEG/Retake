@@ -449,7 +449,7 @@ Perform a conservative takes edit: group repeated attempts, discard false starts
       <section id="exportCard" class="card">
         <div class="card-head">Export</div>
         <div class="export-grid">
-          <button id="expSmart" class="export-tile primary">✂<b>Exact Quality</b><small>Source copied · near-lossless boundaries</small></button>
+          <button id="expSmart" class="export-tile primary">✂<b>Reliable Quality</b><small>GPU accelerated · smooth playback</small></button>
           <button id="expEdl" class="export-tile">▤<b>EDL / CSV</b><small>For NLEs</small></button>
           <button id="expTxt" class="export-tile">T<b>Transcript</b><small>.txt / .srt</small></button>
           <button id="expReenc" class="export-tile" title="Full re-encode; may change quality"><b>Compatibility</b><small>Full re-encode · may change quality</small></button>
@@ -1391,7 +1391,7 @@ function bindExport(btnId, mode) {
     } catch (e) { toast(e.message, "error"); }
   });
 }
-bindExport("expSmart", "smart");
+bindExport("expSmart", "reliable");
 bindExport("expReenc", "reencode");
 $("headerExport").addEventListener("click", () => {
   if (!S.proj) toast("Open media before exporting", "warn");

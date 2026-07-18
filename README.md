@@ -38,7 +38,13 @@ Tests: `python test_retake.py`. Every project is self-contained under `projects/
 
 When gaps are visible, `Remove gaps in kept sentences` offers a separate scoped batch: sentences with at least one kept word remain eligible, while fully deleted sentences and gaps already covered by consecutive deleted content are skipped. The original `Remove all gaps` action remains available and unchanged.
 
-`Exact Quality` is the default media export. It packet-copies unaffected source media and uses SmartCut's highest broadly compatible near-lossless setting only around unavoidable cut boundaries, then verifies duration, codecs, dimensions, FPS, sample rate, channels, and stream counts. A SmartCut failure stops cleanly; Retake never silently falls back to a full lossy re-encode. `Compatibility` is the explicit full re-encode option.
+`Reliable Quality` is the default media export. It creates a high-quality
+H.264/AAC MP4 with continuous frame timing and uses NVIDIA hardware encoding
+when available. Retake verifies duration, displayed dimensions, FPS, audio
+properties, and every video packet's timing before making the export available.
+If hardware encoding is unavailable or fails, Retake retries with a reliable
+CPU encoder. `Compatibility` uses the same stable timeline with a smaller-file
+quality setting.
 
 `Download Latest Export` transfers the newest completed media export for the
 open project directly through the browser. It works after restarting Retake and

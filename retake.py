@@ -144,6 +144,7 @@ def probe_media(path: str) -> dict[str, Any]:
         duration = float(data.get("format", {}).get("duration") or 0.0)
         vcodec = acodec = None
         width = height = sample_rate = channels = None
+        rotation = 0
         video_streams = audio_streams = 0
         fps = 25.0
         for s in data.get("streams", []):
@@ -156,6 +157,14 @@ def probe_media(path: str) -> dict[str, Any]:
                     vcodec = s.get("codec_name")
                     width = s.get("width")
                     height = s.get("height")
+                    try:
+                        rotation = int(s.get("tags", {}).get("rotate") or 0)
+                        for side_data in s.get("side_data_list", []):
+                            if side_data.get("rotation") is not None:
+                                rotation = int(side_data["rotation"])
+                                break
+                    except (TypeError, ValueError):
+                        rotation = 0
                     rate = s.get("r_frame_rate") or "25/1"
                     try:
                         fps = float(Fraction(rate)) or 25.0
@@ -176,7 +185,8 @@ def probe_media(path: str) -> dict[str, Any]:
             "duration_s": duration, "container": container, "vcodec": vcodec,
             "acodec": acodec, "has_video": vcodec is not None, "fps": fps,
             "width": width, "height": height, "sample_rate": sample_rate,
-            "channels": channels, "video_streams": video_streams,
+            "channels": channels, "rotation": rotation,
+            "video_streams": video_streams,
             "audio_streams": audio_streams,
         }
 
@@ -198,6 +208,7 @@ def probe_media(path: str) -> dict[str, Any]:
         "has_video": vm is not None,
         "fps": float(fm.group(1)) if fm else 25.0,
         "width": None, "height": None, "sample_rate": None, "channels": None,
+        "rotation": 0,
         "video_streams": 1 if vm else 0, "audio_streams": 1 if am else 0,
     }
 
@@ -2057,13 +2068,22 @@ def latest_media_export() -> Optional[Path]:
 
     source = Path(source_path)
     pattern = re.compile(
-        rf"^{re.escape(source.stem)}\.retake_cut(?:\.\d+)?{re.escape(source.suffix)}$",
+        rf"^{re.escape(source.stem)}\.retake_cut(?:\.\d+)?\.[^.]+$",
         re.IGNORECASE,
     )
+    media_suffixes = {
+        source.suffix.lower(), ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
+        ".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+    }
     candidates: list[tuple[int, str, Path]] = []
     for candidate in exports_dir.iterdir():
         try:
-            if candidate.is_symlink() or not candidate.is_file() or not pattern.fullmatch(candidate.name):
+            if (
+                candidate.is_symlink()
+                or not candidate.is_file()
+                or candidate.suffix.lower() not in media_suffixes
+                or not pattern.fullmatch(candidate.name)
+            ):
                 continue
             resolved = candidate.resolve()
             resolved.relative_to(exports_dir)
@@ -2075,22 +2095,6 @@ def latest_media_export() -> Optional[Path]:
     return max(candidates)[2]
 
 
-class _SmartcutProgress:
-    """smartcut progress protocol: first emit(total), then emit(1) increments."""
-
-    def __init__(self) -> None:
-        self.total = 0
-        self.done = 0
-
-    def emit(self, value: int) -> None:
-        if self.total == 0:
-            self.total = max(1, value)
-            return
-        self.done += 1
-        set_status("export", 5 + 90 * self.done / self.total,
-                   f"smart cut… {self.done}/{self.total}")
-
-
 AUDIO_CODEC_MAP: dict[str, list[str]] = {
     "aac": ["-c:a", "aac", "-b:a", "192k"],
     "mp3": ["-c:a", "libmp3lame", "-b:a", "192k"],
@@ -2098,13 +2102,13 @@ AUDIO_CODEC_MAP: dict[str, list[str]] = {
     "vorbis": ["-c:a", "libvorbis", "-q:a", "5"],
     "flac": ["-c:a", "flac"],
 }
-VIDEO_CODEC_MAP: dict[str, list[str]] = {
-    "h264": ["-c:v", "libx264", "-crf", "18", "-preset", "medium"],
-    "hevc": ["-c:v", "libx265", "-crf", "20", "-preset", "medium"],
-    "vp9": ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"],
-    "av1": ["-c:v", "libsvtav1", "-crf", "30"],
-    "mpeg4": ["-c:v", "mpeg4", "-q:v", "3"],
-}
+def display_dimensions(properties: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    """Dimensions as a player displays them after applying rotation metadata."""
+    width, height = properties.get("width"), properties.get("height")
+    rotation = int(properties.get("rotation") or 0) % 360
+    if rotation in (90, 270):
+        return height, width
+    return width, height
 
 
 def _audio_codec_args(acodec: Optional[str]) -> list[str]:
@@ -2150,85 +2154,240 @@ def _ffmpeg_audio_cut(proj: dict[str, Any], keeps: list[tuple[float, float]], ou
     _run_ffmpeg_with_progress(cmd, edited, "cutting audio (sample-accurate)")
 
 
-def _ffmpeg_reencode_cut(proj: dict[str, Any], keeps: list[tuple[float, float]], out: Path) -> None:
-    """Frame-accurate fallback: one full re-encode at matched codec + sane CRF."""
-    sel = "+".join(f"between(t,{a:.6f},{b:.6f})" for a, b in keeps)
+def _ffmpeg_encoder_usable(encoder: str) -> bool:
+    """Test the actual encoder and device, not only FFmpeg's encoder listing."""
+    if not FFMPEG:
+        resolve_ffmpeg()
+    result = _run([
+        FFMPEG, "-v", "error", "-f", "lavfi",
+        "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1",
+        "-an", "-c:v", encoder, "-f", "null", "-",
+    ])
+    return result.returncode == 0
+
+
+def _reliable_video_command(
+    proj: dict[str, Any],
+    keeps: list[tuple[float, float]],
+    out: Path,
+    encoder: str,
+    compatibility: bool = False,
+) -> list[str]:
+    """Build a continuous-CFR H.264/AAC export command."""
+    fps = max(1.0, float(proj["probe"].get("fps") or 25.0))
+    fps_fraction = Fraction(fps).limit_denominator(1001)
+    fps_expr = (
+        str(fps_fraction.numerator)
+        if fps_fraction.denominator == 1
+        else f"{fps_fraction.numerator}/{fps_fraction.denominator}"
+    )
+    track_timescale = (
+        fps_fraction.numerator * 1000
+        if fps_fraction.denominator == 1
+        else fps_fraction.numerator
+    )
+    source_offset = keeps[0][0]
+    input_duration = keeps[-1][1] - source_offset
+    shifted_keeps = [
+        (start - source_offset, end - source_offset) for start, end in keeps
+    ]
+    selection = "+".join(
+        f"between(t,{start:.6f},{end:.6f})" for start, end in shifted_keeps
+    )
     has_audio = proj["probe"].get("acodec") is not None
-    graph = f"[0:v]select='{sel}',setpts=N/FRAME_RATE/TB[v]"
+    graph_parts = [
+        f"[0:v]select='{selection}',"
+        f"setpts=N/({fps_expr}*TB),fps={fps_expr}[v]"
+    ]
     maps = ["-map", "[v]"]
     if has_audio:
-        graph += f";[0:a]aselect='{sel}',asetpts=N/SR/TB[a]"
-        maps += ["-map", "[a]"]
-    vargs = VIDEO_CODEC_MAP.get(proj["probe"].get("vcodec") or "",
-                                ["-c:v", "libx264", "-crf", "18", "-preset", "medium"])
-    aargs = _audio_codec_args(proj["probe"].get("acodec")) if has_audio else []
-    cmd = [FFMPEG, "-y", "-hide_banner", "-i", proj["source_path"],
-           "-filter_complex", graph, *maps, *vargs, *aargs, str(out)]
-    edited = sum(b - a for a, b in keeps)
-    _run_ffmpeg_with_progress(cmd, edited, "re-encoding (fallback)")
-
-
-def _smartcut_export(proj: dict[str, Any], keeps: list[tuple[float, float]], out: Path) -> None:
-    """Frame-accurate smart cut: same container/codec, only cut points re-encoded."""
-    from smartcut.cut_video import (AudioExportInfo, AudioExportSettings,
-                                    VideoExportMode, VideoExportQuality,
-                                    VideoSettings, smart_cut)
-    from smartcut.media_container import MediaContainer
-
-    source = MediaContainer(proj["source_path"])
-    try:
-        segments = [(Fraction(a).limit_denominator(1_000_000),
-                     Fraction(b).limit_denominator(1_000_000)) for a, b in keeps]
-        audio = AudioExportInfo(
-            output_tracks=[AudioExportSettings(codec="passthru")] * len(source.audio_tracks)
+        audio_labels = []
+        for index, (start, end) in enumerate(shifted_keeps):
+            label = f"a{index}"
+            graph_parts.append(
+                f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},"
+                f"asetpts=PTS-STARTPTS[{label}]"
+            )
+            audio_labels.append(f"[{label}]")
+        graph_parts.append(
+            "".join(audio_labels)
+            + f"concat=n={len(audio_labels)}:v=0:a=1,"
+            "aresample=async=1:first_pts=0[a]"
         )
-        # Literal LOSSLESS (QP 0) is rejected by common H.264 High-profile files.
-        # CRF 3 is SmartCut's highest broadly compatible preset; only boundary
-        # GOPs use it, while all unaffected source packets remain passthrough.
-        video = VideoSettings(VideoExportMode.SMARTCUT, VideoExportQuality.NEAR_LOSSLESS, "copy")
-        err = smart_cut(source, segments, str(out), audio_export_info=audio,
-                        video_settings=video, progress=_SmartcutProgress())
-        if err is not None:
-            raise err
-    finally:
+        maps.extend(["-map", "[a]"])
+
+    if encoder == "h264_nvenc":
+        quality = "23" if compatibility else "18"
+        preset = "p4" if compatibility else "p6"
+        video_args = [
+            "-c:v", encoder, "-preset", preset, "-tune", "hq",
+            "-rc", "vbr", "-cq", quality, "-b:v", "0",
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+        ]
+    else:
+        quality = "22" if compatibility else "18"
+        preset = "veryfast" if compatibility else "fast"
+        video_args = [
+            "-c:v", "libx264", "-crf", quality, "-preset", preset,
+            "-profile:v", "high", "-pix_fmt", "yuv420p",
+        ]
+
+    audio_args = ["-c:a", "aac", "-b:a", "192k"] if has_audio else ["-an"]
+    return [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{source_offset:.6f}", "-t", f"{input_duration:.6f}",
+        "-i", proj["source_path"],
+        "-filter_complex", ";".join(graph_parts),
+        *maps,
+        "-map_metadata", "0", "-map_chapters", "-1",
+        *video_args, *audio_args,
+        "-r", fps_expr, "-fps_mode", "cfr",
+        "-video_track_timescale", str(track_timescale),
+        "-metadata:s:v:0", "rotate=0",
+        "-max_muxing_queue_size", "4096",
+        "-shortest", "-movflags", "+faststart",
+        str(out),
+    ]
+
+
+def _reliable_video_export(
+    proj: dict[str, Any],
+    keeps: list[tuple[float, float]],
+    out: Path,
+    compatibility: bool = False,
+) -> str:
+    """Export with GPU acceleration when usable, with one safe CPU fallback."""
+    edited = sum(end - start for start, end in keeps)
+    encoders = (
+        ["h264_nvenc", "libx264"]
+        if _ffmpeg_encoder_usable("h264_nvenc")
+        else ["libx264"]
+    )
+    first_error: Optional[Exception] = None
+    for encoder in encoders:
+        label = "NVIDIA GPU" if encoder == "h264_nvenc" else "CPU"
         try:
-            source.close()
-        except Exception:
-            pass
+            command = _reliable_video_command(
+                proj, keeps, out, encoder, compatibility=compatibility
+            )
+            _run_ffmpeg_with_progress(
+                command, edited, f"reliable {label} export"
+            )
+            return label
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            if encoder == "h264_nvenc" and "libx264" in encoders:
+                log.warning("NVIDIA export failed; retrying on CPU: %s", exc)
+                try:
+                    out.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            raise
+    raise RuntimeError(f"reliable export failed: {first_error}")
 
 
-def verify_export_properties(
+def validate_video_timeline(path: str, fps: float, expected_duration: float) -> list[str]:
+    """Reject muxed video whose DTS cadence or packet durations are irregular."""
+    if not FFPROBE:
+        return ["ffprobe is required to verify reliable export timing"]
+    result = _run([
+        FFPROBE, "-v", "error", "-select_streams", "v:0",
+        "-show_packets", "-show_entries", "packet=dts_time,duration_time",
+        "-of", "csv=p=0", path,
+    ])
+    if result.returncode != 0:
+        return [f"could not inspect video timing: {result.stderr.strip()[:200]}"]
+
+    frame_duration = 1.0 / max(1.0, fps)
+    tolerance = max(0.002, frame_duration * 0.2)
+    previous_dts: Optional[float] = None
+    packet_count = non_monotonic = bad_spacing = bad_duration = 0
+    first_dts = last_dts = None
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(",")
+        if len(fields) < 2 or "N/A" in fields[:2]:
+            continue
+        try:
+            dts, duration = float(fields[0]), float(fields[1])
+        except ValueError:
+            continue
+        packet_count += 1
+        if first_dts is None:
+            first_dts = dts
+        last_dts = dts
+        if previous_dts is not None:
+            delta = dts - previous_dts
+            if delta <= 0:
+                non_monotonic += 1
+            elif abs(delta - frame_duration) > tolerance:
+                bad_spacing += 1
+        if abs(duration - frame_duration) > tolerance:
+            bad_duration += 1
+        previous_dts = dts
+
+    errors: list[str] = []
+    if packet_count == 0:
+        return ["export contains no readable video packets"]
+    if non_monotonic:
+        errors.append(f"{non_monotonic} non-monotonic video timestamp(s)")
+    if bad_spacing:
+        errors.append(f"{bad_spacing} irregular frame interval(s)")
+    if bad_duration:
+        errors.append(f"{bad_duration} incorrect packet duration(s)")
+    if first_dts is not None and last_dts is not None:
+        timeline_duration = last_dts - first_dts + frame_duration
+        if abs(timeline_duration - expected_duration) > max(0.25, 3 * frame_duration):
+            errors.append(
+                f"video timeline is {timeline_duration:.3f}s; "
+                f"expected {expected_duration:.3f}s"
+            )
+    return errors
+
+
+def reliable_export_integrity_errors(
     source_path: str, output_path: str, expected_duration: float,
 ) -> list[str]:
-    """Return precise source/output differences that matter to media quality."""
+    """Property and packet-timing checks required before publishing an export."""
     source = probe_media(source_path)
     output = probe_media(output_path)
-    warnings: list[str] = []
     fps = float(source.get("fps") or 25.0)
-    tolerance = max(0.25, 2.0 / max(1.0, fps))
-    if abs(float(output["duration_s"]) - expected_duration) > tolerance:
-        warnings.append(
+    errors: list[str] = []
+    if abs(float(output["duration_s"]) - expected_duration) > max(0.25, 3.0 / fps):
+        errors.append(
             f"duration {output['duration_s']:.3f}s vs expected {expected_duration:.3f}s"
         )
-    comparisons = [
-        ("width", "video width"), ("height", "video height"),
-        ("vcodec", "video codec"), ("acodec", "audio codec"),
-        ("sample_rate", "audio sample rate"), ("channels", "audio channels"),
-        ("video_streams", "video stream count"), ("audio_streams", "audio stream count"),
-    ]
-    for key, label in comparisons:
+    if output.get("vcodec") != "h264":
+        errors.append(f"video codec is {output.get('vcodec') or 'missing'}, expected h264")
+    if output.get("video_streams") != 1:
+        errors.append(f"video stream count is {output.get('video_streams')}, expected 1")
+    expected_audio = 1 if source.get("audio_streams") else 0
+    if output.get("audio_streams") != expected_audio:
+        errors.append(
+            f"audio stream count is {output.get('audio_streams')}, expected {expected_audio}"
+        )
+    if expected_audio and output.get("acodec") != "aac":
+        errors.append(f"audio codec is {output.get('acodec') or 'missing'}, expected aac")
+    if display_dimensions(source) != display_dimensions(output):
+        errors.append(
+            f"display dimensions changed from {display_dimensions(source)} "
+            f"to {display_dimensions(output)}"
+        )
+    if abs(float(output.get("fps") or 0.0) - fps) > 0.01:
+        errors.append(f"frame rate changed from {fps:g} to {output.get('fps')}")
+    for key, label in (("sample_rate", "audio sample rate"), ("channels", "audio channels")):
         before, after = source.get(key), output.get(key)
-        if before is not None and after is not None and before != after:
-            warnings.append(f"{label} changed from {before} to {after}")
-    source_fps, output_fps = source.get("fps"), output.get("fps")
-    if source_fps and output_fps and abs(float(source_fps) - float(output_fps)) > 0.01:
-        warnings.append(f"frame rate changed from {source_fps:g} to {output_fps:g}")
-    return warnings
+        if expected_audio and before is not None and after is not None and before != after:
+            errors.append(f"{label} changed from {before} to {after}")
+    errors.extend(validate_video_timeline(output_path, fps, expected_duration))
+    return errors
 
 
 def export_job(mode: str) -> None:
-    """Quality-safe Smart Cut; re-encode only when the user explicitly requests it."""
+    """Reliable CFR export; legacy smart clients are routed to the same safe path."""
     out: Optional[Path] = None
+    work_out: Optional[Path] = None
     try:
         proj = CURRENT["project"]
         assert proj is not None
@@ -2238,43 +2397,46 @@ def export_job(mode: str) -> None:
             raise RuntimeError("everything is cut - nothing to export")
         edited = sum(b - a for a, b in keeps)
         warning: Optional[str] = None
-        set_status("export", 3, "starting exact-quality export")
-        out = export_output_path(proj, "retake_cut")
-
-        if mode == "reencode" and not proj["probe"].get("has_video"):
+        has_video = bool(proj["probe"].get("has_video"))
+        if not has_video:
+            set_status("export", 3, "starting sample-accurate audio export")
+            out = export_output_path(proj, "retake_cut")
             warning = "compatibility mode: audio was fully re-encoded and may change quality"
             _ffmpeg_audio_cut(proj, keeps, out)
-        elif mode == "reencode":
-            warning = "compatibility mode: media was fully re-encoded and may change quality"
-            _ffmpeg_reencode_cut(proj, keeps, out)
         else:
-            _smartcut_export(proj, keeps, out)
-
-        try:
-            differences = verify_export_properties(proj["source_path"], str(out), edited)
-            if differences:
-                warning = ((warning + " | ") if warning else "") + " | ".join(differences)
-        except Exception as exc:
-            warning = ((warning + " | ") if warning else "") + f"could not verify output: {exc}"
+            compatibility = mode == "reencode"
+            set_status("export", 3, "starting reliable video export")
+            out = export_output_path(proj, "retake_cut", ".mp4")
+            work_out = out.with_name(f"{out.stem}.partial{out.suffix}")
+            encoder = _reliable_video_export(
+                proj, keeps, work_out, compatibility=compatibility
+            )
+            set_status("export", 96, "verifying frame timing")
+            integrity_errors = reliable_export_integrity_errors(
+                proj["source_path"], str(work_out), edited
+            )
+            if integrity_errors:
+                raise RuntimeError("integrity check failed: " + " | ".join(integrity_errors))
+            os.replace(work_out, out)
+            work_out = None
+            if compatibility:
+                warning = (
+                    f"compatibility mode used the {encoder} encoder with a smaller-file setting"
+                )
 
         with _STATE_LOCK:
             LAST_EXPORT["path"] = str(out)
             LAST_EXPORT["warning"] = warning
         set_status("ready", 100, f"exported: {out}")
-        log.info("export ok: %s (%s)", out, warning or "verified exact quality")
+        log.info("export ok: %s (%s)", out, warning or "verified smooth frame timing")
     except Exception as exc:
-        if out is not None and out.exists():
+        cleanup = work_out if work_out is not None else out
+        if cleanup is not None and cleanup.exists():
             try:
-                out.unlink()
+                cleanup.unlink()
             except OSError:
-                log.warning("could not remove partial export: %s", out)
-        if mode == "smart":
-            fail(
-                f"Exact Quality export failed without re-encoding the whole file: {exc}. "
-                "Use Compatibility Re-encode only if you accept a full re-encode."
-            )
-        else:
-            fail(f"export failed: {exc}")
+                log.warning("could not remove partial export: %s", cleanup)
+        fail(f"reliable export failed: {exc}")
     finally:
         JOB_LOCK.release()
 
