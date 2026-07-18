@@ -13,6 +13,7 @@ import asyncio
 import csv
 import difflib
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -79,6 +80,11 @@ UPLOAD_CHUNK_MAX_BYTES = 2 * 1024 * 1024
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
 PREVIEW_PROXY_VERSION = 2
+ALIGNMENT_VERSION = 1
+ALIGNMENT_MIN_COVERAGE = 0.85
+ALIGNMENT_MIN_SCORE = 0.45
+ALIGNMENT_MAX_WORD_SECONDS = 2.5
+WORD_CUT_SAFETY_S = 0.06
 
 # --------------------------------------------------------------------------
 # ffmpeg / ffprobe resolution
@@ -223,7 +229,7 @@ JOB_LOCK = threading.Lock()  # one heavy job at a time
 PROJECT_ALLOC_LOCK = threading.Lock()
 
 STATUS: dict[str, Any] = {
-    # idle|probe|load_model|transcribe|cluster|ready|ai|export|preview|error
+    # idle|probe|load_model|transcribe|cluster|ready|ai|align|export|preview|error
     "phase": "idle",
     "pct": 0.0,
     "msg": "",
@@ -240,6 +246,10 @@ LAST_EXPORT: dict[str, Any] = {"path": None, "warning": None}
 PREVIEW_STATE: dict[str, Any] = {
     "running": False, "identity": None, "error": None,
     "device": None, "fallback": False,
+}
+ALIGNMENT_STATE: dict[str, Any] = {
+    "running": False, "identity": None, "error": None,
+    "device": None, "fallback": False, "coverage": None,
 }
 _PREVIEW_GPU_USABLE: Optional[bool] = None
 
@@ -412,6 +422,7 @@ def _timed_interval(item: dict[str, Any]) -> Optional[tuple[float, float]]:
 
 def consecutive_word_cut_intervals(
     tokens: list[dict[str, Any]],
+    safety_handle: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Collapse every consecutive run of cut spoken words into one interval.
 
@@ -432,18 +443,37 @@ def consecutive_word_cut_intervals(
 
     intervals: list[tuple[float, float]] = []
     run: Optional[tuple[float, float]] = None
+    previous_kept_end: Optional[float] = None
     for start, end, _token_id, is_cut in words:
         if is_cut:
-            run = (run[0], max(run[1], end)) if run is not None else (start, end)
+            if run is not None:
+                run = (run[0], max(run[1], end))
+            else:
+                protected_start = start
+                if safety_handle > 0 and previous_kept_end is not None:
+                    protected_start = max(
+                        protected_start, previous_kept_end + safety_handle
+                    )
+                run = (protected_start, end)
         elif run is not None:
-            intervals.append(run)
+            protected_end = run[1]
+            if safety_handle > 0:
+                protected_end = min(protected_end, start - safety_handle)
+            if protected_end > run[0] + MERGE_EPS:
+                intervals.append((run[0], protected_end))
             run = None
+            previous_kept_end = end
+        else:
+            previous_kept_end = end
     if run is not None:
-        intervals.append(run)
+        if run[1] > run[0] + MERGE_EPS:
+            intervals.append(run)
     return intervals
 
 
-def transcript_cut_intervals(tokens: list[dict[str, Any]]) -> list[tuple[float, float]]:
+def transcript_cut_intervals(
+    tokens: list[dict[str, Any]], safety_handle: float = 0.0,
+) -> list[tuple[float, float]]:
     """Continuous spoken-word runs plus explicitly cut legacy gap tokens."""
     legacy_gap_cuts = [
         interval
@@ -451,12 +481,27 @@ def transcript_cut_intervals(tokens: list[dict[str, Any]]) -> list[tuple[float, 
         if token.get("kind") != "word" and token.get("cut")
         if (interval := _timed_interval(token)) is not None
     ]
-    return merge_intervals(consecutive_word_cut_intervals(tokens) + legacy_gap_cuts)
+    return merge_intervals(
+        consecutive_word_cut_intervals(tokens, safety_handle) + legacy_gap_cuts
+    )
+
+
+def project_uses_aligned_timing(proj: dict[str, Any]) -> bool:
+    alignment = proj.get("alignment")
+    return (
+        isinstance(alignment, dict)
+        and alignment.get("status") == "aligned"
+        and alignment.get("version") == ALIGNMENT_VERSION
+        and float(alignment.get("coverage") or 0.0) >= ALIGNMENT_MIN_COVERAGE
+    )
 
 
 def cut_intervals_from_tokens(proj: dict[str, Any]) -> list[tuple[float, float]]:
     """All accepted edits, with consecutive cut words composed continuously."""
-    transcript_cuts = transcript_cut_intervals(proj.get("tokens", []))
+    safety_handle = WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
+    transcript_cuts = transcript_cut_intervals(
+        proj.get("tokens", []), safety_handle=safety_handle
+    )
     gap_cuts = [
         interval
         for gap in proj.get("audio_gaps", [])
@@ -492,7 +537,10 @@ def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
         for words in segment_words.values()
         if words
     ]
-    word_cuts = consecutive_word_cut_intervals(proj.get("tokens", []))
+    word_cuts = consecutive_word_cut_intervals(
+        proj.get("tokens", []),
+        safety_handle=WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0,
+    )
 
     candidates: list[tuple[float, str]] = []
     for gap in proj.get("audio_gaps", []):
@@ -526,8 +574,13 @@ def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
 def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
     """Project JSON plus authoritative derived intervals, without mutating it."""
     payload = dict(proj)
-    payload["word_cut_intervals"] = consecutive_word_cut_intervals(proj.get("tokens", []))
-    payload["transcript_cut_intervals"] = transcript_cut_intervals(proj.get("tokens", []))
+    safety_handle = WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
+    payload["word_cut_intervals"] = consecutive_word_cut_intervals(
+        proj.get("tokens", []), safety_handle=safety_handle
+    )
+    payload["transcript_cut_intervals"] = transcript_cut_intervals(
+        proj.get("tokens", []), safety_handle=safety_handle
+    )
     payload["cut_intervals"] = cut_intervals_from_tokens(proj)
     payload["scoped_gap_candidate_ids"] = scoped_gap_candidate_ids(proj)
     return payload
@@ -729,6 +782,428 @@ def build_tokens(
 
 
 # --------------------------------------------------------------------------
+# Forced word alignment (isolated WhisperX worker)
+# --------------------------------------------------------------------------
+
+def alignment_segments_for_project(
+    proj: dict[str, Any], max_span: float = 30.0, padding: float = 2.5,
+) -> list[dict[str, Any]]:
+    """Group transcript sections into bounded, padded forced-alignment windows."""
+    duration = float(proj.get("duration_s") or 0.0)
+    source: list[dict[str, Any]] = []
+    for segment in proj.get("segments", []):
+        text = str(segment.get("text", "")).strip()
+        interval = _timed_interval(segment)
+        if text and interval is not None:
+            source.append({
+                "start": interval[0], "end": interval[1], "text": text,
+            })
+    source.sort(key=lambda item: (item["start"], item["end"]))
+    if not source:
+        words = [
+            token for token in proj.get("tokens", [])
+            if token.get("kind") == "word" and _timed_interval(token) is not None
+        ]
+        if words:
+            source = [{
+                "start": float(words[0]["start"]),
+                "end": float(words[-1]["end"]),
+                "text": " ".join(str(word.get("text", "")) for word in words),
+            }]
+
+    grouped: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for segment in source:
+        if current and segment["end"] - current[0]["start"] > max_span:
+            grouped.append({
+                "start": max(0.0, current[0]["start"] - padding),
+                "end": min(duration, current[-1]["end"] + padding),
+                "text": " ".join(item["text"] for item in current),
+            })
+            current = []
+        current.append(segment)
+    if current:
+        grouped.append({
+            "start": max(0.0, current[0]["start"] - padding),
+            "end": min(duration, current[-1]["end"] + padding),
+            "text": " ".join(item["text"] for item in current),
+        })
+    return grouped
+
+
+def alignment_python_path() -> Optional[Path]:
+    override = os.environ.get("RETAKE_ALIGN_PYTHON")
+    candidates = [Path(override)] if override else []
+    candidates.extend([
+        MODELS_DIR / "alignment-runtime" / "Scripts" / "python.exe",
+        MODELS_DIR / "alignment-runtime" / "bin" / "python",
+    ])
+    if importlib.util.find_spec("whisperx") is not None:
+        candidates.append(Path(sys.executable))
+    return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def alignment_worker_call(proj: dict[str, Any], device: str) -> dict[str, Any]:
+    """Run one device attempt out of process so failures release all GPU state."""
+    python = alignment_python_path()
+    if python is None:
+        raise RuntimeError(
+            "alignment runtime is not installed under models/alignment-runtime"
+        )
+    payload = {
+        "device": device,
+        "source_path": str(Path(proj["source_path"]).resolve()),
+        "language": str(proj.get("language") or "en"),
+        "segments": alignment_segments_for_project(proj),
+        "model_dir": str((MODELS_DIR / "alignment").resolve()),
+        "ffmpeg": FFMPEG,
+    }
+    if not payload["segments"]:
+        raise RuntimeError("project transcript contains no alignable sections")
+    environment = os.environ.copy()
+    environment.pop("HF_HUB_OFFLINE", None)
+    environment.pop("TRANSFORMERS_OFFLINE", None)
+    environment["HF_HOME"] = str((MODELS_DIR / "alignment" / "huggingface").resolve())
+    nltk_data = (MODELS_DIR / "alignment" / "nltk").resolve()
+    nltk_data.mkdir(parents=True, exist_ok=True)
+    environment["NLTK_DATA"] = str(nltk_data)
+    result = subprocess.run(
+        [str(python), str(ROOT / "alignment_worker.py")],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=environment, timeout=7200,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip()[-1200:] or "alignment worker failed"
+        raise RuntimeError(detail)
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("alignment worker returned invalid output") from exc
+    if not isinstance(output.get("words"), list):
+        raise RuntimeError("alignment worker returned no word timings")
+    return output
+
+
+def run_forced_alignment(proj: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Attempt CUDA first and retry exactly once on CPU."""
+    failures: list[str] = []
+    for device in ("cuda", "cpu"):
+        with _STATE_LOCK:
+            ALIGNMENT_STATE.update(
+                device=device, fallback=device == "cpu", error=None,
+            )
+        try:
+            return alignment_worker_call(proj, device), device == "cpu"
+        except Exception as exc:
+            failures.append(f"{device}: {exc}")
+            if device == "cuda":
+                log.warning("GPU alignment failed; retrying on CPU: %s", exc)
+                continue
+            raise RuntimeError(" | ".join(failures)) from exc
+    raise RuntimeError(" | ".join(failures) or "alignment failed")
+
+
+def _aligned_word_is_trustworthy(word: dict[str, Any]) -> bool:
+    try:
+        start, end = float(word["start"]), float(word["end"])
+        score = float(word.get("score", 0.0))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(start) and math.isfinite(end)
+        and 0.0 <= start < end
+        and score >= ALIGNMENT_MIN_SCORE
+        and end - start <= ALIGNMENT_MAX_WORD_SECONDS
+    )
+
+
+def recalibrate_legacy_gap_timings(
+    tokens: list[dict[str, Any]], duration: float,
+) -> None:
+    """Constrain saved transcript gaps between their newly aligned neighbors."""
+    next_words: list[Optional[dict[str, Any]]] = [None] * len(tokens)
+    following: Optional[dict[str, Any]] = None
+    for index in range(len(tokens) - 1, -1, -1):
+        next_words[index] = following
+        if tokens[index].get("kind") == "word":
+            following = tokens[index]
+
+    previous: Optional[dict[str, Any]] = None
+    for index, token in enumerate(tokens):
+        if token.get("kind") == "word":
+            previous = token
+            continue
+        following = next_words[index]
+        previous_interval = _timed_interval(previous) if previous is not None else None
+        following_interval = _timed_interval(following) if following is not None else None
+        start = previous_interval[1] if previous_interval is not None else 0.0
+        end = following_interval[0] if following_interval is not None else duration
+        if previous is not None and not previous.get("cut"):
+            start += WORD_CUT_SAFETY_S
+        if following is not None and not following.get("cut"):
+            end -= WORD_CUT_SAFETY_S
+        start = max(0.0, min(duration, start))
+        end = max(0.0, min(duration, end))
+        if end <= start + MERGE_EPS:
+            end = start
+        token["start"] = round(start, 3)
+        token["end"] = round(end, 3)
+
+
+def apply_aligned_word_timings(
+    proj: dict[str, Any], result: dict[str, Any], fallback: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a validated copy with only confidently mapped word times changed."""
+    candidate = json.loads(json.dumps(proj))
+    original_words = [
+        token for token in proj.get("tokens", []) if token.get("kind") == "word"
+    ]
+    candidate_words = [
+        token for token in candidate.get("tokens", []) if token.get("kind") == "word"
+    ]
+    aligned_words = [
+        word for word in result.get("words", [])
+        if isinstance(word, dict) and str(word.get("word", "")).strip()
+    ]
+    original_norm = [norm_word(str(word.get("text", ""))) for word in original_words]
+    aligned_norm = [norm_word(str(word.get("word", ""))) for word in aligned_words]
+    matcher = difflib.SequenceMatcher(
+        None, original_norm, aligned_norm, autojunk=False
+    )
+    accepted_indices: set[int] = set()
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            old_index = block.a + offset
+            aligned = aligned_words[block.b + offset]
+            if not _aligned_word_is_trustworthy(aligned):
+                continue
+            candidate_words[old_index]["start"] = round(float(aligned["start"]), 3)
+            candidate_words[old_index]["end"] = round(float(aligned["end"]), 3)
+            candidate_words[old_index]["alignment_score"] = round(
+                float(aligned.get("score", 0.0)), 4
+            )
+            accepted_indices.add(old_index)
+
+    # Independently padded windows can occasionally align a boundary word into
+    # the previous window. Revert only the conflicting proposal; never reorder
+    # transcript tokens or guess a replacement time.
+    for _pass in range(2):
+        changed = False
+        for index in range(1, len(candidate_words)):
+            previous = _timed_interval(candidate_words[index - 1])
+            current = _timed_interval(candidate_words[index])
+            if previous is None or current is None or current[0] + MERGE_EPS >= previous[0]:
+                continue
+            revert_index = (
+                index if index in accepted_indices
+                else index - 1 if index - 1 in accepted_indices
+                else None
+            )
+            if revert_index is None:
+                continue
+            original = original_words[revert_index]
+            candidate_words[revert_index]["start"] = original.get("start")
+            candidate_words[revert_index]["end"] = original.get("end")
+            candidate_words[revert_index].pop("alignment_score", None)
+            accepted_indices.remove(revert_index)
+            changed = True
+        if not changed:
+            break
+
+    total = len(original_words)
+    accepted = len(accepted_indices)
+    coverage = accepted / total if total else 0.0
+    if coverage < ALIGNMENT_MIN_COVERAGE:
+        raise RuntimeError(
+            f"alignment coverage {coverage:.1%} is below "
+            f"the required {ALIGNMENT_MIN_COVERAGE:.0%}"
+        )
+
+    old_signature = [
+        (token.get("id"), token.get("kind"), token.get("text"), bool(token.get("cut")))
+        for token in proj.get("tokens", [])
+    ]
+    new_signature = [
+        (token.get("id"), token.get("kind"), token.get("text"), bool(token.get("cut")))
+        for token in candidate.get("tokens", [])
+    ]
+    if old_signature != new_signature:
+        raise RuntimeError("alignment changed token identity or edit decisions")
+
+    duration = float(candidate.get("duration_s") or 0.0)
+    recalibrate_legacy_gap_timings(candidate.get("tokens", []), duration)
+    previous_start = -1.0
+    for index, word in enumerate(candidate_words):
+        interval = _timed_interval(word)
+        original_interval = _timed_interval(original_words[index])
+        if interval is None:
+            if original_interval is None and index not in accepted_indices:
+                continue
+            raise RuntimeError("alignment produced an invalid word interval")
+        if interval[0] < 0 or interval[1] > duration + 0.05:
+            raise RuntimeError("alignment produced an invalid word interval")
+        if interval[0] + MERGE_EPS < previous_start:
+            if index not in accepted_indices and original_interval == interval:
+                continue
+            raise RuntimeError("alignment produced non-chronological word timings")
+        previous_start = interval[0]
+
+    by_segment: dict[Any, list[dict[str, Any]]] = {}
+    for word in candidate_words:
+        if "seg" in word:
+            by_segment.setdefault(word["seg"], []).append(word)
+    for segment in candidate.get("segments", []):
+        words = by_segment.get(segment.get("id"), [])
+        if words:
+            segment["start"] = round(min(float(word["start"]) for word in words), 3)
+            segment["end"] = round(max(float(word["end"]) for word in words), 3)
+
+    stats = {
+        "version": ALIGNMENT_VERSION,
+        "status": "aligned",
+        "device": str(result.get("device") or ("cpu" if fallback else "cuda")),
+        "fallback": bool(fallback),
+        "model": str(result.get("model") or "whisperx-default"),
+        "matched_words": accepted,
+        "total_words": total,
+        "coverage": round(coverage, 6),
+        "elapsed_s": float(result.get("elapsed_s") or 0.0),
+        "completed_at": utc_now(),
+    }
+    candidate["alignment"] = stats
+    return candidate, stats
+
+
+def alignment_source_identity(proj: dict[str, Any]) -> dict[str, Any]:
+    source = Path(str(proj["source_path"])).resolve()
+    stat = source.stat()
+    transcript = [
+        (token.get("id"), token.get("text"))
+        for token in proj.get("tokens", [])
+        if token.get("kind") == "word"
+    ]
+    digest = hashlib.sha256(
+        json.dumps(transcript, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "version": ALIGNMENT_VERSION,
+        "source_name": source.name,
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "transcript_sha256": digest,
+    }
+
+
+def alignment_status_payload() -> dict[str, Any]:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        state = dict(ALIGNMENT_STATE)
+    if proj is None:
+        return {
+            "state": "no_project", "ready": False, "running": False,
+            "runtime_ready": alignment_python_path() is not None,
+        }
+    try:
+        identity = alignment_source_identity(proj)
+    except (KeyError, FileNotFoundError, OSError):
+        return {
+            "state": "unavailable", "ready": False, "running": False,
+            "runtime_ready": alignment_python_path() is not None,
+            "error": "Source media is unavailable.",
+        }
+    saved = proj.get("alignment") if isinstance(proj.get("alignment"), dict) else {}
+    if (
+        saved.get("status") == "aligned"
+        and saved.get("version") == ALIGNMENT_VERSION
+        and saved.get("source") == identity
+    ):
+        return {
+            "state": "ready", "ready": True, "running": False,
+            "runtime_ready": True, "error": None,
+            "device": saved.get("device"), "fallback": bool(saved.get("fallback")),
+            "coverage": saved.get("coverage"),
+        }
+    if state.get("running") and state.get("identity") == identity:
+        return {
+            "state": "preparing", "ready": False, "running": True,
+            "runtime_ready": alignment_python_path() is not None, "error": None,
+            "device": state.get("device"), "fallback": bool(state.get("fallback")),
+            "coverage": None,
+        }
+    if state.get("error") and state.get("identity") == identity:
+        return {
+            "state": "failed", "ready": False, "running": False,
+            "runtime_ready": alignment_python_path() is not None,
+            "error": str(state["error"]), "device": state.get("device"),
+            "fallback": bool(state.get("fallback")), "coverage": None,
+        }
+    return {
+        "state": "available" if alignment_python_path() is not None else "unavailable",
+        "ready": False, "running": False,
+        "runtime_ready": alignment_python_path() is not None,
+        "error": (
+            None if alignment_python_path() is not None
+            else "Accurate timing runtime is not installed."
+        ),
+        "device": None, "fallback": False, "coverage": None,
+    }
+
+
+def recalibrate_alignment_job(
+    proj: dict[str, Any], identity: dict[str, Any],
+) -> None:
+    try:
+        project_dir = project_directory_for_media(proj["source_path"])
+        if project_dir is None:
+            raise RuntimeError("project folder is unavailable")
+        backup = project_dir / (
+            "project.alignment-backup-"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            + ".json"
+        )
+        atomic_write_json(backup, proj)
+        set_status("align", 4, "aligning transcript on GPU")
+        result, fallback = run_forced_alignment(proj)
+        set_status("align", 92, "validating aligned word boundaries")
+
+        with _STATE_LOCK:
+            latest = CURRENT["project"]
+            if latest is None or alignment_source_identity(latest) != identity:
+                raise RuntimeError("project changed while timing was being aligned")
+            candidate, stats = apply_aligned_word_timings(latest, result, fallback)
+            stats["source"] = identity
+            candidate["alignment"] = stats
+            candidate["updated_at"] = utc_now()
+            atomic_write_json(project_dir / "project.json", candidate)
+            CURRENT["project"] = candidate
+            ALIGNMENT_STATE.update(
+                running=False, identity=identity, error=None,
+                device=stats["device"], fallback=stats["fallback"],
+                coverage=stats["coverage"],
+            )
+        set_status(
+            "ready", 100,
+            (
+                f"timing calibrated on {stats['device'].upper()} "
+                f"({stats['coverage']:.1%} words)"
+            ),
+        )
+        log.info(
+            "alignment ready device=%s fallback=%s coverage=%.1f%% backup=%s",
+            stats["device"], stats["fallback"], stats["coverage"] * 100, backup,
+        )
+    except Exception as exc:
+        with _STATE_LOCK:
+            ALIGNMENT_STATE.update(
+                running=False, identity=identity, error=str(exc), coverage=None,
+            )
+        fail(f"timing recalibration failed: {exc}")
+    finally:
+        JOB_LOCK.release()
+
+
+# --------------------------------------------------------------------------
 # Retake coloring: word repeats + sentence clusters (deterministic, no LLM)
 # --------------------------------------------------------------------------
 
@@ -907,7 +1382,9 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                 )
                 set_status("transcribe", 4, f"transcribing with {model_name} ({device})")
                 seg_iter, info = model.transcribe(
-                    media_path, word_timestamps=True, vad_filter=False,
+                    media_path, word_timestamps=True, vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 200},
+                    condition_on_previous_text=False,
                     language=requested_language or None,
                 )
                 language = info.language or "en"
@@ -932,6 +1409,48 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             raise last_err
 
         tokens, segments = build_tokens(fw_segments, duration, GAP_THRESHOLD_DEFAULT)
+        # The CTranslate2 model can occupy most of a small GPU. Release it
+        # before the isolated forced-aligner gets its GPU-first attempt.
+        if "model" in locals():
+            del model
+            import gc
+            gc.collect()
+
+        alignment_meta: dict[str, Any]
+        alignment_draft = {
+            "source_path": str(Path(media_path).resolve()),
+            "duration_s": round(duration, 3),
+            "language": language,
+            "tokens": tokens,
+            "segments": segments,
+        }
+        if alignment_python_path() is not None:
+            try:
+                set_status("align", 92, "calibrating word timing on GPU")
+                aligned_result, alignment_fallback = run_forced_alignment(
+                    alignment_draft
+                )
+                aligned_draft, alignment_meta = apply_aligned_word_timings(
+                    alignment_draft, aligned_result, alignment_fallback
+                )
+                tokens = aligned_draft["tokens"]
+                segments = aligned_draft["segments"]
+                alignment_meta["source"] = alignment_source_identity(aligned_draft)
+            except Exception as alignment_error:
+                log.warning(
+                    "new transcript alignment failed; saving unaligned timing: %s",
+                    alignment_error,
+                )
+                alignment_meta = {
+                    "version": ALIGNMENT_VERSION, "status": "unaligned",
+                    "error": str(alignment_error), "completed_at": utc_now(),
+                }
+        else:
+            alignment_meta = {
+                "version": ALIGNMENT_VERSION, "status": "unaligned",
+                "error": "Accurate timing runtime is not installed.",
+                "completed_at": utc_now(),
+            }
         set_status("cluster", 95, "coloring retakes")
         clusters = find_clusters(segments)
         word_repeats = find_word_repeats(tokens)
@@ -956,6 +1475,7 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             },
             "language": language,
             "requested_language": requested_language or "auto",
+            "alignment": alignment_meta,
             "tokens": tokens,
             "segments": segments,
             "clusters": clusters,
@@ -2915,6 +3435,7 @@ def get_status() -> JSONResponse:
         s["has_project"] = CURRENT["project"] is not None
         s["export"] = dict(LAST_EXPORT)
     s["preview"] = preview_status_payload()
+    s["alignment"] = alignment_status_payload()
     return JSONResponse(s)
 
 
@@ -3171,6 +3692,49 @@ def get_preview_status() -> JSONResponse:
     return JSONResponse(preview_status_payload())
 
 
+@app.get("/alignment/status")
+def get_alignment_status() -> JSONResponse:
+    return JSONResponse(alignment_status_payload())
+
+
+@app.post("/alignment/recalibrate")
+def start_alignment_recalibration() -> JSONResponse:
+    with _STATE_LOCK:
+        current = CURRENT["project"]
+        proj = json.loads(json.dumps(current)) if current is not None else None
+    if proj is None:
+        return JSONResponse({"error": "Open a project first."}, status_code=404)
+    if not proj.get("probe", {}).get("audio_streams") and not proj.get(
+        "probe", {}
+    ).get("acodec"):
+        return JSONResponse(
+            {"error": "Accurate timing requires an audio stream."}, status_code=400
+        )
+    if alignment_python_path() is None:
+        return JSONResponse(
+            {"error": "Accurate timing runtime is not installed."}, status_code=409
+        )
+    try:
+        identity = alignment_source_identity(proj)
+    except (KeyError, FileNotFoundError, OSError):
+        return JSONResponse({"error": "Source media is unavailable."}, status_code=404)
+    status = alignment_status_payload()
+    if status.get("ready"):
+        return JSONResponse({"ok": True, "ready": True})
+    if not JOB_LOCK.acquire(blocking=False):
+        return JSONResponse({"error": "another job is running"}, status_code=409)
+    with _STATE_LOCK:
+        ALIGNMENT_STATE.update(
+            running=True, identity=identity, error=None,
+            device="cuda", fallback=False, coverage=None,
+        )
+    set_status("align", 1, "starting GPU timing calibration")
+    threading.Thread(
+        target=recalibrate_alignment_job, args=(proj, identity), daemon=True
+    ).start()
+    return JSONResponse({"ok": True, "ready": False})
+
+
 @app.post("/preview/create")
 def create_preview_proxy() -> JSONResponse:
     with _STATE_LOCK:
@@ -3243,10 +3807,17 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
         gt = payload.get("gap_threshold_s")
         if isinstance(gt, (int, float)) and 0.05 <= gt <= 30:
             proj["gap_threshold_s"] = float(gt)
+        safety_handle = (
+            WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
+        )
         response = {
             "ok": True,
-            "word_cut_intervals": consecutive_word_cut_intervals(proj["tokens"]),
-            "transcript_cut_intervals": transcript_cut_intervals(proj["tokens"]),
+            "word_cut_intervals": consecutive_word_cut_intervals(
+                proj["tokens"], safety_handle=safety_handle
+            ),
+            "transcript_cut_intervals": transcript_cut_intervals(
+                proj["tokens"], safety_handle=safety_handle
+            ),
             "cut_intervals": cut_intervals_from_tokens(proj),
             "scoped_gap_candidate_ids": scoped_gap_candidate_ids(proj),
         }

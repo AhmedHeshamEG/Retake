@@ -11,7 +11,9 @@ python retake.py
 
 The browser opens at `http://localhost:8710`. The command window also prints the private LAN link to open on a phone. Choose or drop a video/audio file, select its spoken language (or leave Auto-detect), and Retake uploads it with visible resumable progress.
 
-All inference is offline. Whisper, embedding, and optional GGUF weights load only from `./models/`; Retake reports a clear error if a required local model is missing rather than downloading it.
+Core transcription, embedding, and optional GGUF weights load from `./models/`.
+Accurate word alignment downloads its language model once into `models/alignment/`
+when that optional runtime is first prepared; later calibration is local.
 
 ## Docker
 
@@ -25,6 +27,37 @@ Then open `http://localhost:8710`. The local `models/` and `projects/` folders
 are mounted into the container, so model weights stay outside the image and
 projects survive container replacement. A phone or tablet on the same private
 network can use `http://COMPUTER-LAN-IP:8710` when the host firewall allows it.
+
+The standard container uses the CPU fallback. To grant an NVIDIA GPU to the
+same image (NVIDIA Container Toolkit required), use:
+
+```
+docker compose -f compose.yaml -f compose.gpu.yaml up --build
+```
+
+The backend still retries on CPU if an accelerated job fails after startup.
+
+## Accurate word timing
+
+Whisper's normal word timestamps can drift or end before the audible word.
+`Recalibrate Timing` uses WhisperX phoneme alignment against the original audio,
+then protects the retained side of every transcript cut. It runs once per
+project and is cached; normal preview and export stay fast. Existing word IDs,
+text, cut selections, markers, and source media are preserved, and a timestamped
+project backup is written before publication.
+
+On Windows, prepare the isolated GPU-first runtime with Python 3.11:
+
+```
+py -3.11 -m venv models\alignment-runtime
+models\alignment-runtime\Scripts\python.exe -m pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+models\alignment-runtime\Scripts\python.exe -m pip install -r requirements-alignment.txt
+```
+
+The CUDA download is large. The runtime and alignment models remain under the
+Git-ignored `models/` folder. Retake always tries CUDA first; if CUDA is absent,
+out of memory, or errors, the isolated worker exits and Retake retries once on
+CPU without partially updating the project.
 
 ## Optional AI cut
 
@@ -54,7 +87,8 @@ as EDL, CSV, TXT, and SRT are not selected.
 Edited preview uses native range-aware file delivery and seeks across cuts
 without pausing first. For high-bitrate 4K phone media, `Smooth Preview` can
 prepare a reusable 720p H.264/AAC proxy with NVIDIA decoding, scaling, and
-encoding. This is an explicit one-time job, remains valid when edits change, and
+encoding, with a speed-oriented CPU fallback. This is an explicit one-time job,
+remains valid when edits change, and
 automatically falls back to the original if proxy playback fails. The source and
 final export never use or depend on this disposable proxy. Cut jumps retry
 silently when decoding is briefly delayed. Safe local reads/autosaves retry

@@ -1,0 +1,5 @@
+# Install CUDA Torch/Torchaudio first for GPU alignment, then install this file.
+# Windows CUDA 12.8 example:
+#   python -m pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   python -m pip install -r requirements-alignment.txt
+whisperx==3.8.6

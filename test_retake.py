@@ -706,6 +706,230 @@ def test_preview_job_retries_once_on_cpu_after_gpu_failure() -> None:
             retake.preview_proxy_integrity_errors = old_integrity
 
 
+def test_alignment_windows_are_bounded_and_padded() -> None:
+    project = {
+        "duration_s": 100.0,
+        "segments": [
+            {"start": 5.0, "end": 14.0, "text": "first section"},
+            {"start": 14.2, "end": 25.0, "text": "second section"},
+            {"start": 40.0, "end": 48.0, "text": "third section"},
+        ],
+    }
+    windows = retake.alignment_segments_for_project(
+        project, max_span=30.0, padding=2.5
+    )
+    assert windows == [
+        {"start": 2.5, "end": 27.5,
+         "text": "first section second section"},
+        {"start": 37.5, "end": 50.5, "text": "third section"},
+    ]
+
+
+def test_aligned_timings_preserve_token_identity_and_reject_hallucinated_span() -> None:
+    project = {
+        "duration_s": 40.0,
+        "tokens": [
+            {"id": 1, "kind": "word", "text": "And",
+             "start": 31.1, "end": 31.98, "seg": 1, "cut": True},
+            {"id": 2, "kind": "word", "text": "if",
+             "start": 31.98, "end": 32.86, "seg": 1, "cut": False},
+            {"id": 3, "kind": "word", "text": "Cloud,",
+             "start": 33.56, "end": 33.88, "seg": 1, "cut": False},
+        ],
+        "segments": [
+            {"id": 1, "start": 31.1, "end": 33.88,
+             "text": "And if Cloud,"},
+        ],
+        "markers": [{"t": 12.0, "note": "keep me"}],
+    }
+    result = {
+        "device": "cuda", "model": "test-aligner", "elapsed_s": 1.0,
+        "words": [
+            {"word": "And", "start": 28.281, "end": 32.769, "score": 0.332},
+            {"word": "if", "start": 32.789, "end": 32.889, "score": 0.845},
+            {"word": "Cloud,", "start": 33.651, "end": 34.092, "score": 0.87},
+        ],
+    }
+    old_coverage = retake.ALIGNMENT_MIN_COVERAGE
+    try:
+        retake.ALIGNMENT_MIN_COVERAGE = 0.6
+        candidate, stats = retake.apply_aligned_word_timings(
+            project, result, fallback=False
+        )
+    finally:
+        retake.ALIGNMENT_MIN_COVERAGE = old_coverage
+    assert [(t["id"], t["text"], t["cut"]) for t in candidate["tokens"]] == [
+        (1, "And", True), (2, "if", False), (3, "Cloud,", False),
+    ]
+    assert (candidate["tokens"][0]["start"], candidate["tokens"][0]["end"]) == (
+        31.1, 31.98
+    )
+    assert (candidate["tokens"][1]["start"], candidate["tokens"][1]["end"]) == (
+        32.789, 32.889
+    )
+    assert candidate["markers"] == project["markers"]
+    assert stats["device"] == "cuda" and stats["coverage"] == 0.666667
+
+
+def test_alignment_recalibrates_legacy_gap_without_cutting_kept_words() -> None:
+    project = {
+        "duration_s": 4.0,
+        "tokens": [
+            {"id": 1, "kind": "word", "text": "before",
+             "start": 1.0, "end": 1.4, "seg": 1, "cut": False},
+            {"id": 2, "kind": "gap", "text": "…",
+             "start": 1.4, "end": 2.8, "cut": True},
+            {"id": 3, "kind": "word", "text": "after",
+             "start": 2.8, "end": 3.1, "seg": 1, "cut": False},
+        ],
+        "segments": [
+            {"id": 1, "start": 1.0, "end": 3.1, "text": "before after"},
+        ],
+    }
+    result = {
+        "device": "cuda", "model": "test", "elapsed_s": 0.1,
+        "words": [
+            {"word": "before", "start": 1.1, "end": 1.65, "score": 0.9},
+            {"word": "after", "start": 2.1, "end": 2.5, "score": 0.9},
+        ],
+    }
+    candidate, _stats = retake.apply_aligned_word_timings(
+        project, result, fallback=False
+    )
+    gap = candidate["tokens"][1]
+    assert (gap["id"], gap["cut"]) == (2, True)
+    assert (gap["start"], gap["end"]) == (1.71, 2.04)
+    assert retake.transcript_cut_intervals(
+        candidate["tokens"], retake.WORD_CUT_SAFETY_S
+    ) == [(1.71, 2.04)]
+
+
+def test_forced_alignment_attempts_gpu_then_cpu() -> None:
+    old_call = retake.alignment_worker_call
+    old_state = dict(retake.ALIGNMENT_STATE)
+    devices: list[str] = []
+    try:
+        def fake_call(_proj, device):
+            devices.append(device)
+            if device == "cuda":
+                raise RuntimeError("simulated CUDA memory error")
+            return {"device": "cpu", "words": []}
+
+        retake.alignment_worker_call = fake_call
+        result, fallback = retake.run_forced_alignment({})
+        assert devices == ["cuda", "cpu"]
+        assert result["device"] == "cpu" and fallback is True
+    finally:
+        retake.alignment_worker_call = old_call
+        retake.ALIGNMENT_STATE.clear()
+        retake.ALIGNMENT_STATE.update(old_state)
+
+
+def test_aligned_project_cut_boundaries_protect_adjacent_kept_words() -> None:
+    tokens = [
+        {"id": 1, "kind": "word", "text": "Wikipedia",
+         "start": 0.0, "end": 1.0, "cut": False},
+        {"id": 2, "kind": "word", "text": "remove",
+         "start": 1.0, "end": 1.8, "cut": True},
+        {"id": 3, "kind": "word", "text": "this",
+         "start": 1.8, "end": 2.1, "cut": True},
+        {"id": 4, "kind": "word", "text": "Next",
+         "start": 2.0, "end": 2.5, "cut": False},
+    ]
+    project = {
+        "tokens": tokens, "audio_gaps": [],
+        "alignment": {
+            "status": "aligned", "version": retake.ALIGNMENT_VERSION,
+            "coverage": 1.0,
+        },
+    }
+    assert retake.consecutive_word_cut_intervals(tokens) == [(1.0, 2.1)]
+    assert retake.cut_intervals_from_tokens(project) == [
+        (1.06, 1.94)
+    ]
+
+
+def test_alignment_job_backs_up_and_publishes_without_changing_edits() -> None:
+    old_current = dict(retake.CURRENT)
+    old_state = dict(retake.ALIGNMENT_STATE)
+    old_status = dict(retake.STATUS)
+    old_runner = retake.run_forced_alignment
+    with temporary_project_root():
+        project_dir = retake.next_project_directory()
+        source = project_dir / "media" / "original.wav"
+        source.write_bytes(b"source-audio")
+        project = {
+            "schema_version": 1, "source_path": str(source),
+            "duration_s": 5.0, "language": "en",
+            "probe": {"acodec": "pcm_s16le", "audio_streams": 1},
+            "tokens": [
+                {"id": 1, "kind": "word", "text": "keep",
+                 "start": 1.0, "end": 1.3, "seg": 1, "cut": False},
+                {"id": 2, "kind": "word", "text": "remove",
+                 "start": 1.3, "end": 1.8, "seg": 1, "cut": True},
+                {"id": 3, "kind": "word", "text": "next",
+                 "start": 1.8, "end": 2.1, "seg": 1, "cut": False},
+            ],
+            "segments": [
+                {"id": 1, "start": 1.0, "end": 2.1,
+                 "text": "keep remove next"},
+            ],
+            "markers": [{"t": 4.0, "note": "unchanged"}],
+            "audio_gaps": [],
+        }
+        retake.atomic_write_json(project_dir / "project.json", project)
+        identity = retake.alignment_source_identity(project)
+        result = {
+            "device": "cuda", "model": "test", "elapsed_s": 0.2,
+            "words": [
+                {"word": "keep", "start": 1.1, "end": 1.4, "score": 0.9},
+                {"word": "remove", "start": 1.5, "end": 1.9, "score": 0.9},
+                {"word": "next", "start": 2.0, "end": 2.3, "score": 0.9},
+            ],
+        }
+        try:
+            retake.CURRENT.update(
+                project=project, media_path=str(source),
+                project_dir=str(project_dir), source_filename=source.name,
+            )
+            retake.ALIGNMENT_STATE.update(
+                running=True, identity=identity, error=None,
+                device="cuda", fallback=False, coverage=None,
+            )
+            retake.run_forced_alignment = lambda _proj: (result, False)
+            assert retake.JOB_LOCK.acquire(blocking=False)
+            retake.recalibrate_alignment_job(project, identity)
+            saved = json.loads(
+                (project_dir / "project.json").read_text(encoding="utf-8")
+            )
+            assert [(t["id"], t["cut"]) for t in saved["tokens"]] == [
+                (1, False), (2, True), (3, False),
+            ]
+            assert saved["tokens"][0]["start"] == 1.1
+            assert saved["markers"] == project["markers"]
+            assert saved["alignment"]["device"] == "cuda"
+            assert list(project_dir.glob("project.alignment-backup-*.json"))
+            assert retake.ALIGNMENT_STATE["coverage"] == 1.0
+        finally:
+            if retake.JOB_LOCK.locked():
+                retake.JOB_LOCK.release()
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.ALIGNMENT_STATE.clear()
+            retake.ALIGNMENT_STATE.update(old_state)
+            retake.STATUS.clear()
+            retake.STATUS.update(old_status)
+            retake.run_forced_alignment = old_runner
+
+
+def test_future_transcription_enables_vad_and_forced_alignment_contract() -> None:
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    assert "vad_filter=True" in source
+    assert 'vad_parameters={"min_silence_duration_ms": 200}' in source
+    assert "condition_on_previous_text=False" in source
+    assert "run_forced_alignment(" in source
+
+
 def test_real_project_folders_increment_without_hashes() -> None:
     with temporary_project_root() as root:
         one = retake.next_project_directory()
@@ -766,6 +990,15 @@ def test_gpu_smooth_preview_ui_only_switches_backend_media_sources() -> None:
     assert "player.currentTime = Math.min(saved.time" in html
     assert "Smooth Preview could not play, so the original preview was restored." in html
     assert 'preview:"Smooth Preview"' in html
+
+
+def test_recalibrate_timing_ui_uses_backend_alignment_status() -> None:
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert 'id="recalibrateTiming"' in html
+    assert 'await api("/alignment/recalibrate", {})' in html
+    assert 'api("/alignment/status")' in html
+    assert "GPU first, CPU fallback" in html
+    assert 'align:"Calibrating timing"' in html
 
 
 def test_safe_api_calls_retry_but_side_effecting_jobs_do_not() -> None:

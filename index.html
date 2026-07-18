@@ -408,6 +408,7 @@ header{
           <div class="playerActions">
             <button id="previewToggle" class="small" hidden>Preview: <b>edited</b></button>
             <button id="smoothPreview" class="small" hidden>Smooth Preview: prepare</button>
+            <button id="recalibrateTiming" class="small" hidden>Recalibrate Timing</button>
             <button id="scrollToggle" class="small" hidden>Auto-scroll: on</button>
             <button id="fullscreenBtn" class="small" hidden>⛶ Fullscreen</button>
             <span class="spacer"></span>
@@ -552,6 +553,10 @@ const S = {
     ready:false, running:false, active:false, gpuUsable:null, error:null,
     device:null, fallback:false, activateWhenReady:false, generation:0,
     fallingBack:false,
+  },
+  alignment: {
+    ready:false, running:false, runtimeReady:false, error:null,
+    device:null, fallback:false, coverage:null,
   },
   autoscroll: true,
   cutIvs: [], keeps: [],    // derived intervals
@@ -1044,6 +1049,73 @@ $("gapWave").addEventListener("pointermove",(event)=>{
 });
 function finishGapDrag(){if(!S.gapEditor?.drag)return;S.gapEditor.drag=null;S.proj.audio_gaps=S.audioGaps;saveAudioGaps();document.querySelector(`[data-gap-id="${S.gapEditor.id}"]`)?.classList.add("manual");}
 $("gapWave").addEventListener("pointerup",finishGapDrag);$("gapWave").addEventListener("pointercancel",finishGapDrag);
+
+/* ======================================================== word timing alignment */
+function renderAlignmentControl() {
+  const state = S.alignment, button = $("recalibrateTiming");
+  if (!S.proj?.probe?.acodec && !S.proj?.probe?.audio_streams) {
+    button.hidden = true; return;
+  }
+  button.hidden = false;
+  if (state.running) {
+    button.disabled = true;
+    button.textContent = state.fallback
+      ? "Calibrating Timing: CPU fallback…"
+      : "Calibrating Timing: GPU…";
+    button.title = "Matching transcript words to the actual audio";
+  } else if (state.ready) {
+    button.disabled = true;
+    const pct = Number.isFinite(Number(state.coverage))
+      ? ` ${Math.round(Number(state.coverage) * 100)}%` : "";
+    button.textContent = `Timing: ${String(state.device || "aligned").toUpperCase()}${pct}`;
+    button.title = "Accurate timing is cached; exports do not rerun it";
+  } else if (!state.runtimeReady) {
+    button.disabled = true;
+    button.textContent = "Accurate Timing: unavailable";
+    button.title = state.error || "The alignment runtime is not installed";
+  } else {
+    button.disabled = false;
+    button.textContent = state.error ? "Recalibrate Timing: retry" : "Recalibrate Timing";
+    button.title = state.error || "One-time GPU-first alignment with CPU fallback";
+  }
+}
+function applyAlignmentStatus(status) {
+  if (!status) return false;
+  const completed = S.alignment.running && !!status.ready;
+  S.alignment.ready = !!status.ready;
+  S.alignment.running = !!status.running;
+  S.alignment.runtimeReady = !!status.runtime_ready;
+  S.alignment.error = status.error || null;
+  S.alignment.device = status.device || null;
+  S.alignment.fallback = !!status.fallback;
+  S.alignment.coverage = status.coverage;
+  renderAlignmentControl();
+  return completed;
+}
+async function refreshAlignmentStatus() {
+  try {
+    applyAlignmentStatus(await api("/alignment/status"));
+  } catch (error) {
+    S.alignment.error = error.message;
+    renderAlignmentControl();
+  }
+}
+$("recalibrateTiming").addEventListener("click", async () => {
+  if (S.alignment.running || S.alignment.ready || !S.alignment.runtimeReady) return;
+  try {
+    await api("/alignment/recalibrate", {});
+    S.alignment.running = true;
+    S.alignment.device = "cuda";
+    S.alignment.fallback = false;
+    S.alignment.error = null;
+    renderAlignmentControl();
+    toast("Accurate timing calibration started (GPU first, CPU fallback).");
+  } catch (error) {
+    S.alignment.error = error.message;
+    renderAlignmentControl();
+    toast(error.message, "warn");
+  }
+});
 
 /* ================================================================== preview */
 const player = $("player");
@@ -1689,10 +1761,15 @@ async function loadProject() {
   $("previewToggle").hidden = false;
   S.smoothPreview = {
     ready:false, running:false, active:false, gpuUsable:null, error:null,
-    activateWhenReady:false, generation:S.smoothPreview.generation + 1,
-    fallingBack:false,
+    device:null, fallback:false, activateWhenReady:false,
+    generation:S.smoothPreview.generation + 1, fallingBack:false,
+  };
+  S.alignment = {
+    ready:false, running:false, runtimeReady:false, error:null,
+    device:null, fallback:false, coverage:null,
   };
   $("smoothPreview").hidden = !P.probe.has_video;
+  $("recalibrateTiming").hidden = !P.probe.acodec && !P.probe.audio_streams;
   $("scrollToggle").hidden = false;
   $("fullscreenBtn").hidden = !P.probe.has_video;
   $("pathInput").value = P.source_path;
@@ -1705,7 +1782,8 @@ async function loadProject() {
   player.src = "/media?v=" + Date.now();
   player.load();
   renderSmoothPreviewControl();
-  await refreshSmoothPreview(true);
+  renderAlignmentControl();
+  await Promise.all([refreshSmoothPreview(true), refreshAlignmentStatus()]);
   showWelcome(false);
   initAI();
   toast(`loaded · ${P.segments.length} sentences · ${P.clusters.length} retake cluster${P.clusters.length===1?"":"s"}`);
@@ -1719,14 +1797,14 @@ function showWelcome(on) {
 /* ================================================================== polling */
 let wasPhase = "idle";
 function updateGlobalProgress(st) {
-  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","export","preview"].includes(st.phase);
+  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","align","export","preview"].includes(st.phase);
   const bar = $("globalProgress"), fill = $("globalProgressFill"), label = $("globalProgressLabel");
   bar.classList.toggle("on", busy);
   const indeterminate = busy && (st.phase === "load_model" || Number(st.pct) <= 0);
   bar.classList.toggle("indeterminate", indeterminate);
   if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
   label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
-  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
   $("readyPill").textContent = phaseName[st.phase] || "Working";
   const exporting = st.phase === "export";
   document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
@@ -1738,6 +1816,17 @@ async function poll() {
     const st = await api("/status");
     updateGlobalProgress(st);
     applySmoothPreviewStatus(st.preview);
+    const alignmentCompleted = applyAlignmentStatus(st.alignment);
+    if (alignmentCompleted) {
+      const savedTime = Number.isFinite(player.currentTime) ? player.currentTime : 0;
+      const resume = !player.paused;
+      player.addEventListener("loadedmetadata", () => {
+        player.currentTime = Math.min(savedTime, Math.max(0, (player.duration || savedTime) - .01));
+        if (resume) player.play().catch(() => {});
+      }, {once:true});
+      await loadProject();
+      toast("Word timing recalibrated to the actual audio.");
+    }
     if (st.err_seq > S.errSeq) {
       S.errSeq = st.err_seq;
       if (st.error) toast(st.error, "error", 9000);
@@ -1768,7 +1857,7 @@ async function poll() {
       if (st.phase === "ready" && S.aiRunning) await aiFinished();
       wasPhase = st.phase;
     }
-    if (["export","ai","gaps","preview"].includes(st.phase) && st.msg)
+    if (["export","ai","gaps","align","preview"].includes(st.phase) && st.msg)
       $("durations").title = `${st.msg} (${st.pct}%)`;
   } catch (_) { /* server briefly unreachable; keep polling */ }
   setTimeout(poll, 500);
