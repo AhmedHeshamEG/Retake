@@ -11,11 +11,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-alignment.txt ./
+COPY requirements.txt requirements-alignment.txt requirements-enhancement.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt \
-    && python -m pip install --no-cache-dir -r requirements-alignment.txt
+    && python -m pip install --no-cache-dir -r requirements-alignment.txt \
+    && python -m pip install --no-cache-dir -r requirements-enhancement.txt
 
-COPY retake.py alignment_worker.py index.html ./
+COPY retake.py alignment_worker.py enhancement_worker.py index.html ./
 RUN mkdir -p /app/models/llm /app/projects/.incoming
 
 EXPOSE 8710

@@ -1,0 +1,4 @@
+# Install in the isolated models/enhancement-runtime environment. Keep the
+# downloaded DeepFilterNet3 checkpoint under models/deepfilternet/ so Retake
+# remains offline and no model files enter Git.
+deepfilternet==0.5.6

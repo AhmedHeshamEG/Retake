@@ -65,11 +65,38 @@ Drop any instruct `.gguf` (recommended: Qwen3-4B-Instruct Q4_K_M) into `models/l
 
 Tests: `python test_retake.py`. Every project is self-contained under `projects/Project N/`, including its original media, `project.json`, and `exports/`. Reopening a project never retranscribes it.
 
-## Real-audio gaps and export quality
+## Voice enhancement and export quality
 
-`Show gaps` is off by default. Turning it on analyzes the actual audio with FFmpeg instead of trusting Whisper's padded word timestamps. Detected gaps are a separate editable layer with a compact waveform, draggable edges, exact timestamp fields, configurable sensitivity/minimum duration, and a natural-pause setting. Bulk removal is reviewable and undoable; it never rewrites words or cuts automatically.
+`Voice Enhancement` is enabled by default with the conservative **Great**
+profile. It targets comfortable -16 LUFS speech, gently levels quiet/loud
+moments, protects true peaks, and preserves the source sample rate and channels.
+`Fine tune` exposes friendly percentages for output loudness, voice leveling,
+noise cleanup, and original detail. Cleanup strength never changes the selected
+final loudness.
 
-When gaps are visible, `Remove gaps in kept sentences` offers a separate scoped batch: sentences with at least one kept word remain eligible, while fully deleted sentences and gaps already covered by consecutive deleted content are skipped. The original `Remove all gaps` action remains available and unchanged.
+Clean recordings bypass neural denoising. When meaningful background noise is
+detected and the optional local DeepFilterNet3 runtime is ready, Retake applies
+limited cleanup before leveling and measured two-pass loudness normalization.
+If the model is absent or fails, export safely continues with the untouched
+voice plus leveling/loudness and shows a warning.
+
+On Windows, prepare the isolated optional runtime with Python 3.11 and place the
+official DeepFilterNet3 model directory at `models/deepfilternet/`:
+
+```
+py -3.11 -m venv models\enhancement-runtime
+models\enhancement-runtime\Scripts\python.exe -m pip install torch torchaudio
+models\enhancement-runtime\Scripts\python.exe -m pip install -r requirements-enhancement.txt
+```
+
+The runtime and checkpoints remain under the Git-ignored `models/` folder.
+
+During media export, Retake first builds the existing authoritative consecutive
+cut/keep intervals. It then inspects only each kept interval's edge and snaps a
+nearby trustworthy join to real waveform silence. This can recover a quiet word
+attack/release or remove a tiny leftover pause without changing saved word
+timestamps, edit selections, text exports, or preview. If no safe nearby silence
+exists, the established speech-safe boundary is used unchanged.
 
 `Reliable Quality` is the default media export. It creates a high-quality
 H.264/AAC MP4 with continuous frame timing and uses NVIDIA hardware encoding
@@ -102,4 +129,7 @@ Consecutive deleted words are composed as one continuous backend cut from the fi
 - **Word click vs. seek**: the spec binds plain click to both "toggle strike" and "seek there". Plain click toggles the cut (the core editing loop); **Alt+click or double-click seeks**. Listed in the `?` shortcut overlay.
 - **ffprobe fallback**: `imageio-ffmpeg` ships only ffmpeg. If ffprobe isn't on PATH (or next to ffmpeg), probing falls back to parsing `ffmpeg -i` output instead of failing at startup — strictly more robust, same results.
 - **llama-cpp-python** is commented out in `requirements.txt` (it may need a compiler to build). This keeps `pip install -r requirements.txt` failure-proof; the AI feature documents its own one-line install above.
-- **Whisper gaps vs. real-audio gaps**: legacy Whisper-derived gap tokens remain compatible with old projects and AI instructions. The finishing-stage `Show gaps` layer is detected independently from the audio waveform, can overlap inaccurate word timestamps safely, and is stored under stable string IDs.
+- **Legacy gap data**: Whisper-derived gap tokens remain compatible with old
+  projects and AI instructions. The removed manual real-audio gap editor's saved
+  records are left untouched for compatibility but are intentionally inert, so
+  an invisible cut can never affect preview or export.

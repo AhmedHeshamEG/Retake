@@ -21,11 +21,12 @@ from retake import (
     deterministic_retake_proposals,
     deterministic_instruction_plan,
     cut_intervals_from_tokens,
-    ensure_audio_gap_state,
-    gap_bulk_cut_bounds,
+    ensure_voice_enhancement_state,
     keep_list,
+    loudness_target_lufs,
     merge_intervals,
     parse_silencedetect_output,
+    refine_export_keep_edges,
     retake_text_match,
     sanitize_clusters,
     validate_ai_attachments,
@@ -38,7 +39,7 @@ from retake import (
     resolve_phrase_tokens,
     timestamps_in_text,
     validate_planned_operations,
-    validate_audio_gaps,
+    validate_voice_enhancement,
     validate_llm_proposal,
 )
 
@@ -119,13 +120,13 @@ def test_audio_silence_parser_handles_leading_and_trailing_gaps() -> None:
     assert approx(parse_silencedetect_output(output, 10.0), [(0.0, 1.25), (8.5, 10.0)])
 
 
-def test_audio_gap_cuts_merge_with_whisper_token_cuts_without_rewriting_words() -> None:
+def test_legacy_audio_gap_cuts_are_inert_without_rewriting_words() -> None:
     proj = {
         "tokens": [{"id": 0, "kind": "word", "text": "hello", "start": 1.0,
                     "end": 2.0, "seg": 0, "cut": True}],
         "audio_gaps": [{"id": "agap-1", "start": 1.8, "end": 3.0, "cut": True}],
     }
-    assert approx(cut_intervals_from_tokens(proj), [(1.0, 3.0)])
+    assert approx(cut_intervals_from_tokens(proj), [(1.0, 2.0)])
     assert proj["tokens"][0]["start"] == 1.0 and proj["tokens"][0]["end"] == 2.0
 
 
@@ -200,15 +201,12 @@ def test_cut_api_returns_authoritative_runs_and_restore_splits_them() -> None:
             joined = client.post("/cuts", json={"cut_ids": [0, 2, 3]}).json()
             assert joined["word_cut_intervals"] == [[.1, 2.5]]
             assert joined["transcript_cut_intervals"] == [[.1, 2.5]]
-            assert joined["scoped_gap_candidate_ids"] == []
             assert client.get("/project").json()["cut_intervals"] == [[.1, 2.5]]
 
             restored = client.post("/cuts", json={"cut_ids": [0, 3]}).json()
             assert restored["transcript_cut_intervals"] == [[.1, .3], [2.2, 2.5]]
-            assert restored["scoped_gap_candidate_ids"] == ["agap-seg-1"]
             saved = (project_dir / "project.json").read_text(encoding="utf-8")
             assert "transcript_cut_intervals" not in saved and "word_cut_intervals" not in saved
-            assert "scoped_gap_candidate_ids" not in saved
         finally:
             retake.CURRENT.clear()
             retake.CURRENT.update(old_current)
@@ -221,76 +219,43 @@ def test_preview_consumes_backend_composed_transcript_intervals() -> None:
     assert "const ivs = S.cutsSynced ? S.transcriptCutIvs" in html
 
 
-def test_scoped_gap_candidates_exclude_fully_deleted_sentences_only() -> None:
-    proj = {
-        "tokens": [
-            {"id": 0, "kind": "word", "start": 0.0, "end": .5, "seg": 0, "cut": True},
-            {"id": 1, "kind": "word", "start": 1.0, "end": 1.5, "seg": 0, "cut": True},
-            {"id": 2, "kind": "word", "start": 2.0, "end": 2.5, "seg": 1, "cut": True},
-            {"id": 3, "kind": "word", "start": 3.0, "end": 3.2, "seg": 2, "cut": False},
-            {"id": 4, "kind": "word", "start": 3.4, "end": 3.6, "seg": 2, "cut": True},
-            {"id": 5, "kind": "word", "start": 3.8, "end": 4.0, "seg": 2, "cut": True},
-        ],
-        "audio_gaps": [
-            {"id": "deleted-sentence", "detected_start": .6, "detected_end": .9},
-            {"id": "deleted-boundary", "detected_start": 1.6, "detected_end": 1.9},
-            {"id": "kept-boundary", "detected_start": 2.6, "detected_end": 2.9},
-            {"id": "partial-sentence", "detected_start": 3.65, "detected_end": 3.75},
-        ],
-    }
-    assert retake.scoped_gap_candidate_ids(proj) == [
-        "kept-boundary", "partial-sentence"
+def test_export_keep_edges_snap_to_nearby_silence_only() -> None:
+    keeps = [(0.0, 5.0), (10.0, 25.0), (30.0, 40.0)]
+    silences = [(4.82, 5.08), (9.78, 9.92), (25.12, 25.24), (29.91, 30.08)]
+    assert refine_export_keep_edges(keeps, silences, 40.0) == [
+        (0.0, 4.82), (9.92, 25.12), (30.08, 40.0)
     ]
 
 
-def test_scoped_gap_eligibility_is_derived_without_mutating_projects() -> None:
-    proj = {
-        "tokens": [
-            {"id": 0, "kind": "word", "start": 1.0, "end": 1.4,
-             "seg": 0, "cut": False},
-        ],
-        "audio_gaps": [
-            {"id": "agap-1", "detected_start": 1.1, "detected_end": 1.3,
-             "start": 1.1, "end": 1.3, "cut": False},
-        ],
-    }
-    payload = retake.project_response_payload(proj)
-    assert payload["scoped_gap_candidate_ids"] == ["agap-1"]
-    assert "scoped_gap_candidate_ids" not in proj
+def test_export_keep_edges_leave_missing_or_distant_silence_unchanged() -> None:
+    keeps = [(0.0, 5.0), (10.0, 25.0), (30.0, 40.0)]
+    assert refine_export_keep_edges(keeps, [], 40.0) == keeps
+    assert refine_export_keep_edges(keeps, [(8.0, 8.2), (27.0, 27.2)], 40.0) == keeps
 
 
-def test_show_gaps_has_separate_scoped_action_and_keeps_remove_all() -> None:
-    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    assert 'id="gapApply"' in html and ">Remove all gaps</button>" in html
-    assert 'id="gapScoped"' in html and "Remove gaps in kept sentences" in html
-    assert '$("gapScoped").hidden = !S.showGaps' in html
-    assert "S.scopedGapIds.has(gap.id) && bulkBounds(gap)" in html
-    assert '$("gapScoped").addEventListener("click"' in html
+def test_export_keep_edges_reject_overlap_and_invalid_silence() -> None:
+    keeps = [(4.95, 5.25)]
+    silences = [(4.9, 5.3), (float("nan"), 9.0)]
+    assert refine_export_keep_edges(keeps, silences, 10.0) == keeps
 
 
-def test_bulk_gap_cut_keeps_natural_pause_evenly() -> None:
-    gap = {"detected_start": 8.0, "detected_end": 10.0}
-    assert gap_bulk_cut_bounds(gap, .12) == (8.06, 9.94)
-    assert gap_bulk_cut_bounds(gap, 2.0) is None
-
-
-def test_audio_gap_validation_keeps_stable_detector_ids() -> None:
-    existing = [{"id": "agap-1", "detected_start": 1.0, "detected_end": 2.0,
-                 "start": 1.0, "end": 2.0, "cut": False, "manual": False}]
-    saved = validate_audio_gaps(
-        [{"id": "agap-1", "start": 1.1, "end": 1.9, "cut": True, "manual": True},
-         {"id": "invented", "start": 4, "end": 5, "cut": True}],
-        existing, 10.0,
-    )
-    assert len(saved) == 1 and saved[0]["id"] == "agap-1"
-    assert saved[0]["cut"] is True and saved[0]["manual"] is True
-
-
-def test_old_projects_gain_empty_optional_gap_state() -> None:
+def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
     proj = {"tokens": []}
-    assert ensure_audio_gap_state(proj)
-    assert proj["audio_gaps"] == [] and proj["audio_gaps_analyzed"] is False
-    assert not ensure_audio_gap_state(proj)
+    assert ensure_voice_enhancement_state(proj)
+    settings = validate_voice_enhancement(proj["voice_enhancement"])
+    assert settings["enabled"] is True and settings["profile"] == "great"
+    assert settings["noise_cleanup"] == 25.0 and settings["original_detail"] == 90.0
+    assert loudness_target_lufs(0) == -24.0
+    assert loudness_target_lufs(80) == -16.0
+    assert loudness_target_lufs(100) == -14.0
+    assert not ensure_voice_enhancement_state(proj)
+    for bad in (-1, 101, float("nan"), True):
+        try:
+            validate_voice_enhancement({"noise_cleanup": bad})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid cleanup accepted: {bad!r}")
 
 
 def test_ai_chunks_never_split_clusters() -> None:
@@ -1003,7 +968,7 @@ def test_recalibrate_timing_ui_uses_backend_alignment_status() -> None:
 
 def test_safe_api_calls_retry_but_side_effecting_jobs_do_not() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    assert 'new Set(["/cuts","/gaps","/markers"])' in html
+    assert 'new Set(["/cuts","/markers","/voice-enhancement"])' in html
     assert "const attempts = safeToRetry ? 3 : 1" in html
     assert "/failed to fetch|networkerror/i" in html
 
@@ -1031,12 +996,16 @@ def test_fullscreen_and_ai_navigation_use_exact_visible_targets() -> None:
     assert 'first?.scrollIntoView({block:"center",behavior:"smooth"})' in html
 
 
-def test_real_audio_gaps_are_optional_and_old_slider_is_gone() -> None:
+def test_gap_editor_is_removed_and_voice_enhancement_is_default_on() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    assert 'id="gapToggle"' in html and 'aria-pressed="false"' in html
-    assert 'id="gapWave"' in html and 'id="gapStart"' in html and 'id="gapEnd"' in html
-    assert "S.gapSuggestions.size" in html and "Apply ${S.gapSuggestions.size} suggestions" in html
-    assert 'id="gapSlider"' not in html
+    for removed in ('id="gapToggle"', 'id="gapWave"', 'id="gapStart"', 'id="gapEnd"', 'api("/gaps'):
+        assert removed not in html
+    assert 'id="enhanceEnabled" type="checkbox" checked' in html
+    assert "Voice Enhancement" in html and "Reset to Great" in html
+    for control in ("enhanceLoudness", "enhanceLeveling", "enhanceNoise", "enhanceDetail"):
+        assert f'id="{control}" type="range"' in html
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    assert '@app.post("/gaps")' not in source and '@app.get("/waveform")' not in source
 
 
 def test_default_and_legacy_smart_modes_use_reliable_export() -> None:
@@ -1067,6 +1036,46 @@ def test_reliable_export_command_enforces_continuous_mp4_timing() -> None:
     assert "-ss 1.000000 -t 4.500000" in joined
     assert "atrim=start=0.000000:end=1.000000" in joined
     assert "aresample=async=1:first_pts=0" in joined
+
+
+def test_reliable_export_maps_prepared_audio_with_source_properties() -> None:
+    proj = {
+        "source_path": "input.MOV",
+        "probe": {"fps": 30.0, "acodec": "aac", "sample_rate": 48000, "channels": 2},
+    }
+    command = retake._reliable_video_command(
+        proj, [(1.0, 2.0), (4.0, 5.5)], Path("output.mp4"), "libx264",
+        audio_path=Path("enhanced.wav"),
+    )
+    joined = " ".join(command)
+    assert "-i input.MOV -i enhanced.wav" in joined
+    assert "[1:a:0]asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0[a]" in joined
+    assert "-b:a 256k -ar 48000 -ac 2" in joined
+    assert "[0:a:0]atrim=" not in joined
+
+
+def test_enhancement_filter_order_keeps_loudness_independent_from_cleanup() -> None:
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    prepare_start = source.index("def prepare_export_audio")
+    prepare_end = source.index("def _ffmpeg_audio_cut", prepare_start)
+    prepare = source[prepare_start:prepare_end]
+    assert prepare.index("_run_deepfilter_worker") < prepare.index("_normalize_audio_stem")
+    normalize_start = source.index("def _normalize_audio_stem")
+    normalize_end = source.index("def prepare_export_audio", normalize_start)
+    normalize = source[normalize_start:normalize_end]
+    assert "leveling = _leveling_filter" in normalize
+    assert 'f"{leveling},loudnorm=I=' in normalize and "alimiter=limit=" in normalize
+    assert "aresample={sample_rate}" in normalize
+
+
+def test_export_refinement_runs_after_keep_composition_without_text_export_changes() -> None:
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    start = source.index("def export_job")
+    end = source.index("def export_text", start)
+    media_export = source[start:end]
+    assert media_export.index("keep_list(cuts") < media_export.index("refine_export_keep_edges")
+    text_export = source[end:source.index("def fully_cut_segments", end)]
+    assert "refine_export_keep_edges" not in text_export
 
 
 def test_display_dimensions_apply_phone_rotation() -> None:

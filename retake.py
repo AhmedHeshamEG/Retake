@@ -25,6 +25,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -68,9 +69,6 @@ log = logging.getLogger("retake")
 
 PORT = 8710
 GAP_THRESHOLD_DEFAULT = 0.35
-ACTIVE_GAP_MIN_DEFAULT = 0.35
-ACTIVE_GAP_DB_DEFAULT = -40.0
-ACTIVE_GAP_KEEP_DEFAULT = 0.12
 MERGE_EPS = 0.001
 AI_ATTACHMENT_MAX_FILES = 5
 AI_ATTACHMENT_MAX_BYTES = 512 * 1024
@@ -85,6 +83,18 @@ ALIGNMENT_MIN_COVERAGE = 0.85
 ALIGNMENT_MIN_SCORE = 0.45
 ALIGNMENT_MAX_WORD_SECONDS = 2.5
 WORD_CUT_SAFETY_S = 0.06
+VOICE_ENHANCEMENT_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "profile": "great",
+    "output_loudness": 80.0,
+    "voice_leveling": 25.0,
+    "noise_cleanup": 25.0,
+    "original_detail": 90.0,
+}
+EXPORT_SILENCE_MIN_S = 0.05
+EXPORT_SILENCE_DB_DEFAULT = -45.0
+EXPORT_EDGE_MAX_SHIFT_S = 0.40
+EXPORT_TRUE_PEAK_DB = -1.5
 
 # --------------------------------------------------------------------------
 # ffmpeg / ffprobe resolution
@@ -242,7 +252,7 @@ CURRENT: dict[str, Any] = {
 AI_STATE: dict[str, Any] = {
     "running": False, "proposals": [], "warnings": [], "done": False, "mode": None,
 }
-LAST_EXPORT: dict[str, Any] = {"path": None, "warning": None}
+LAST_EXPORT: dict[str, Any] = {"path": None, "warning": None, "enhancement": None}
 PREVIEW_STATE: dict[str, Any] = {
     "running": False, "identity": None, "error": None,
     "device": None, "fallback": False,
@@ -339,30 +349,53 @@ def save_current_project() -> None:
         atomic_write_json(Path(project_dir) / "project.json", proj)
 
 
-def ensure_audio_gap_state(proj: dict[str, Any]) -> bool:
-    """Lazily add the optional real-audio gap layer to old projects."""
-    changed = False
-    defaults = {
-        "min_duration_s": ACTIVE_GAP_MIN_DEFAULT,
-        "silence_db": ACTIVE_GAP_DB_DEFAULT,
-        "keep_pause_s": ACTIVE_GAP_KEEP_DEFAULT,
-    }
-    settings = proj.get("audio_gap_settings")
-    if not isinstance(settings, dict):
-        proj["audio_gap_settings"] = dict(defaults)
-        changed = True
-    else:
-        for key, value in defaults.items():
-            if key not in settings:
-                settings[key] = value
-                changed = True
-    if not isinstance(proj.get("audio_gaps"), list):
-        proj["audio_gaps"] = []
-        changed = True
-    if "audio_gaps_analyzed" not in proj:
-        proj["audio_gaps_analyzed"] = False
-        changed = True
-    return changed
+def validate_voice_enhancement(raw: Any) -> dict[str, Any]:
+    """Return one strict, stable export-enhancement settings object."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("voice enhancement settings must be an object")
+    enabled = raw.get("enabled", VOICE_ENHANCEMENT_DEFAULTS["enabled"])
+    if not isinstance(enabled, bool):
+        raise ValueError("voice enhancement enabled must be true or false")
+    profile = str(raw.get("profile", VOICE_ENHANCEMENT_DEFAULTS["profile"]))
+    if profile not in {"great", "custom"}:
+        raise ValueError("voice enhancement profile must be great or custom")
+
+    settings: dict[str, Any] = {"enabled": enabled, "profile": profile}
+    for key in (
+        "output_loudness", "voice_leveling", "noise_cleanup", "original_detail",
+    ):
+        value = raw.get(key, VOICE_ENHANCEMENT_DEFAULTS[key])
+        if isinstance(value, bool):
+            raise ValueError(f"{key.replace('_', ' ')} must be a percentage")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key.replace('_', ' ')} must be a percentage") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+            raise ValueError(f"{key.replace('_', ' ')} must be between 0 and 100")
+        settings[key] = round(value, 1)
+    return settings
+
+
+def ensure_voice_enhancement_state(proj: dict[str, Any]) -> bool:
+    """Lazily add validated enhancement defaults without touching edit data."""
+    existing = proj.get("voice_enhancement")
+    try:
+        validated = validate_voice_enhancement(existing)
+    except ValueError:
+        validated = dict(VOICE_ENHANCEMENT_DEFAULTS)
+    if existing != validated:
+        proj["voice_enhancement"] = validated
+        return True
+    return False
+
+
+def loudness_target_lufs(percent: float) -> float:
+    """Map the friendly 0-100 control onto the -24 to -14 LUFS range."""
+    bounded = max(0.0, min(100.0, float(percent)))
+    return round(-24.0 + bounded * 0.10, 1)
 
 
 # --------------------------------------------------------------------------
@@ -502,73 +535,10 @@ def cut_intervals_from_tokens(proj: dict[str, Any]) -> list[tuple[float, float]]
     transcript_cuts = transcript_cut_intervals(
         proj.get("tokens", []), safety_handle=safety_handle
     )
-    gap_cuts = [
-        interval
-        for gap in proj.get("audio_gaps", [])
-        if gap.get("cut")
-        if (interval := _timed_interval(gap)) is not None
-    ]
-    return merge_intervals(transcript_cuts + gap_cuts)
-
-
-def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
-    """Detected gaps belonging to sentences that still contain a kept word.
-
-    A gap between sentence ranges remains eligible unless it is already wholly
-    swallowed by an exact consecutive-word cut. This keeps ambiguous boundary
-    gaps reviewable and never broadens the word cut itself.
-    """
-    segment_words: dict[Any, list[tuple[float, float, bool]]] = {}
-    for token in proj.get("tokens", []):
-        if token.get("kind") != "word" or "seg" not in token:
-            continue
-        interval = _timed_interval(token)
-        if interval is None:
-            continue
-        segment_words.setdefault(token["seg"], []).append(
-            (interval[0], interval[1], bool(token.get("cut")))
-        )
-    sentence_ranges = [
-        (
-            min(word[0] for word in words),
-            max(word[1] for word in words),
-            any(not word[2] for word in words),
-        )
-        for words in segment_words.values()
-        if words
-    ]
-    word_cuts = consecutive_word_cut_intervals(
-        proj.get("tokens", []),
-        safety_handle=WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0,
-    )
-
-    candidates: list[tuple[float, str]] = []
-    for gap in proj.get("audio_gaps", []):
-        try:
-            start = float(gap.get("detected_start", gap.get("start")))
-            end = float(gap.get("detected_end", gap.get("end")))
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
-            continue
-        midpoint = (start + end) / 2.0
-        owners = [
-            has_kept_word
-            for sentence_start, sentence_end, has_kept_word in sentence_ranges
-            if sentence_start - MERGE_EPS <= midpoint <= sentence_end + MERGE_EPS
-        ]
-        if owners:
-            eligible = any(owners)
-        else:
-            eligible = not any(
-                start >= cut_start - MERGE_EPS and end <= cut_end + MERGE_EPS
-                for cut_start, cut_end in word_cuts
-            )
-        gap_id = str(gap.get("id", ""))
-        if eligible and gap_id:
-            candidates.append((start, gap_id))
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return [gap_id for _start, gap_id in candidates]
+    # The removed real-audio gap editor must not leave invisible, non-editable
+    # cuts active in old projects. Legacy transcript gap tokens remain part of
+    # transcript_cuts above; persisted `audio_gaps` records are intentionally inert.
+    return transcript_cuts
 
 
 def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
@@ -582,7 +552,9 @@ def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
         proj.get("tokens", []), safety_handle=safety_handle
     )
     payload["cut_intervals"] = cut_intervals_from_tokens(proj)
-    payload["scoped_gap_candidate_ids"] = scoped_gap_candidate_ids(proj)
+    payload["voice_enhancement"] = validate_voice_enhancement(
+        proj.get("voice_enhancement")
+    )
     return payload
 
 
@@ -607,10 +579,13 @@ def parse_silencedetect_output(text: str, duration: float) -> list[tuple[float, 
     return merge_intervals(gaps)
 
 
-def detect_audio_gaps(
-    media_path: str, duration: float, min_duration: float, silence_db: float,
-) -> list[dict[str, Any]]:
-    """Detect actual low-energy audio intervals without touching Whisper data."""
+def detect_silence_intervals(
+    media_path: str,
+    duration: float,
+    min_duration: float = EXPORT_SILENCE_MIN_S,
+    silence_db: float = EXPORT_SILENCE_DB_DEFAULT,
+) -> list[tuple[float, float]]:
+    """Detect ephemeral source silences for export; never mutate project state."""
     if not FFMPEG:
         resolve_ffmpeg()
     filt = f"silencedetect=noise={silence_db:.1f}dB:d={min_duration:.3f}"
@@ -619,117 +594,76 @@ def detect_audio_gaps(
         "-vn", "-af", filt, "-f", "null", "-",
     ])
     if result.returncode != 0:
-        raise RuntimeError(f"audio gap analysis failed: {result.stderr.strip()[-400:]}")
-    gaps = parse_silencedetect_output(result.stderr, duration)
-    return [
-        {
-            "id": f"agap-{index + 1}",
-            "detected_start": round(start, 3), "detected_end": round(end, 3),
-            "start": round(start, 3), "end": round(end, 3),
-            "cut": False, "manual": False,
-        }
-        for index, (start, end) in enumerate(gaps)
-        if end - start >= min_duration - MERGE_EPS
-    ]
+        raise RuntimeError(f"audio silence analysis failed: {result.stderr.strip()[-400:]}")
+    return parse_silencedetect_output(result.stderr, duration)
 
 
-def validate_audio_gap_settings(raw: Any) -> dict[str, float]:
-    if not isinstance(raw, dict):
-        raw = {}
-    try:
-        min_duration = float(raw.get("min_duration_s", ACTIVE_GAP_MIN_DEFAULT))
-        silence_db = float(raw.get("silence_db", ACTIVE_GAP_DB_DEFAULT))
-        keep_pause = float(raw.get("keep_pause_s", ACTIVE_GAP_KEEP_DEFAULT))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("gap settings must be numbers") from exc
-    if not 0.05 <= min_duration <= 30:
-        raise ValueError("minimum gap must be between 0.05 and 30 seconds")
-    if not -80 <= silence_db <= -10:
-        raise ValueError("silence sensitivity must be between -80 and -10 dB")
-    if not 0 <= keep_pause <= 5:
-        raise ValueError("retained pause must be between 0 and 5 seconds")
-    return {
-        "min_duration_s": round(min_duration, 3),
-        "silence_db": round(silence_db, 1),
-        "keep_pause_s": round(keep_pause, 3),
-    }
+def refine_export_keep_edges(
+    keeps: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+    duration: float,
+    max_shift: float = EXPORT_EDGE_MAX_SHIFT_S,
+) -> list[tuple[float, float]]:
+    """Snap established keep edges to nearby real silence, or change nothing.
 
-
-def validate_audio_gaps(raw: Any, existing: list[dict[str, Any]], duration: float) -> list[dict[str, Any]]:
-    """Accept edits only for detector-created stable IDs; preserve detector evidence."""
-    if not isinstance(raw, list):
-        raise ValueError("audio gaps must be a list")
-    by_id = {str(gap.get("id")): gap for gap in existing}
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        gap_id = str(item.get("id", ""))
-        original = by_id.get(gap_id)
-        if original is None or gap_id in seen:
-            continue
-        seen.add(gap_id)
+    This pure export-only operation intentionally runs after cut composition and
+    keep-list construction. A kept start maps to the speech-side silence end; a
+    kept end maps to the speech-side silence start. Distant/invalid candidates
+    are rejected rather than guessed.
+    """
+    original = [(float(start), float(end)) for start, end in keeps]
+    if not original or not silences or max_shift <= 0:
+        return original
+    cleaned_silences: list[tuple[float, float]] = []
+    for raw_start, raw_end in silences:
         try:
-            start = max(0.0, min(duration, float(item.get("start"))))
-            end = max(0.0, min(duration, float(item.get("end"))))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"invalid boundaries for {gap_id}") from exc
-        if end <= start:
-            raise ValueError(f"gap {gap_id} must end after it starts")
-        row = dict(original)
-        row.update(
-            start=round(start, 3), end=round(end, 3),
-            cut=bool(item.get("cut", False)),
-            manual=bool(item.get("manual", original.get("manual", False))),
-        )
-        out.append(row)
-    for gap in existing:
-        if str(gap.get("id")) not in seen:
-            out.append(dict(gap))
-    out.sort(key=lambda gap: (float(gap["detected_start"]), str(gap["id"])))
-    return out
+            silence_start, silence_end = float(raw_start), float(raw_end)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(silence_start) or not math.isfinite(silence_end):
+            continue
+        silence_start = max(0.0, silence_start)
+        silence_end = min(float(duration), silence_end)
+        if silence_end - silence_start >= EXPORT_SILENCE_MIN_S - MERGE_EPS:
+            cleaned_silences.append((silence_start, silence_end))
+    valid_silences = merge_intervals(cleaned_silences)
+    if not valid_silences:
+        return original
 
+    def nearest_target(boundary: float, edge: str) -> float:
+        candidates: list[tuple[float, float, float]] = []
+        for silence_start, silence_end in valid_silences:
+            if silence_end < boundary - max_shift or silence_start > boundary + max_shift:
+                continue
+            if silence_start <= boundary <= silence_end:
+                distance = 0.0
+            else:
+                distance = min(abs(boundary - silence_start), abs(boundary - silence_end))
+            target = silence_end if edge == "start" else silence_start
+            shift = abs(target - boundary)
+            if shift <= max_shift + MERGE_EPS:
+                candidates.append((distance, shift, target))
+        if not candidates:
+            return boundary
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        return candidates[0][2]
 
-def gap_bulk_cut_bounds(gap: dict[str, Any], keep_pause: float) -> Optional[tuple[float, float]]:
-    start = float(gap["detected_start"])
-    end = float(gap["detected_end"])
-    if end - start <= keep_pause + MERGE_EPS:
-        return None
-    side = keep_pause / 2.0
-    return (round(start + side, 3), round(end - side, 3))
+    refined: list[tuple[float, float]] = []
+    for index, (start, end) in enumerate(original):
+        new_start = start if start <= MERGE_EPS else nearest_target(start, "start")
+        new_end = end if duration - end <= MERGE_EPS else nearest_target(end, "end")
+        new_start = max(0.0, min(float(duration), new_start))
+        new_end = max(0.0, min(float(duration), new_end))
+        if new_end <= new_start + MERGE_EPS:
+            new_start, new_end = start, end
+        refined.append((new_start, new_end))
 
-
-def audio_waveform_peaks(media_path: str, start: float, end: float, points: int) -> list[float]:
-    """Return normalized mono peak buckets for a small on-demand gap editor."""
-    if not FFMPEG:
-        resolve_ffmpeg()
-    span = max(0.01, end - start)
-    cmd = [
-        FFMPEG, "-v", "error", "-ss", f"{start:.6f}", "-t", f"{span:.6f}",
-        "-i", media_path, "-vn", "-ac", "1", "-ar", "8000",
-        "-f", "f32le", "pipe:1",
-    ]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode != 0:
-        error = result.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(f"waveform decode failed: {error[-300:]}")
-    samples = array("f")
-    usable = len(result.stdout) - (len(result.stdout) % samples.itemsize)
-    samples.frombytes(result.stdout[:usable])
-    if sys.byteorder != "little":
-        samples.byteswap()
-    if not samples:
-        return [0.0] * points
-    bucket = max(1, len(samples) // points)
-    peaks = [
-        max((abs(value) for value in samples[i:i + bucket]), default=0.0)
-        for i in range(0, len(samples), bucket)
-    ][:points]
-    if len(peaks) < points:
-        peaks.extend([0.0] * (points - len(peaks)))
-    maximum = max(peaks) or 1.0
-    return [round(min(1.0, peak / maximum), 4) for peak in peaks]
+    for index, (start, end) in enumerate(refined):
+        if end <= start + MERGE_EPS:
+            return original
+        if index and start < refined[index - 1][1] - MERGE_EPS:
+            return original
+    return [(round(start, 6), round(end, 6)) for start, end in refined]
 
 
 # --------------------------------------------------------------------------
@@ -1482,13 +1416,7 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             "word_repeats": word_repeats,
             "markers": [],
             "gap_threshold_s": GAP_THRESHOLD_DEFAULT,
-            "audio_gap_settings": {
-                "min_duration_s": ACTIVE_GAP_MIN_DEFAULT,
-                "silence_db": ACTIVE_GAP_DB_DEFAULT,
-                "keep_pause_s": ACTIVE_GAP_KEEP_DEFAULT,
-            },
-            "audio_gaps": [],
-            "audio_gaps_analyzed": False,
+            "voice_enhancement": dict(VOICE_ENHANCEMENT_DEFAULTS),
             "project_name": project_dir.name,
             "created_at": utc_now(),
             "updated_at": utc_now(),
@@ -1505,37 +1433,6 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                  len(tokens), len(segments), len(clusters))
     except Exception as e:
         fail(f"transcription failed: {e}", back_to="idle")
-    finally:
-        JOB_LOCK.release()
-
-
-def audio_gap_detection_job(settings: dict[str, float]) -> None:
-    """Analyze source audio in the background and persist review-only candidates."""
-    try:
-        with _STATE_LOCK:
-            proj = CURRENT["project"]
-            if proj is None:
-                raise RuntimeError("no project loaded")
-            source = str(proj["source_path"])
-            duration = float(proj["duration_s"])
-            has_audio = proj.get("probe", {}).get("acodec") is not None
-        if not has_audio:
-            raise RuntimeError("this media has no audio track")
-        set_status("gaps", 5, "detecting real audio gaps")
-        gaps = detect_audio_gaps(
-            source, duration, settings["min_duration_s"], settings["silence_db"]
-        )
-        with _STATE_LOCK:
-            current = CURRENT["project"]
-            if current is None or str(current.get("source_path")) != source:
-                raise RuntimeError("project changed during gap analysis")
-            current["audio_gap_settings"] = settings
-            current["audio_gaps"] = gaps
-            current["audio_gaps_analyzed"] = True
-        save_current_project()
-        set_status("ready", 100, f"detected {len(gaps)} real audio gaps")
-    except Exception as exc:
-        fail(f"audio gap detection failed: {exc}")
     finally:
         JOB_LOCK.release()
 
@@ -2672,6 +2569,262 @@ def _run_ffmpeg_with_progress(
         raise RuntimeError(f"ffmpeg exited {proc.returncode}: {err[-400:]}")
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return -120.0
+    ordered = sorted(values)
+    position = max(0.0, min(1.0, fraction)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def audio_energy_profile(media_path: str, sample_rate: int = 16000) -> dict[str, float | bool]:
+    """Estimate solo-speech noise/speech levels from 20 ms mono RMS windows."""
+    if not FFMPEG:
+        resolve_ffmpeg()
+    result = subprocess.run(
+        [
+            FFMPEG, "-v", "error", "-nostdin", "-i", media_path, "-vn",
+            "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1",
+        ],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"audio level analysis failed: {error[-300:]}")
+    samples = array("h")
+    usable = len(result.stdout) - len(result.stdout) % samples.itemsize
+    samples.frombytes(result.stdout[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    frame_samples = max(1, int(sample_rate * 0.020))
+    levels: list[float] = []
+    for offset in range(0, len(samples), frame_samples):
+        frame = samples[offset:offset + frame_samples]
+        if len(frame) < frame_samples // 2:
+            continue
+        square_mean = sum(float(value) * float(value) for value in frame) / len(frame)
+        rms = math.sqrt(square_mean) / 32768.0
+        levels.append(20.0 * math.log10(max(rms, 1e-6)))
+    if not levels:
+        return {
+            "noise_floor_db": -120.0, "speech_level_db": -120.0,
+            "snr_db": 0.0, "quiet_fraction": 1.0,
+            "meaningful_noise": False, "silence_db": EXPORT_SILENCE_DB_DEFAULT,
+        }
+    noise_floor = _percentile(levels, 0.20)
+    speech_level = _percentile(levels, 0.80)
+    snr = speech_level - noise_floor
+    quiet_cutoff = noise_floor + 2.5
+    quiet_fraction = sum(level <= quiet_cutoff for level in levels) / len(levels)
+    meaningful_noise = bool(
+        quiet_fraction >= 0.25 and noise_floor > -60.0 and 3.0 <= snr < 32.0
+    )
+    silence_db = max(-55.0, min(-32.0, noise_floor + 3.0))
+    return {
+        "noise_floor_db": round(noise_floor, 2),
+        "speech_level_db": round(speech_level, 2),
+        "snr_db": round(snr, 2),
+        "quiet_fraction": round(quiet_fraction, 4),
+        "meaningful_noise": meaningful_noise,
+        "silence_db": round(silence_db, 1),
+    }
+
+
+def _audio_concat_graph(keeps: list[tuple[float, float]], input_label: str = "0:a:0") -> str:
+    parts = [
+        f"[{input_label}]atrim=start={start:.6f}:end={end:.6f},"
+        f"asetpts=PTS-STARTPTS[a{index}]"
+        for index, (start, end) in enumerate(keeps)
+    ]
+    labels = "".join(f"[a{index}]" for index in range(len(keeps)))
+    parts.append(f"{labels}concat=n={len(keeps)}:v=0:a=1[out]")
+    return ";".join(parts)
+
+
+def _render_edited_audio_stem(
+    proj: dict[str, Any], keeps: list[tuple[float, float]], out: Path,
+) -> None:
+    sample_rate = int(proj.get("probe", {}).get("sample_rate") or 48000)
+    channels = int(proj.get("probe", {}).get("channels") or 1)
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", proj["source_path"], "-filter_complex", _audio_concat_graph(keeps),
+        "-map", "[out]", "-ar", str(sample_rate), "-ac", str(channels),
+        "-c:a", "pcm_f32le", str(out),
+    ]
+    edited = sum(end - start for start, end in keeps)
+    _run_ffmpeg_with_progress(cmd, edited, "building lossless edited audio")
+
+
+def enhancement_python_path() -> Optional[Path]:
+    configured = os.environ.get("RETAKE_ENHANCEMENT_PYTHON", "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+    runtime = MODELS_DIR / "enhancement-runtime"
+    candidate = runtime / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if candidate.is_file():
+        return candidate
+    if importlib.util.find_spec("df") is not None:
+        return Path(sys.executable)
+    return None
+
+
+def enhancement_runtime_ready() -> bool:
+    return bool(
+        enhancement_python_path()
+        and (ROOT / "enhancement_worker.py").is_file()
+        and (MODELS_DIR / "deepfilternet").is_dir()
+    )
+
+
+def _run_deepfilter_worker(
+    source: Path,
+    output: Path,
+    settings: dict[str, Any],
+    expected_duration: float,
+    expected_channels: int,
+) -> None:
+    python = enhancement_python_path()
+    model_dir = MODELS_DIR / "deepfilternet"
+    if python is None or not model_dir.is_dir():
+        raise RuntimeError("the optional DeepFilterNet runtime/model is not installed")
+    request = {
+        "source_path": str(source), "output_path": str(output),
+        "model_dir": str(model_dir),
+        "noise_cleanup": float(settings["noise_cleanup"]),
+        "original_detail": float(settings["original_detail"]),
+    }
+    result = subprocess.run(
+        [str(python), str(ROOT / "enhancement_worker.py")],
+        input=json.dumps(request), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"DeepFilterNet failed: {result.stderr.strip()[-400:]}")
+    response = json.loads(result.stdout or "{}")
+    properties = probe_media(str(output))
+    if abs(float(properties["duration_s"]) - expected_duration) > 0.05:
+        raise RuntimeError("DeepFilterNet changed audio duration")
+    if int(properties.get("channels") or 0) != int(expected_channels):
+        raise RuntimeError("DeepFilterNet changed the channel count")
+    if int(response.get("samples") or 0) <= 0:
+        raise RuntimeError("DeepFilterNet returned no audio samples")
+
+
+def _leveling_filter(percent: float) -> str:
+    if percent <= 0:
+        return "anull"
+    ratio = 1.0 + 2.0 * max(0.0, min(100.0, percent)) / 100.0
+    return (
+        "acompressor=threshold=0.125:"
+        f"ratio={ratio:.3f}:attack=20:release=180:makeup=1:knee=2.828"
+    )
+
+
+def _parse_loudnorm_measurement(stderr: str) -> dict[str, float]:
+    required = {"input_i", "input_tp", "input_lra", "input_thresh", "target_offset"}
+    for match in reversed(re.findall(r"\{[^{}]*\}", stderr, flags=re.DOTALL)):
+        try:
+            data = json.loads(match)
+            if required <= data.keys():
+                return {key: float(data[key]) for key in required}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    raise RuntimeError("FFmpeg did not return a readable loudness measurement")
+
+
+def _normalize_audio_stem(
+    source: Path,
+    output: Path,
+    settings: dict[str, Any],
+    sample_rate: int,
+    channels: int,
+    edited_duration: float,
+) -> None:
+    target = loudness_target_lufs(float(settings["output_loudness"]))
+    leveling = _leveling_filter(float(settings["voice_leveling"]))
+    first_filter = (
+        f"{leveling},loudnorm=I={target:.1f}:TP={EXPORT_TRUE_PEAK_DB:.1f}:"
+        "LRA=11:print_format=json"
+    )
+    measured = _run([
+        FFMPEG, "-hide_banner", "-nostats", "-i", str(source),
+        "-af", first_filter, "-f", "null", "-",
+    ])
+    if measured.returncode != 0:
+        raise RuntimeError(f"loudness measurement failed: {measured.stderr.strip()[-400:]}")
+    values = _parse_loudnorm_measurement(measured.stderr)
+    peak_limit = 10.0 ** (EXPORT_TRUE_PEAK_DB / 20.0)
+    second_filter = (
+        f"{leveling},loudnorm=I={target:.1f}:TP={EXPORT_TRUE_PEAK_DB:.1f}:LRA=11:"
+        f"measured_I={values['input_i']:.3f}:measured_TP={values['input_tp']:.3f}:"
+        f"measured_LRA={values['input_lra']:.3f}:"
+        f"measured_thresh={values['input_thresh']:.3f}:"
+        f"offset={values['target_offset']:.3f}:linear=true:print_format=summary,"
+        f"alimiter=limit={peak_limit:.6f}:attack=5:release=50:level=false:latency=1,"
+        f"aresample={sample_rate}:async=1:first_pts=0"
+    )
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+        "-af", second_filter, "-ar", str(sample_rate), "-ac", str(channels),
+        "-c:a", "pcm_f32le", str(output),
+    ]
+    _run_ffmpeg_with_progress(cmd, edited_duration, "leveling voice and setting loudness")
+
+
+def prepare_export_audio(
+    proj: dict[str, Any],
+    keeps: list[tuple[float, float]],
+    settings: dict[str, Any],
+    work_dir: Path,
+) -> tuple[Path, list[str], str]:
+    """Create one lossless edited/enhanced audio stem for final mux or encode."""
+    settings = validate_voice_enhancement(settings)
+    warnings: list[str] = []
+    edited_duration = sum(end - start for start, end in keeps)
+    sample_rate = int(proj.get("probe", {}).get("sample_rate") or 48000)
+    channels = int(proj.get("probe", {}).get("channels") or 1)
+    edited = work_dir / "edited.wav"
+    _render_edited_audio_stem(proj, keeps, edited)
+    if not settings["enabled"]:
+        return edited, warnings, "disabled"
+
+    source_for_leveling = edited
+    cleanup_status = "unnecessary"
+    if float(settings["noise_cleanup"]) > 0:
+        profile = audio_energy_profile(str(edited))
+        if bool(profile["meaningful_noise"]):
+            if enhancement_runtime_ready():
+                cleaned = work_dir / "cleaned.wav"
+                try:
+                    set_status("export", 20, "cleaning background noise conservatively")
+                    _run_deepfilter_worker(
+                        edited, cleaned, settings, edited_duration, channels
+                    )
+                    source_for_leveling = cleaned
+                    cleanup_status = "applied"
+                except Exception as exc:
+                    cleaned.unlink(missing_ok=True)
+                    log.warning("noise cleanup skipped: %s", exc)
+                    warnings.append("noise cleanup was skipped; original voice detail was preserved")
+                    cleanup_status = "skipped"
+            else:
+                warnings.append("noise cleanup model is not installed; loudness and leveling still applied")
+                cleanup_status = "skipped"
+
+    normalized = work_dir / "enhanced.wav"
+    _normalize_audio_stem(
+        source_for_leveling, normalized, settings, sample_rate, channels, edited_duration
+    )
+    return normalized, warnings, cleanup_status
+
+
 def _ffmpeg_audio_cut(proj: dict[str, Any], keeps: list[tuple[float, float]], out: Path) -> None:
     """Sample-accurate audio cut+concat via one atrim/concat filtergraph."""
     parts = []
@@ -2684,6 +2837,38 @@ def _ffmpeg_audio_cut(proj: dict[str, Any], keeps: list[tuple[float, float]], ou
            *_audio_codec_args(proj["probe"].get("acodec")), str(out)]
     edited = sum(b - a for a, b in keeps)
     _run_ffmpeg_with_progress(cmd, edited, "cutting audio (sample-accurate)")
+
+
+def _encode_audio_stem(
+    proj: dict[str, Any], stem: Path, out: Path, edited_duration: float,
+) -> None:
+    sample_rate = int(proj.get("probe", {}).get("sample_rate") or 48000)
+    channels = int(proj.get("probe", {}).get("channels") or 1)
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", str(stem),
+        "-ar", str(sample_rate), "-ac", str(channels),
+        *_audio_codec_args(proj.get("probe", {}).get("acodec")), str(out),
+    ]
+    _run_ffmpeg_with_progress(cmd, edited_duration, "encoding enhanced audio")
+
+
+def audio_export_integrity_errors(
+    source_path: str, output_path: str, expected_duration: float,
+) -> list[str]:
+    source = probe_media(source_path)
+    output = probe_media(output_path)
+    errors: list[str] = []
+    if abs(float(output["duration_s"]) - expected_duration) > 0.10:
+        errors.append(
+            f"duration {output['duration_s']:.3f}s vs expected {expected_duration:.3f}s"
+        )
+    for key, label in (("sample_rate", "sample rate"), ("channels", "channels")):
+        before, after = source.get(key), output.get(key)
+        if before is not None and after is not None and before != after:
+            errors.append(f"{label} changed from {before} to {after}")
+    if output.get("audio_streams") != 1:
+        errors.append(f"audio stream count is {output.get('audio_streams')}, expected 1")
+    return errors
 
 
 def _ffmpeg_encoder_usable(encoder: str) -> bool:
@@ -3061,6 +3246,7 @@ def _reliable_video_command(
     out: Path,
     encoder: str,
     compatibility: bool = False,
+    audio_path: Optional[Path] = None,
 ) -> list[str]:
     """Build a continuous-CFR H.264/AAC export command."""
     fps = max(1.0, float(proj["probe"].get("fps") or 25.0))
@@ -3083,26 +3269,33 @@ def _reliable_video_command(
     selection = "+".join(
         f"between(t,{start:.6f},{end:.6f})" for start, end in shifted_keeps
     )
-    has_audio = proj["probe"].get("acodec") is not None
+    has_audio = audio_path is not None or proj["probe"].get("acodec") is not None
     graph_parts = [
         f"[0:v]select='{selection}',"
         f"setpts=N/({fps_expr}*TB),fps={fps_expr}[v]"
     ]
     maps = ["-map", "[v]"]
     if has_audio:
-        audio_labels = []
-        for index, (start, end) in enumerate(shifted_keeps):
-            label = f"a{index}"
+        if audio_path is not None:
             graph_parts.append(
-                f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},"
-                f"asetpts=PTS-STARTPTS[{label}]"
+                f"[1:a:0]asetpts=PTS-STARTPTS,"
+                f"aresample={int(proj['probe'].get('sample_rate') or 48000)}:"
+                "async=1:first_pts=0[a]"
             )
-            audio_labels.append(f"[{label}]")
-        graph_parts.append(
-            "".join(audio_labels)
-            + f"concat=n={len(audio_labels)}:v=0:a=1,"
-            "aresample=async=1:first_pts=0[a]"
-        )
+        else:
+            audio_labels = []
+            for index, (start, end) in enumerate(shifted_keeps):
+                label = f"a{index}"
+                graph_parts.append(
+                    f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},"
+                    f"asetpts=PTS-STARTPTS[{label}]"
+                )
+                audio_labels.append(f"[{label}]")
+            graph_parts.append(
+                "".join(audio_labels)
+                + f"concat=n={len(audio_labels)}:v=0:a=1,"
+                "aresample=async=1:first_pts=0[a]"
+            )
         maps.extend(["-map", "[a]"])
 
     if encoder == "h264_nvenc":
@@ -3121,11 +3314,23 @@ def _reliable_video_command(
             "-profile:v", "high", "-pix_fmt", "yuv420p",
         ]
 
-    audio_args = ["-c:a", "aac", "-b:a", "192k"] if has_audio else ["-an"]
-    return [
-        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+    audio_args = (
+        [
+            "-c:a", "aac", "-b:a", "256k",
+            "-ar", str(int(proj["probe"].get("sample_rate") or 48000)),
+            "-ac", str(int(proj["probe"].get("channels") or 1)),
+        ]
+        if has_audio else ["-an"]
+    )
+    input_args = [
         "-ss", f"{source_offset:.6f}", "-t", f"{input_duration:.6f}",
         "-i", proj["source_path"],
+    ]
+    if audio_path is not None:
+        input_args.extend(["-i", str(audio_path)])
+    return [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        *input_args,
         "-filter_complex", ";".join(graph_parts),
         *maps,
         "-map_metadata", "0", "-map_chapters", "-1",
@@ -3144,6 +3349,7 @@ def _reliable_video_export(
     keeps: list[tuple[float, float]],
     out: Path,
     compatibility: bool = False,
+    audio_path: Optional[Path] = None,
 ) -> str:
     """Export with GPU acceleration when usable, with one safe CPU fallback."""
     edited = sum(end - start for start, end in keeps)
@@ -3157,7 +3363,8 @@ def _reliable_video_export(
         label = "NVIDIA GPU" if encoder == "h264_nvenc" else "CPU"
         try:
             command = _reliable_video_command(
-                proj, keeps, out, encoder, compatibility=compatibility
+                proj, keeps, out, encoder, compatibility=compatibility,
+                audio_path=audio_path,
             )
             _run_ffmpeg_with_progress(
                 command, edited, f"reliable {label} export"
@@ -3273,32 +3480,71 @@ def reliable_export_integrity_errors(
     return errors
 
 
-def export_job(mode: str) -> None:
+def export_job(mode: str, enhancement: Optional[dict[str, Any]] = None) -> None:
     """Reliable CFR export; legacy smart clients are routed to the same safe path."""
     out: Optional[Path] = None
     work_out: Optional[Path] = None
+    audio_temp: Optional[tempfile.TemporaryDirectory[str]] = None
     try:
         proj = CURRENT["project"]
         assert proj is not None
+        enhancement = validate_voice_enhancement(
+            enhancement if enhancement is not None else proj.get("voice_enhancement")
+        )
         cuts = cut_intervals_from_tokens(proj)
         keeps = keep_list(cuts, proj["duration_s"])
         if not keeps:
             raise RuntimeError("everything is cut - nothing to export")
+        warnings: list[str] = []
+        has_audio = proj.get("probe", {}).get("acodec") is not None
+        if has_audio:
+            set_status("export", 2, "snapping joins to real silence")
+            try:
+                level_profile = audio_energy_profile(proj["source_path"])
+                silences = detect_silence_intervals(
+                    proj["source_path"], float(proj["duration_s"]),
+                    silence_db=float(level_profile["silence_db"]),
+                )
+                keeps = refine_export_keep_edges(
+                    keeps, silences, float(proj["duration_s"])
+                )
+            except Exception as exc:
+                log.warning("export silence snapping skipped: %s", exc)
+                warnings.append("silence snapping was unavailable; original safe joins were used")
         edited = sum(b - a for a, b in keeps)
-        warning: Optional[str] = None
+        audio_stem: Optional[Path] = None
+        cleanup_status = "not_applicable"
+        if has_audio:
+            project_dir = project_directory_for_media(proj["source_path"])
+            if project_dir is None:
+                raise RuntimeError("project audio work folder is unavailable")
+            audio_temp = tempfile.TemporaryDirectory(
+                prefix=".retake-audio-", dir=str(project_dir)
+            )
+            audio_stem, enhancement_warnings, cleanup_status = prepare_export_audio(
+                proj, keeps, enhancement, Path(audio_temp.name)
+            )
+            warnings.extend(enhancement_warnings)
         has_video = bool(proj["probe"].get("has_video"))
         if not has_video:
-            set_status("export", 3, "starting sample-accurate audio export")
+            set_status("export", 70, "encoding enhanced audio export")
             out = export_output_path(proj, "retake_cut")
-            warning = "compatibility mode: audio was fully re-encoded and may change quality"
-            _ffmpeg_audio_cut(proj, keeps, out)
+            warnings.append("audio was fully re-encoded for sample-accurate edits")
+            assert audio_stem is not None
+            _encode_audio_stem(proj, audio_stem, out, edited)
+            integrity_errors = audio_export_integrity_errors(
+                proj["source_path"], str(out), edited
+            )
+            if integrity_errors:
+                raise RuntimeError("integrity check failed: " + " | ".join(integrity_errors))
         else:
             compatibility = mode == "reencode"
             set_status("export", 3, "starting reliable video export")
             out = export_output_path(proj, "retake_cut", ".mp4")
             work_out = out.with_name(f"{out.stem}.partial{out.suffix}")
             encoder = _reliable_video_export(
-                proj, keeps, work_out, compatibility=compatibility
+                proj, keeps, work_out, compatibility=compatibility,
+                audio_path=audio_stem,
             )
             set_status("export", 96, "verifying frame timing")
             integrity_errors = reliable_export_integrity_errors(
@@ -3309,13 +3555,15 @@ def export_job(mode: str) -> None:
             os.replace(work_out, out)
             work_out = None
             if compatibility:
-                warning = (
+                warnings.append(
                     f"compatibility mode used the {encoder} encoder with a smaller-file setting"
                 )
 
+        warning = " | ".join(warnings) or None
         with _STATE_LOCK:
             LAST_EXPORT["path"] = str(out)
             LAST_EXPORT["warning"] = warning
+            LAST_EXPORT["enhancement"] = cleanup_status
         set_status("ready", 100, f"exported: {out}")
         log.info("export ok: %s (%s)", out, warning or "verified smooth frame timing")
     except Exception as exc:
@@ -3327,6 +3575,8 @@ def export_job(mode: str) -> None:
                 log.warning("could not remove partial export: %s", cleanup)
         fail(f"reliable export failed: {exc}")
     finally:
+        if audio_temp is not None:
+            audio_temp.cleanup()
         JOB_LOCK.release()
 
 
@@ -3485,7 +3735,7 @@ def open_saved_project(payload: dict = Body(...)) -> JSONResponse:
         return JSONResponse({"error": "project not found"}, status_code=404)
     try:
         proj = json.loads(path.read_text(encoding="utf-8"))
-        migrated = ensure_audio_gap_state(proj)
+        migrated = ensure_voice_enhancement_state(proj)
         source = Path(str(proj.get("source_path", "")))
         if not source.is_file():
             return JSONResponse(
@@ -3530,7 +3780,7 @@ def open_media(payload: dict = Body(...)) -> JSONResponse:
         try:
             proj = json.loads(pj.read_text(encoding="utf-8"))
             if proj.get("schema_version") == 1:
-                migrated = ensure_audio_gap_state(proj)
+                migrated = ensure_voice_enhancement_state(proj)
                 safe_clusters = sanitize_clusters(
                     proj.get("segments", []), proj.get("clusters", [])
                 )
@@ -3819,75 +4069,9 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
                 proj["tokens"], safety_handle=safety_handle
             ),
             "cut_intervals": cut_intervals_from_tokens(proj),
-            "scoped_gap_candidate_ids": scoped_gap_candidate_ids(proj),
         }
     save_current_project()
     return JSONResponse(response)
-
-
-@app.post("/gaps/detect")
-def start_gap_detection(payload: dict = Body(default={})) -> JSONResponse:
-    with _STATE_LOCK:
-        proj = CURRENT["project"]
-        if proj is None:
-            return JSONResponse({"error": "no project"}, status_code=404)
-        if proj.get("probe", {}).get("acodec") is None:
-            return JSONResponse({"error": "this media has no audio track"}, status_code=400)
-        base = dict(proj.get("audio_gap_settings") or {})
-    base.update(payload.get("settings") or {})
-    try:
-        settings = validate_audio_gap_settings(base)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    if not JOB_LOCK.acquire(blocking=False):
-        return JSONResponse({"error": "another job is running"}, status_code=409)
-    threading.Thread(
-        target=audio_gap_detection_job, args=(settings,), daemon=True
-    ).start()
-    return JSONResponse({"ok": True})
-
-
-@app.post("/gaps")
-def save_audio_gaps(payload: dict = Body(...)) -> JSONResponse:
-    try:
-        with _STATE_LOCK:
-            proj = CURRENT["project"]
-            if proj is None:
-                return JSONResponse({"error": "no project"}, status_code=404)
-            ensure_audio_gap_state(proj)
-            settings = validate_audio_gap_settings(
-                payload.get("settings", proj["audio_gap_settings"])
-            )
-            gaps = validate_audio_gaps(
-                payload.get("gaps", proj["audio_gaps"]),
-                proj["audio_gaps"], float(proj["duration_s"]),
-            )
-            proj["audio_gap_settings"] = settings
-            proj["audio_gaps"] = gaps
-        save_current_project()
-        return JSONResponse({"ok": True, "gaps": gaps, "settings": settings})
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-
-
-@app.get("/waveform")
-def get_waveform(start: float, end: float, points: int = 180) -> JSONResponse:
-    with _STATE_LOCK:
-        proj = CURRENT["project"]
-        if proj is None:
-            return JSONResponse({"error": "no project"}, status_code=404)
-        media_path = str(proj["source_path"])
-        duration = float(proj["duration_s"])
-    start = max(0.0, min(duration, float(start)))
-    end = max(start, min(duration, float(end)))
-    points = max(40, min(500, int(points)))
-    if end <= start or end - start > 120:
-        return JSONResponse({"error": "waveform range must be between 0 and 120 seconds"}, status_code=400)
-    try:
-        peaks = audio_waveform_peaks(media_path, start, end, points)
-        return JSONResponse({"start": start, "end": end, "peaks": peaks})
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/markers")
@@ -3952,16 +4136,46 @@ def ai_result() -> JSONResponse:
         return JSONResponse(dict(AI_STATE))
 
 
+@app.post("/voice-enhancement")
+def save_voice_enhancement(payload: dict = Body(...)) -> JSONResponse:
+    try:
+        settings = validate_voice_enhancement(payload.get("settings", payload))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        proj["voice_enhancement"] = settings
+    save_current_project()
+    return JSONResponse({"ok": True, "settings": settings})
+
+
 @app.post("/export")
 def run_export(payload: dict = Body(...)) -> JSONResponse:
-    if CURRENT["project"] is None:
-        return JSONResponse({"error": "no project"}, status_code=404)
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        current_settings = proj.get("voice_enhancement")
+    try:
+        settings = validate_voice_enhancement(
+            payload.get("voice_enhancement", current_settings)
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     mode = str(payload.get("mode", "smart"))
     if not JOB_LOCK.acquire(blocking=False):
         return JSONResponse({"error": "another job is running"}, status_code=409)
     with _STATE_LOCK:
-        LAST_EXPORT.update(path=None, warning=None)
-    threading.Thread(target=export_job, args=(mode,), daemon=True).start()
+        proj = CURRENT["project"]
+        if proj is None:
+            JOB_LOCK.release()
+            return JSONResponse({"error": "no project"}, status_code=404)
+        proj["voice_enhancement"] = settings
+        LAST_EXPORT.update(path=None, warning=None, enhancement=None)
+    save_current_project()
+    threading.Thread(target=export_job, args=(mode, dict(settings)), daemon=True).start()
     return JSONResponse({"ok": True})
 
 
