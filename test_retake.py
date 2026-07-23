@@ -1034,8 +1034,42 @@ def test_reliable_export_command_enforces_continuous_mp4_timing() -> None:
     assert "-movflags +faststart" in joined
     assert "setpts=N/(30*TB),fps=30" in joined
     assert "-ss 1.000000 -t 4.500000" in joined
+    assert "-noautorotate -display_rotation 0" in joined
     assert "atrim=start=0.000000:end=1.000000" in joined
     assert "aresample=async=1:first_pts=0" in joined
+
+
+def test_reliable_export_reprobes_and_normalizes_phone_orientation() -> None:
+    saved_properties = {
+        "fps": 30.0, "acodec": "aac", "sample_rate": 48000, "channels": 1,
+        "width": 3840, "height": 2160,
+    }
+    actual_properties = {
+        **saved_properties, "rotation": 90, "video_streams": 1, "audio_streams": 1,
+    }
+    proj = {"source_path": "phone.MOV", "probe": saved_properties}
+    captured: list[list[str]] = []
+    old_probe = retake.probe_media
+    old_encoder_usable = retake._ffmpeg_encoder_usable
+    old_run = retake._run_ffmpeg_with_progress
+    try:
+        retake.probe_media = lambda _path: actual_properties
+        retake._ffmpeg_encoder_usable = lambda _encoder: False
+        retake._run_ffmpeg_with_progress = (
+            lambda command, *_args, **_kwargs: captured.append(command)
+        )
+        assert retake._reliable_video_export(
+            proj, [(0.0, 2.0)], Path("output.mp4")
+        ) == "CPU"
+        joined = " ".join(captured[0])
+        assert "transpose=cclock" in joined
+        assert "-noautorotate -display_rotation 0" in joined
+        assert "-metadata:s:v:0 rotate=0" in joined
+        assert "setpts=N/(30*TB),transpose=cclock,fps=30" in joined
+    finally:
+        retake.probe_media = old_probe
+        retake._ffmpeg_encoder_usable = old_encoder_usable
+        retake._run_ffmpeg_with_progress = old_run
 
 
 def test_reliable_export_maps_prepared_audio_with_source_properties() -> None:
@@ -1085,6 +1119,15 @@ def test_display_dimensions_apply_phone_rotation() -> None:
     assert retake.display_dimensions(
         {"width": 3840, "height": 2160, "rotation": 0}
     ) == (3840, 2160)
+    assert retake._orientation_normalization_filters({"rotation": 90}) == [
+        "transpose=cclock"
+    ]
+    assert retake._orientation_normalization_filters({"rotation": 270}) == [
+        "transpose=clock"
+    ]
+    assert retake._orientation_normalization_filters({"rotation": 180}) == [
+        "hflip", "vflip"
+    ]
 
 
 def test_video_timeline_validation_rejects_smartcut_style_gaps() -> None:

@@ -2535,6 +2535,19 @@ def display_dimensions(properties: dict[str, Any]) -> tuple[Optional[int], Optio
     return width, height
 
 
+def _orientation_normalization_filters(properties: dict[str, Any]) -> list[str]:
+    """Bake source display rotation into pixels, leaving no rotation metadata."""
+    rotation = int(properties.get("rotation") or 0) % 360
+    if rotation == 90:
+        # FFprobe's display-matrix sign is opposite FFmpeg's transpose filter.
+        return ["transpose=cclock"]
+    if rotation == 270:
+        return ["transpose=clock"]
+    if rotation == 180:
+        return ["hflip", "vflip"]
+    return []
+
+
 def _audio_codec_args(acodec: Optional[str]) -> list[str]:
     if acodec and acodec.startswith("pcm"):
         return ["-c:a", "pcm_s16le"]
@@ -3037,18 +3050,11 @@ def _preview_video_filter(
         ]
     else:
         raise ValueError(f"unknown preview device: {device}")
-    if rotation in (90, 270):
-        # FFprobe display-matrix rotation has the opposite sign from FFmpeg's
-        # transpose filter. This mapping was verified against decoded source
-        # frames, not inferred from dimensions alone.
-        direction = "cclock" if rotation == 90 else "clock"
+    orientation_filters = _orientation_normalization_filters(properties)
+    if orientation_filters:
         if device == "gpu":
             filters.extend(["hwdownload", "format=nv12"])
-        filters.append(f"transpose={direction}")
-    elif rotation == 180:
-        if device == "gpu":
-            filters.extend(["hwdownload", "format=nv12"])
-        filters.extend(["hflip", "vflip"])
+        filters.extend(orientation_filters)
     elif device == "gpu":
         # NVENC reliably accepts these downloaded NV12 frames on every tested
         # FFmpeg build; direct CUDA-frame negotiation fails on some builds.
@@ -3247,9 +3253,15 @@ def _reliable_video_command(
     encoder: str,
     compatibility: bool = False,
     audio_path: Optional[Path] = None,
+    source_properties: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     """Build a continuous-CFR H.264/AAC export command."""
-    fps = max(1.0, float(proj["probe"].get("fps") or 25.0))
+    properties = dict(proj.get("probe", {}))
+    if source_properties:
+        properties.update(
+            {key: value for key, value in source_properties.items() if value is not None}
+        )
+    fps = max(1.0, float(properties.get("fps") or 25.0))
     fps_fraction = Fraction(fps).limit_denominator(1001)
     fps_expr = (
         str(fps_fraction.numerator)
@@ -3269,17 +3281,26 @@ def _reliable_video_command(
     selection = "+".join(
         f"between(t,{start:.6f},{end:.6f})" for start, end in shifted_keeps
     )
-    has_audio = audio_path is not None or proj["probe"].get("acodec") is not None
+    has_audio = (
+        audio_path is not None
+        or properties.get("acodec") is not None
+        or bool(properties.get("audio_streams"))
+    )
+    video_filters = [
+        f"select='{selection}'",
+        f"setpts=N/({fps_expr}*TB)",
+        *_orientation_normalization_filters(properties),
+        f"fps={fps_expr}",
+    ]
     graph_parts = [
-        f"[0:v]select='{selection}',"
-        f"setpts=N/({fps_expr}*TB),fps={fps_expr}[v]"
+        f"[0:v]{','.join(video_filters)}[v]"
     ]
     maps = ["-map", "[v]"]
     if has_audio:
         if audio_path is not None:
             graph_parts.append(
                 f"[1:a:0]asetpts=PTS-STARTPTS,"
-                f"aresample={int(proj['probe'].get('sample_rate') or 48000)}:"
+                f"aresample={int(properties.get('sample_rate') or 48000)}:"
                 "async=1:first_pts=0[a]"
             )
         else:
@@ -3317,13 +3338,14 @@ def _reliable_video_command(
     audio_args = (
         [
             "-c:a", "aac", "-b:a", "256k",
-            "-ar", str(int(proj["probe"].get("sample_rate") or 48000)),
-            "-ac", str(int(proj["probe"].get("channels") or 1)),
+            "-ar", str(int(properties.get("sample_rate") or 48000)),
+            "-ac", str(int(properties.get("channels") or 1)),
         ]
         if has_audio else ["-an"]
     )
     input_args = [
         "-ss", f"{source_offset:.6f}", "-t", f"{input_duration:.6f}",
+        "-noautorotate", "-display_rotation", "0",
         "-i", proj["source_path"],
     ]
     if audio_path is not None:
@@ -3353,6 +3375,10 @@ def _reliable_video_export(
 ) -> str:
     """Export with GPU acceleration when usable, with one safe CPU fallback."""
     edited = sum(end - start for start, end in keeps)
+    # Legacy project JSON may predate stored rotation metadata. The immutable
+    # source is authoritative for every export so portrait phone media cannot
+    # be flattened by stale project properties.
+    source_properties = probe_media(proj["source_path"])
     encoders = (
         ["h264_nvenc", "libx264"]
         if _ffmpeg_encoder_usable("h264_nvenc")
@@ -3364,7 +3390,7 @@ def _reliable_video_export(
         try:
             command = _reliable_video_command(
                 proj, keeps, out, encoder, compatibility=compatibility,
-                audio_path=audio_path,
+                audio_path=audio_path, source_properties=source_properties,
             )
             _run_ffmpeg_with_progress(
                 command, edited, f"reliable {label} export"
