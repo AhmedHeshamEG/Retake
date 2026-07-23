@@ -21,6 +21,7 @@ from retake import (
     deterministic_retake_proposals,
     deterministic_instruction_plan,
     cut_intervals_from_tokens,
+    ensure_audio_gap_state,
     ensure_voice_enhancement_state,
     keep_list,
     loudness_target_lufs,
@@ -120,13 +121,13 @@ def test_audio_silence_parser_handles_leading_and_trailing_gaps() -> None:
     assert approx(parse_silencedetect_output(output, 10.0), [(0.0, 1.25), (8.5, 10.0)])
 
 
-def test_legacy_audio_gap_cuts_are_inert_without_rewriting_words() -> None:
+def test_export_audio_gap_cuts_join_words_without_rewriting_timestamps() -> None:
     proj = {
         "tokens": [{"id": 0, "kind": "word", "text": "hello", "start": 1.0,
                     "end": 2.0, "seg": 0, "cut": True}],
         "audio_gaps": [{"id": "agap-1", "start": 1.8, "end": 3.0, "cut": True}],
     }
-    assert approx(cut_intervals_from_tokens(proj), [(1.0, 2.0)])
+    assert approx(cut_intervals_from_tokens(proj), [(1.0, 3.0)])
     assert proj["tokens"][0]["start"] == 1.0 and proj["tokens"][0]["end"] == 2.0
 
 
@@ -968,7 +969,7 @@ def test_recalibrate_timing_ui_uses_backend_alignment_status() -> None:
 
 def test_safe_api_calls_retry_but_side_effecting_jobs_do_not() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    assert 'new Set(["/cuts","/markers","/voice-enhancement"])' in html
+    assert 'new Set(["/cuts","/gaps","/markers","/voice-enhancement"])' in html
     assert "const attempts = safeToRetry ? 3 : 1" in html
     assert "/failed to fetch|networkerror/i" in html
 
@@ -996,16 +997,31 @@ def test_fullscreen_and_ai_navigation_use_exact_visible_targets() -> None:
     assert 'first?.scrollIntoView({block:"center",behavior:"smooth"})' in html
 
 
-def test_gap_editor_is_removed_and_voice_enhancement_is_default_on() -> None:
+def test_export_gap_review_and_voice_enhancement_are_available() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    for removed in ('id="gapToggle"', 'id="gapWave"', 'id="gapStart"', 'id="gapEnd"', 'api("/gaps'):
-        assert removed not in html
+    for restored in (
+        'id="gapToggle"', 'id="gapPreview"', 'id="gapWave"',
+        'id="gapStart"', 'id="gapEnd"', 'api("/gaps',
+    ):
+        assert restored in html
+    assert "export-only cut layer" in html
+    assert "Playing the exact gap-cleaned cut used for export." in html
     assert 'id="enhanceEnabled" type="checkbox" checked' in html
     assert "Voice Enhancement" in html and "Reset to Great" in html
     for control in ("enhanceLoudness", "enhanceLeveling", "enhanceNoise", "enhanceDetail"):
         assert f'id="{control}" type="range"' in html
     source = Path(retake.__file__).read_text(encoding="utf-8")
-    assert '@app.post("/gaps")' not in source and '@app.get("/waveform")' not in source
+    assert '@app.post("/gaps")' in source and '@app.get("/waveform")' in source
+    assert "return merge_intervals(transcript_cuts + gap_cuts)" in source
+
+
+def test_audio_gap_state_migration_preserves_transcript_timing() -> None:
+    proj = {"tokens": [{"id": 0, "start": 1.0, "end": 2.0}]}
+    before = json.loads(json.dumps(proj["tokens"]))
+    assert ensure_audio_gap_state(proj)
+    assert proj["audio_gaps"] == [] and not proj["audio_gaps_analyzed"]
+    assert proj["tokens"] == before
+    assert not ensure_audio_gap_state(proj)
 
 
 def test_default_and_legacy_smart_modes_use_reliable_export() -> None:

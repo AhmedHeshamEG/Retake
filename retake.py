@@ -69,6 +69,9 @@ log = logging.getLogger("retake")
 
 PORT = 8710
 GAP_THRESHOLD_DEFAULT = 0.35
+ACTIVE_GAP_MIN_DEFAULT = 0.35
+ACTIVE_GAP_DB_DEFAULT = -40.0
+ACTIVE_GAP_KEEP_DEFAULT = 0.12
 MERGE_EPS = 0.001
 AI_ATTACHMENT_MAX_FILES = 5
 AI_ATTACHMENT_MAX_BYTES = 512 * 1024
@@ -392,6 +395,32 @@ def ensure_voice_enhancement_state(proj: dict[str, Any]) -> bool:
     return False
 
 
+def ensure_audio_gap_state(proj: dict[str, Any]) -> bool:
+    """Lazily add the export-only real-audio gap layer to old projects."""
+    changed = False
+    defaults = {
+        "min_duration_s": ACTIVE_GAP_MIN_DEFAULT,
+        "silence_db": ACTIVE_GAP_DB_DEFAULT,
+        "keep_pause_s": ACTIVE_GAP_KEEP_DEFAULT,
+    }
+    settings = proj.get("audio_gap_settings")
+    if not isinstance(settings, dict):
+        proj["audio_gap_settings"] = dict(defaults)
+        changed = True
+    else:
+        for key, value in defaults.items():
+            if key not in settings:
+                settings[key] = value
+                changed = True
+    if not isinstance(proj.get("audio_gaps"), list):
+        proj["audio_gaps"] = []
+        changed = True
+    if "audio_gaps_analyzed" not in proj:
+        proj["audio_gaps_analyzed"] = False
+        changed = True
+    return changed
+
+
 def loudness_target_lufs(percent: float) -> float:
     """Map the friendly 0-100 control onto the -24 to -14 LUFS range."""
     bounded = max(0.0, min(100.0, float(percent)))
@@ -535,10 +564,68 @@ def cut_intervals_from_tokens(proj: dict[str, Any]) -> list[tuple[float, float]]
     transcript_cuts = transcript_cut_intervals(
         proj.get("tokens", []), safety_handle=safety_handle
     )
-    # The removed real-audio gap editor must not leave invisible, non-editable
-    # cuts active in old projects. Legacy transcript gap tokens remain part of
-    # transcript_cuts above; persisted `audio_gaps` records are intentionally inert.
-    return transcript_cuts
+    gap_cuts = [
+        interval
+        for gap in proj.get("audio_gaps", [])
+        if gap.get("cut")
+        if (interval := _timed_interval(gap)) is not None
+    ]
+    return merge_intervals(transcript_cuts + gap_cuts)
+
+
+def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
+    """Return gaps near kept speech, without changing transcript timestamps."""
+    segment_words: dict[Any, list[tuple[float, float, bool]]] = {}
+    for token in proj.get("tokens", []):
+        if token.get("kind") != "word" or "seg" not in token:
+            continue
+        interval = _timed_interval(token)
+        if interval is None:
+            continue
+        segment_words.setdefault(token["seg"], []).append(
+            (interval[0], interval[1], bool(token.get("cut")))
+        )
+    sentence_ranges = [
+        (
+            min(word[0] for word in words),
+            max(word[1] for word in words),
+            any(not word[2] for word in words),
+        )
+        for words in segment_words.values()
+        if words
+    ]
+    word_cuts = consecutive_word_cut_intervals(
+        proj.get("tokens", []),
+        safety_handle=WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0,
+    )
+
+    candidates: list[tuple[float, str]] = []
+    for gap in proj.get("audio_gaps", []):
+        try:
+            start = float(gap.get("detected_start", gap.get("start")))
+            end = float(gap.get("detected_end", gap.get("end")))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        midpoint = (start + end) / 2.0
+        owners = [
+            has_kept_word
+            for sentence_start, sentence_end, has_kept_word in sentence_ranges
+            if sentence_start - MERGE_EPS <= midpoint <= sentence_end + MERGE_EPS
+        ]
+        if owners:
+            eligible = any(owners)
+        else:
+            eligible = not any(
+                start >= cut_start - MERGE_EPS and end <= cut_end + MERGE_EPS
+                for cut_start, cut_end in word_cuts
+            )
+        gap_id = str(gap.get("id", ""))
+        if eligible and gap_id:
+            candidates.append((start, gap_id))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return [gap_id for _start, gap_id in candidates]
 
 
 def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
@@ -552,6 +639,7 @@ def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
         proj.get("tokens", []), safety_handle=safety_handle
     )
     payload["cut_intervals"] = cut_intervals_from_tokens(proj)
+    payload["scoped_gap_candidate_ids"] = scoped_gap_candidate_ids(proj)
     payload["voice_enhancement"] = validate_voice_enhancement(
         proj.get("voice_enhancement")
     )
@@ -577,6 +665,137 @@ def parse_silencedetect_output(text: str, duration: float) -> list[tuple[float, 
     if pending is not None and duration > pending:
         gaps.append((pending, float(duration)))
     return merge_intervals(gaps)
+
+
+def detect_audio_gaps(
+    media_path: str, duration: float, min_duration: float, silence_db: float,
+) -> list[dict[str, Any]]:
+    """Detect actual low-energy audio intervals without touching Whisper data."""
+    if not FFMPEG:
+        resolve_ffmpeg()
+    filt = f"silencedetect=noise={silence_db:.1f}dB:d={min_duration:.3f}"
+    result = _run([
+        FFMPEG, "-hide_banner", "-nostats", "-i", media_path,
+        "-vn", "-af", filt, "-f", "null", "-",
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"audio gap analysis failed: {result.stderr.strip()[-400:]}")
+    gaps = parse_silencedetect_output(result.stderr, duration)
+    return [
+        {
+            "id": f"agap-{index + 1}",
+            "detected_start": round(start, 3), "detected_end": round(end, 3),
+            "start": round(start, 3), "end": round(end, 3),
+            "cut": False, "manual": False,
+        }
+        for index, (start, end) in enumerate(gaps)
+        if end - start >= min_duration - MERGE_EPS
+    ]
+
+
+def validate_audio_gap_settings(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        min_duration = float(raw.get("min_duration_s", ACTIVE_GAP_MIN_DEFAULT))
+        silence_db = float(raw.get("silence_db", ACTIVE_GAP_DB_DEFAULT))
+        keep_pause = float(raw.get("keep_pause_s", ACTIVE_GAP_KEEP_DEFAULT))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("gap settings must be numbers") from exc
+    if not 0.05 <= min_duration <= 30:
+        raise ValueError("minimum gap must be between 0.05 and 30 seconds")
+    if not -80 <= silence_db <= -10:
+        raise ValueError("silence sensitivity must be between -80 and -10 dB")
+    if not 0 <= keep_pause <= 5:
+        raise ValueError("retained pause must be between 0 and 5 seconds")
+    return {
+        "min_duration_s": round(min_duration, 3),
+        "silence_db": round(silence_db, 1),
+        "keep_pause_s": round(keep_pause, 3),
+    }
+
+
+def validate_audio_gaps(
+    raw: Any, existing: list[dict[str, Any]], duration: float,
+) -> list[dict[str, Any]]:
+    """Accept edits only for detector-created stable IDs; preserve evidence."""
+    if not isinstance(raw, list):
+        raise ValueError("audio gaps must be a list")
+    by_id = {str(gap.get("id")): gap for gap in existing}
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        gap_id = str(item.get("id", ""))
+        original = by_id.get(gap_id)
+        if original is None or gap_id in seen:
+            continue
+        seen.add(gap_id)
+        try:
+            start = max(0.0, min(duration, float(item.get("start"))))
+            end = max(0.0, min(duration, float(item.get("end"))))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid boundaries for {gap_id}") from exc
+        if end <= start:
+            raise ValueError(f"gap {gap_id} must end after it starts")
+        row = dict(original)
+        row.update(
+            start=round(start, 3), end=round(end, 3),
+            cut=bool(item.get("cut", False)),
+            manual=bool(item.get("manual", original.get("manual", False))),
+        )
+        out.append(row)
+    for gap in existing:
+        if str(gap.get("id")) not in seen:
+            out.append(dict(gap))
+    out.sort(key=lambda gap: (float(gap["detected_start"]), str(gap["id"])))
+    return out
+
+
+def gap_bulk_cut_bounds(
+    gap: dict[str, Any], keep_pause: float,
+) -> Optional[tuple[float, float]]:
+    start = float(gap["detected_start"])
+    end = float(gap["detected_end"])
+    if end - start <= keep_pause + MERGE_EPS:
+        return None
+    side = keep_pause / 2.0
+    return (round(start + side, 3), round(end - side, 3))
+
+
+def audio_waveform_peaks(
+    media_path: str, start: float, end: float, points: int,
+) -> list[float]:
+    """Return normalized mono peak buckets for a small gap-boundary editor."""
+    if not FFMPEG:
+        resolve_ffmpeg()
+    span = max(0.01, end - start)
+    cmd = [
+        FFMPEG, "-v", "error", "-ss", f"{start:.6f}", "-t", f"{span:.6f}",
+        "-i", media_path, "-vn", "-ac", "1", "-ar", "8000",
+        "-f", "f32le", "pipe:1",
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"waveform decode failed: {error[-300:]}")
+    samples = array("f")
+    usable = len(result.stdout) - (len(result.stdout) % samples.itemsize)
+    samples.frombytes(result.stdout[:usable])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return [0.0] * points
+    bucket = max(1, len(samples) // points)
+    peaks = [
+        max((abs(value) for value in samples[i:i + bucket]), default=0.0)
+        for i in range(0, len(samples), bucket)
+    ][:points]
+    if len(peaks) < points:
+        peaks.extend([0.0] * (points - len(peaks)))
+    maximum = max(peaks) or 1.0
+    return [round(min(1.0, peak / maximum), 4) for peak in peaks]
 
 
 def detect_silence_intervals(
@@ -1416,6 +1635,13 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             "word_repeats": word_repeats,
             "markers": [],
             "gap_threshold_s": GAP_THRESHOLD_DEFAULT,
+            "audio_gap_settings": {
+                "min_duration_s": ACTIVE_GAP_MIN_DEFAULT,
+                "silence_db": ACTIVE_GAP_DB_DEFAULT,
+                "keep_pause_s": ACTIVE_GAP_KEEP_DEFAULT,
+            },
+            "audio_gaps": [],
+            "audio_gaps_analyzed": False,
             "voice_enhancement": dict(VOICE_ENHANCEMENT_DEFAULTS),
             "project_name": project_dir.name,
             "created_at": utc_now(),
@@ -1433,6 +1659,37 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                  len(tokens), len(segments), len(clusters))
     except Exception as e:
         fail(f"transcription failed: {e}", back_to="idle")
+    finally:
+        JOB_LOCK.release()
+
+
+def audio_gap_detection_job(settings: dict[str, float]) -> None:
+    """Analyze source audio and persist export-only gap candidates."""
+    try:
+        with _STATE_LOCK:
+            proj = CURRENT["project"]
+            if proj is None:
+                raise RuntimeError("no project loaded")
+            source = str(proj["source_path"])
+            duration = float(proj["duration_s"])
+            has_audio = proj.get("probe", {}).get("acodec") is not None
+        if not has_audio:
+            raise RuntimeError("this media has no audio track")
+        set_status("gaps", 5, "detecting real audio gaps")
+        gaps = detect_audio_gaps(
+            source, duration, settings["min_duration_s"], settings["silence_db"]
+        )
+        with _STATE_LOCK:
+            current = CURRENT["project"]
+            if current is None or str(current.get("source_path")) != source:
+                raise RuntimeError("project changed during gap analysis")
+            current["audio_gap_settings"] = settings
+            current["audio_gaps"] = gaps
+            current["audio_gaps_analyzed"] = True
+        save_current_project()
+        set_status("ready", 100, f"detected {len(gaps)} real audio gaps")
+    except Exception as exc:
+        fail(f"audio gap detection failed: {exc}")
     finally:
         JOB_LOCK.release()
 
@@ -3762,6 +4019,7 @@ def open_saved_project(payload: dict = Body(...)) -> JSONResponse:
     try:
         proj = json.loads(path.read_text(encoding="utf-8"))
         migrated = ensure_voice_enhancement_state(proj)
+        migrated = ensure_audio_gap_state(proj) or migrated
         source = Path(str(proj.get("source_path", "")))
         if not source.is_file():
             return JSONResponse(
@@ -3807,6 +4065,7 @@ def open_media(payload: dict = Body(...)) -> JSONResponse:
             proj = json.loads(pj.read_text(encoding="utf-8"))
             if proj.get("schema_version") == 1:
                 migrated = ensure_voice_enhancement_state(proj)
+                migrated = ensure_audio_gap_state(proj) or migrated
                 safe_clusters = sanitize_clusters(
                     proj.get("segments", []), proj.get("clusters", [])
                 )
@@ -4095,9 +4354,79 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
                 proj["tokens"], safety_handle=safety_handle
             ),
             "cut_intervals": cut_intervals_from_tokens(proj),
+            "scoped_gap_candidate_ids": scoped_gap_candidate_ids(proj),
         }
     save_current_project()
     return JSONResponse(response)
+
+
+@app.post("/gaps/detect")
+def start_gap_detection(payload: dict = Body(default={})) -> JSONResponse:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        if proj.get("probe", {}).get("acodec") is None:
+            return JSONResponse({"error": "this media has no audio track"}, status_code=400)
+        ensure_audio_gap_state(proj)
+        base = dict(proj.get("audio_gap_settings") or {})
+    base.update(payload.get("settings") or {})
+    try:
+        settings = validate_audio_gap_settings(base)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if not JOB_LOCK.acquire(blocking=False):
+        return JSONResponse({"error": "another job is running"}, status_code=409)
+    threading.Thread(
+        target=audio_gap_detection_job, args=(settings,), daemon=True
+    ).start()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/gaps")
+def save_audio_gaps(payload: dict = Body(...)) -> JSONResponse:
+    try:
+        with _STATE_LOCK:
+            proj = CURRENT["project"]
+            if proj is None:
+                return JSONResponse({"error": "no project"}, status_code=404)
+            ensure_audio_gap_state(proj)
+            settings = validate_audio_gap_settings(
+                payload.get("settings", proj["audio_gap_settings"])
+            )
+            gaps = validate_audio_gaps(
+                payload.get("gaps", proj["audio_gaps"]),
+                proj["audio_gaps"], float(proj["duration_s"]),
+            )
+            proj["audio_gap_settings"] = settings
+            proj["audio_gaps"] = gaps
+        save_current_project()
+        return JSONResponse({"ok": True, "gaps": gaps, "settings": settings})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/waveform")
+def get_waveform(start: float, end: float, points: int = 180) -> JSONResponse:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        media_path = str(proj["source_path"])
+        duration = float(proj["duration_s"])
+    start = max(0.0, min(duration, float(start)))
+    end = max(start, min(duration, float(end)))
+    points = max(40, min(500, int(points)))
+    if end <= start or end - start > 120:
+        return JSONResponse(
+            {"error": "waveform range must be between 0 and 120 seconds"},
+            status_code=400,
+        )
+    try:
+        peaks = audio_waveform_peaks(media_path, start, end, points)
+        return JSONResponse({"start": start, "end": end, "peaks": peaks})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.post("/markers")

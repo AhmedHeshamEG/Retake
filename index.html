@@ -236,6 +236,13 @@ header{
 #toolbar[hidden]{display:none!important}
 #toolbar .group{gap:9px}
 #toolbar label{color:var(--text);font-weight:600}
+#gapApply,#gapScoped,#gapPreview{height:34px}
+.gap-tools{position:relative}
+.toggle-button{display:inline-flex;align-items:center;gap:7px}.toggle-button i{width:8px;height:8px;border-radius:50%;background:#59616d}.toggle-button[aria-pressed="true"]{border-color:#536c61;background:#17241e}.toggle-button[aria-pressed="true"] i{background:var(--ok);box-shadow:0 0 8px #42cf8288}
+#gapSettingsPanel{position:absolute;z-index:65;top:42px;left:0;width:286px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
+#gapSettingsPanel label{display:grid;grid-template-columns:1fr 76px 24px;align-items:center;gap:6px;margin:8px 0;color:var(--dim);font-size:12px}
+#gapSettingsPanel input{width:76px;padding:6px 7px;font-variant-numeric:tabular-nums}.gap-settings-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:11px}
+.toolbar-count{color:var(--accent);font-weight:700;white-space:nowrap}
 .find-wrap{display:flex;align-items:center;gap:8px;margin-left:auto}
 #findInput{width:160px;background:#0e1115}
 #transcript{padding:16px 22px 150px;font-size:16px;line-height:2.05;background:linear-gradient(90deg,rgba(255,255,255,.008),transparent 65%)}
@@ -247,7 +254,16 @@ header{
 #transcript .w.match{box-shadow:0 0 0 2px rgba(255,178,36,.5)}
 #transcript .w.cut{background:#14171b;color:#6f747c;border-color:#282d34}
 #transcript .w.prop{box-shadow:inset 0 -3px 0 var(--amber);border-bottom-color:var(--amber)}
-#transcript .g{display:none}
+#transcript .g{display:none;padding:0 11px;line-height:27px;margin:3px 5px;background:#1b2027}
+#transcript.show-legacy-gaps .g{display:inline-block}
+#transcript .ag{display:inline-flex;align-items:center;gap:6px;padding:0 9px;line-height:25px;margin:3px 5px;border:1px solid #3d4652;border-radius:999px;background:#1a2027;color:#aab2be;font:11px ui-monospace,Consolas,monospace;cursor:pointer;vertical-align:middle}
+#transcript .ag:hover{border-color:#748091;color:#eef0f2}.ag .gap-edit{border:0;background:transparent;padding:0;color:#9299a5}.ag.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}.ag.manual::after{content:"•";color:var(--amber)}
+#transcript .ag.suggest{border-color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber);color:#f1c46d}
+#gapEditor{position:fixed;z-index:110;left:50%;bottom:24px;transform:translateX(-50%);width:min(720px,calc(100vw - 28px));padding:12px;border:1px solid #49515d;border-radius:12px;background:#0e1217;box-shadow:0 18px 48px #000c}
+.gap-editor-head,.gap-editor-fields{display:flex;align-items:center;gap:9px}.gap-editor-head{margin-bottom:8px}.gap-editor-head .spacer{flex:1}
+#gapWave{display:block;width:100%;height:118px;border:1px solid #2e3540;border-radius:8px;background:#090c10;cursor:ew-resize;touch-action:none}
+.gap-editor-fields{margin-top:9px;flex-wrap:wrap}.gap-editor-fields label{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}.gap-editor-fields input{width:104px;font-variant-numeric:tabular-nums}
+#gapEditor>small{display:block;color:#747d89;margin-top:8px}
 #transcript .sx{display:inline-grid;place-items:center;width:22px;height:22px;margin-right:6px;border:1px solid transparent}
 #transcript .badge{display:inline-block;padding:1px 8px;margin:0 7px 0 2px}
 #transcriptFooter{height:58px;display:flex;align-items:center;gap:24px;padding:0 18px;background:var(--surface);border-top:1px solid var(--line);color:var(--dim);flex:none}
@@ -351,6 +367,21 @@ header{
   <main id="workspace" hidden>
     <section id="left">
       <div id="toolbar" hidden>
+        <div class="group gap-tools">
+          <button id="gapToggle" class="small toggle-button" aria-pressed="false"><i></i> Show gaps</button>
+          <button id="gapSettingsBtn" class="small" title="Gap detection settings" disabled>⚙</button>
+          <button id="gapApply" class="small" disabled>Remove all gaps</button>
+          <button id="gapScoped" class="small" title="Prepare gaps only around speech that will remain" hidden disabled>Remove gaps in kept sentences</button>
+          <button id="gapCancel" class="small" hidden>Cancel</button>
+          <button id="gapPreview" class="small" title="Play the exact edited cut before exporting">▶ Play final cut</button>
+          <span id="gapCount" class="toolbar-count">Off</span>
+          <div id="gapSettingsPanel" hidden>
+            <label>Minimum silence <input id="gapMin" type="number" min="0.05" max="30" step="0.05" value="0.35"><span>s</span></label>
+            <label>Sensitivity <input id="gapDb" type="number" min="-80" max="-10" step="1" value="-40"><span>dB</span></label>
+            <label>Natural pause kept <input id="gapKeep" type="number" min="0" max="5" step="0.01" value="0.12"><span>s</span></label>
+            <div class="gap-settings-actions"><button id="gapRedetect" class="small">Detect again</button><button id="gapSettingsClose" class="small">Done</button></div>
+          </div>
+        </div>
         <div class="find-wrap">
           <span>Aa</span>
           <input id="findInput" type="text" placeholder="Find" spellcheck="false">
@@ -362,6 +393,7 @@ header{
         <span id="wordStat" class="stat">0 words</span>
         <span class="stat"><i class="stat-dot" style="--c:#a974e8"></i><b id="takeStat">0</b> takes</span>
         <span class="stat"><i class="stat-dot" style="--c:#f05a55"></i><b id="cutStat">0</b> cuts</span>
+        <span class="stat"><i class="stat-dot" style="--c:#87909b"></i><b id="gapStat">0</b> gaps</span>
         <span class="stat"><i class="stat-dot" style="--c:#d9a85f"></i><b id="repeatStat">0</b> repeats</span>
         <span class="footer-spacer"></span>
         <span class="footer-hint">Alt+click a word to seek</span>
@@ -452,6 +484,17 @@ Perform a conservative takes edit: group repeated attempts, discard false starts
     </aside>
   </main>
 
+  <div id="gapEditor" hidden>
+    <div class="gap-editor-head"><b id="gapEditorTitle">Gap</b><span class="spacer"></span><button id="gapEditorClose" class="small">✕</button></div>
+    <canvas id="gapWave" width="640" height="118" aria-label="Audio waveform with editable cut boundaries"></canvas>
+    <div class="gap-editor-fields">
+      <label>Cut from <input id="gapStart" type="number" min="0" step="0.001"></label>
+      <label>to <input id="gapEnd" type="number" min="0" step="0.001"></label>
+      <button id="gapReset" class="small">Reset</button>
+      <button id="gapCutToggle" class="small primary">Cut this gap</button>
+    </div>
+    <small>This is an export-only cut layer. Transcript words and timestamps never move.</small>
+  </div>
   <div id="wordTooltip" role="tooltip"></div>
 
   <div id="welcome">
@@ -543,6 +586,13 @@ const S = {
   cutRevision: 0,
   segTokens: new Map(),     // seg id -> [word token ids]
   gapIds: [],               // gap token ids
+  showGaps: false,
+  audioGaps: [],
+  gapSettings: {min_duration_s:.35,silence_db:-40,keep_pause_s:.12},
+  gapDetecting: false,
+  gapSuggestions: new Map(),
+  scopedGapIds: new Set(),
+  gapEditor: null,
   voiceEnhancement: {enabled:true,profile:"great",output_loudness:80,voice_leveling:25,noise_cleanup:25,original_detail:90},
   markers: [],
   markerColors: ["coral","amber","mint","sky","violet","pink","lime","slate"],
@@ -590,7 +640,7 @@ function toast(msg, type = "info", ms = 6000) {
   $("toasts").appendChild(el);
   setTimeout(() => el.remove(), ms);
 }
-const RETRYABLE_STATE_POSTS = new Set(["/cuts","/markers","/voice-enhancement"]);
+const RETRYABLE_STATE_POSTS = new Set(["/cuts","/gaps","/markers","/voice-enhancement"]);
 async function api(url, body) {
   const path = String(url).split("?",1)[0];
   const safeToRetry = body === undefined || RETRYABLE_STATE_POSTS.has(path);
@@ -655,10 +705,19 @@ function renderTranscript() {
     rep.token_ids.forEach((tid) => chipOf.set(tid, hue));
   }
   const html = [];
+  const audioGaps = S.showGaps ? [...S.audioGaps].sort((a,b) => a.detected_start - b.detected_start) : [];
+  let audioGapIndex = 0;
+  const audioGapHtml = (gap) => {
+    const duration = Math.max(0, gap.detected_end - gap.detected_start).toFixed(2);
+    const classes = ["ag", gap.cut ? "cut" : "", gap.manual ? "manual" : "", S.gapSuggestions.has(gap.id) ? "suggest" : ""].filter(Boolean).join(" ");
+    return `<span class="${classes}" data-gap-id="${escHtml(gap.id)}" title="Detected silence ${fmtTime(gap.detected_start)} – ${fmtTime(gap.detected_end)}"><span>⋯ ${duration}s ⋯</span><button class="gap-edit" type="button" title="Edit exact gap boundaries">⌁</button></span> `;
+  };
   let lastSeg = -1;
   for (const t of P.tokens) {
     if (t.kind === "gap") {
       S.gapIds.push(t.id);
+      const secs = (t.end - t.start).toFixed(1);
+      html.push(`<span class="g" data-id="${t.id}" title="silence ${fmtTime(t.start)} – ${fmtTime(t.end)}">⋯ ${secs}s ⋯</span> `);
       continue;
     }
     if (t.seg !== lastSeg) {
@@ -672,6 +731,10 @@ function renderTranscript() {
         html.push(`<span class="badge" style="--clc:${clColor(cl)};background:${clColor(cl)}">take ${k}/${n}</span>`);
       }
     }
+    while (audioGapIndex < audioGaps.length &&
+           (audioGaps[audioGapIndex].detected_start + audioGaps[audioGapIndex].detected_end) / 2 <= t.start) {
+      html.push(audioGapHtml(audioGaps[audioGapIndex++]));
+    }
     if (!S.segTokens.has(t.seg)) S.segTokens.set(t.seg, []);
     S.segTokens.get(t.seg).push(t.id);
     const cls = ["w"], style = [];
@@ -682,8 +745,11 @@ function renderTranscript() {
     html.push(`<span class="${cls.join(" ")}" tabindex="0" role="button" data-id="${t.id}" data-seg="${t.seg}" data-time="${timing}" aria-label="${esc}, ${timing}"${
       style.length ? ` style="${style.join(";")}"` : ""}>${esc}</span> `);
   }
+  while (audioGapIndex < audioGaps.length) html.push(audioGapHtml(audioGaps[audioGapIndex++]));
   if (lastSeg !== -1) html.push(`</div></div>`);
   T.innerHTML = html.join("");
+  T.classList.toggle("show-gaps", S.showGaps);
+  T.classList.toggle("show-legacy-gaps", S.showGaps && !S.audioGaps.length);
   for (const id of S.cut) {
     const el = tokenEl(id);
     if (el) el.classList.add("cut");
@@ -727,7 +793,7 @@ $("findInput").addEventListener("input", () => {
 
 /* ================================================================== editing */
 function captureEditState() {
-  return {cut:[...S.cut]};
+  return {cut:[...S.cut], audioGaps:S.audioGaps.map((gap) => ({...gap}))};
 }
 function snapshot() { S.undo.push(captureEditState()); if (S.undo.length > 200) S.undo.shift(); S.redo = []; }
 function applyCutSet(next) {
@@ -750,7 +816,9 @@ function toggleTokens(ids, force = null) {
 function restoreEditState(state) {
   S.cut = new Set(state.cut || []);
   S.cutsSynced = false; S.cutRevision++;
-  renderTranscript(); recompute(); saveCuts();
+  S.audioGaps = (state.audioGaps || []).map((gap) => ({...gap}));
+  S.proj.audio_gaps = S.audioGaps;
+  renderTranscript(); recompute(); saveCuts(); saveAudioGaps();
 }
 function undo() { if (!S.undo.length) return; S.redo.push(captureEditState()); restoreEditState(S.undo.pop()); }
 function redo() { if (!S.redo.length) return; S.undo.push(captureEditState()); restoreEditState(S.redo.pop()); }
@@ -760,15 +828,18 @@ function recompute() {
   const ivs = S.cutsSynced ? S.transcriptCutIvs.map((iv) => [...iv]) : [];
   // Keep the old per-token preview only while the authoritative autosave is pending.
   if (!S.cutsSynced) for (const t of P.tokens) if (S.cut.has(t.id)) ivs.push([t.start, t.end]);
+  for (const gap of S.audioGaps) if (gap.cut && gap.end > gap.start) ivs.push([gap.start, gap.end]);
   S.cutIvs = mergeIntervals(ivs);
   S.keeps = keepList(S.cutIvs, P.duration_s);
   const edited = S.keeps.reduce((a,[x,y]) => a + (y - x), 0);
   $("durOrig").textContent = fmtDur(P.duration_s);
   $("durEdit").textContent = fmtDur(edited);
-  $("cutStat").textContent = S.cut.size;
+  $("cutStat").textContent = S.cut.size + S.audioGaps.filter((gap) => gap.cut).length;
   $("wordStat").textContent = `${P.tokens.filter((t) => t.kind === "word").length.toLocaleString()} words`;
   $("takeStat").textContent = P.clusters.reduce((n,c) => n + c.members.length, 0);
+  $("gapStat").textContent = S.audioGaps.length || P.tokens.filter((t) => t.kind === "gap").length;
   $("repeatStat").textContent = P.word_repeats.length;
+  updateGapControls();
 }
 const saveCuts = debounce(async () => {
   if (!S.proj) return;
@@ -780,13 +851,31 @@ const saveCuts = debounce(async () => {
     S.proj.word_cut_intervals = result.word_cut_intervals || [];
     S.proj.transcript_cut_intervals = result.transcript_cut_intervals || [];
     S.proj.cut_intervals = result.cut_intervals || [];
+    S.scopedGapIds = new Set(result.scoped_gap_candidate_ids || []);
     S.cutsSynced = true;
     recompute();
   } catch (e) { toast("autosave failed: " + e.message, "error"); }
 }, 500);
+const saveAudioGaps = debounce(async () => {
+  if (!S.proj?.audio_gaps_analyzed) return;
+  try {
+    const result = await api("/gaps", {gaps:S.audioGaps, settings:S.gapSettings});
+    S.audioGaps = (result.gaps || S.audioGaps).map((gap) => ({...gap}));
+    S.proj.audio_gaps = S.audioGaps;
+  } catch (e) { toast("gap autosave failed: " + e.message, "error"); }
+}, 500);
 /* clicks on transcript (delegated) */
 $("transcript").addEventListener("click", (e) => {
   const el = e.target;
+  const audioGap = el.closest?.(".ag");
+  if (audioGap) {
+    const gap = S.audioGaps.find((item) => item.id === audioGap.dataset.gapId);
+    if (!gap) return;
+    if (e.altKey) { player.currentTime = gap.detected_start + .001; return; }
+    if (el.classList.contains("gap-edit")) openGapEditor(gap.id);
+    else toggleAudioGap(gap.id);
+    return;
+  }
   if (el.classList.contains("sx")) {
     const seg = +el.dataset.seg, ids = segAndInnerGaps(seg);
     const allCut = S.segTokens.get(seg).every((id) => S.cut.has(id));
@@ -836,6 +925,242 @@ function selectionTokenIds() {
   });
   return ids.length ? ids : null;
 }
+
+/* ================================================ export-only audio gap layer */
+function updateGapControls() {
+  $("gapToggle").setAttribute("aria-pressed", String(S.showGaps));
+  $("gapToggle").innerHTML = `<i></i> ${S.showGaps ? "Hide" : "Show"} gaps`;
+  const analyzed = !!S.proj?.audio_gaps_analyzed;
+  const hasScopedGaps = S.audioGaps.some((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
+  $("gapSettingsBtn").disabled = !S.showGaps || S.gapDetecting;
+  $("gapApply").disabled = !S.showGaps || !analyzed || !S.audioGaps.length || S.gapDetecting;
+  $("gapScoped").hidden = !S.showGaps;
+  $("gapScoped").disabled = !analyzed || !hasScopedGaps || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
+  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove all gaps";
+  $("gapCancel").hidden = !S.gapSuggestions.size;
+  $("gapPreview").disabled = !S.proj || S.gapDetecting;
+  $("gapCount").textContent = S.gapDetecting ? "Detecting…" : !S.showGaps ? "Off" : `${S.audioGaps.length} gap${S.audioGaps.length === 1 ? "" : "s"}`;
+}
+function readGapSettings() {
+  return {min_duration_s:+$("gapMin").value,silence_db:+$("gapDb").value,keep_pause_s:+$("gapKeep").value};
+}
+function fillGapSettings() {
+  $("gapMin").value = Number(S.gapSettings.min_duration_s ?? .35).toFixed(2);
+  $("gapDb").value = Number(S.gapSettings.silence_db ?? -40).toFixed(0);
+  $("gapKeep").value = Number(S.gapSettings.keep_pause_s ?? .12).toFixed(2);
+}
+async function runGapDetection(settings = S.gapSettings) {
+  try {
+    clearGapSuggestions(false);
+    await api("/gaps/detect", {settings});
+    S.gapSettings = {...settings}; S.gapDetecting = true; updateGapControls();
+    toast("Detecting real silence from the audio…");
+  } catch (error) { toast(error.message, "error", 9000); }
+}
+async function refreshGapResults() {
+  const project = await api("/project");
+  S.proj.audio_gaps_analyzed = !!project.audio_gaps_analyzed;
+  S.proj.audio_gaps = project.audio_gaps || [];
+  S.proj.audio_gap_settings = project.audio_gap_settings || S.gapSettings;
+  S.audioGaps = S.proj.audio_gaps.map((gap) => ({...gap}));
+  S.gapSettings = {...S.proj.audio_gap_settings};
+  S.scopedGapIds = new Set(project.scoped_gap_candidate_ids || []);
+  if (S.cutsSynced)
+    S.transcriptCutIvs = (project.transcript_cut_intervals || []).map((iv) => [...iv]);
+  S.gapSuggestions.clear();
+  S.gapDetecting = false; fillGapSettings(); renderTranscript(); recompute();
+}
+$("gapToggle").addEventListener("click", async () => {
+  S.showGaps = !S.showGaps;
+  if (!S.showGaps) {
+    $("gapSettingsPanel").hidden = true;
+    closeGapEditor();
+    clearGapSuggestions(false);
+  }
+  renderTranscript(); updateGapControls();
+  if (S.showGaps && !S.proj.audio_gaps_analyzed && !S.gapDetecting)
+    await runGapDetection();
+});
+$("gapSettingsBtn").addEventListener("click", () => {
+  $("gapSettingsPanel").hidden = !$("gapSettingsPanel").hidden;
+});
+$("gapSettingsClose").addEventListener("click", () => {
+  $("gapSettingsPanel").hidden = true;
+});
+$("gapRedetect").addEventListener("click", async () => {
+  if (S.audioGaps.some((gap) => gap.cut || gap.manual) &&
+      !confirm("Detect again? Existing gap adjustments will be replaced. Transcript and word timing stay untouched.")) return;
+  const settings = readGapSettings();
+  if (!Number.isFinite(settings.min_duration_s) || !Number.isFinite(settings.silence_db) ||
+      !Number.isFinite(settings.keep_pause_s)) {
+    toast("Enter valid gap settings", "warn"); return;
+  }
+  $("gapSettingsPanel").hidden = true;
+  await runGapDetection(settings);
+});
+function bulkBounds(gap) {
+  const keep = Math.max(0, Number(S.gapSettings.keep_pause_s) || 0);
+  const length = gap.detected_end - gap.detected_start;
+  if (length <= keep + .001) return null;
+  return [gap.detected_start + keep / 2, gap.detected_end - keep / 2];
+}
+function toggleAudioGap(id, force = null) {
+  const gap = S.audioGaps.find((item) => item.id === id); if (!gap) return;
+  snapshot();
+  S.gapSuggestions.delete(id);
+  const on = force === null ? !gap.cut : force;
+  if (on && !gap.manual) {
+    const bounds = bulkBounds(gap);
+    if (bounds) [gap.start,gap.end] = bounds;
+  }
+  gap.cut = on;
+  S.proj.audio_gaps = S.audioGaps;
+  renderTranscript(); recompute(); saveAudioGaps();
+}
+$("gapApply").addEventListener("click", () => {
+  if (S.gapSuggestions.size) {
+    snapshot();
+    for (const gap of S.audioGaps) {
+      const bounds = S.gapSuggestions.get(gap.id);
+      if (!bounds) continue;
+      [gap.start,gap.end] = bounds;
+      gap.cut = true;
+    }
+    const count = S.gapSuggestions.size;
+    S.gapSuggestions.clear();
+    S.proj.audio_gaps = S.audioGaps;
+    renderTranscript(); recompute(); saveAudioGaps();
+    toast(`Applied ${count} export gap cuts · Ctrl+Z to undo`);
+    return;
+  }
+  const eligible = S.audioGaps.filter((gap) => bulkBounds(gap));
+  if (!eligible.length) {
+    toast("No gaps are longer than the natural pause you chose"); return;
+  }
+  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  renderTranscript(); updateGapControls();
+  toast(`Reviewing ${eligible.length} suggested gap cuts with ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s natural pause`);
+});
+$("gapScoped").addEventListener("click", () => {
+  const eligible = S.audioGaps.filter((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
+  if (!eligible.length) {
+    toast("No removable gaps belong to sentences with kept words"); return;
+  }
+  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  renderTranscript(); updateGapControls();
+  toast(`Reviewing ${eligible.length} gaps from sentences that still contain kept words`);
+});
+function clearGapSuggestions(render = true) {
+  S.gapSuggestions.clear();
+  if (render && S.proj) renderTranscript();
+  updateGapControls();
+}
+$("gapCancel").addEventListener("click", () => clearGapSuggestions());
+$("gapPreview").addEventListener("click", () => {
+  if (!S.proj) return;
+  S.edited = true;
+  $("previewToggle").innerHTML = "Preview: <b>edited</b>";
+  clearSkipState();
+  const first = S.keeps[0]?.[0] ?? 0;
+  player.currentTime = Math.max(0, first + .001);
+  player.play().catch(() => toast("Press Play in the player to review the final cut.", "warn"));
+  toast("Playing the exact gap-cleaned cut used for export.");
+});
+
+function activeEditorGap() {
+  return S.audioGaps.find((gap) => gap.id === S.gapEditor?.id);
+}
+function drawGapWave() {
+  const editor = S.gapEditor, gap = activeEditorGap(), canvas = $("gapWave");
+  if (!editor || !gap) return;
+  const ctx = canvas.getContext("2d"), w = canvas.width, h = canvas.height;
+  const span = editor.windowEnd - editor.windowStart;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle="#090c10"; ctx.fillRect(0,0,w,h);
+  const x1 = (gap.start - editor.windowStart) / span * w;
+  const x2 = (gap.end - editor.windowStart) / span * w;
+  ctx.fillStyle = gap.cut ? "rgba(240,90,85,.18)" : "rgba(243,170,35,.10)";
+  ctx.fillRect(x1,0,Math.max(1,x2-x1),h);
+  const peaks = editor.peaks || [];
+  ctx.strokeStyle="#6c7684"; ctx.lineWidth=1; ctx.beginPath();
+  peaks.forEach((peak,i) => {
+    const x=(i/(Math.max(1,peaks.length-1)))*w, amp=peak*(h*.42);
+    ctx.moveTo(x,h/2-amp); ctx.lineTo(x,h/2+amp);
+  });
+  ctx.stroke();
+  ctx.strokeStyle="#ff9e43"; ctx.lineWidth=3;
+  for (const x of [x1,x2]) {
+    ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+  }
+}
+async function openGapEditor(id) {
+  const gap = S.audioGaps.find((item) => item.id === id); if (!gap) return;
+  const pad=.75, windowStart=Math.max(0,gap.detected_start-pad);
+  const windowEnd=Math.min(S.proj.duration_s,gap.detected_end+pad);
+  S.gapEditor={id,windowStart,windowEnd,peaks:[],drag:null};
+  $("gapEditor").hidden=false;
+  $("gapEditorTitle").textContent=`Export gap ${fmtTime(gap.detected_start)} – ${fmtTime(gap.detected_end)}`;
+  $("gapStart").value=gap.start.toFixed(3);
+  $("gapEnd").value=gap.end.toFixed(3);
+  $("gapCutToggle").textContent=gap.cut?"Restore this gap":"Cut this gap";
+  drawGapWave();
+  try {
+    const data=await api(`/waveform?start=${windowStart}&end=${windowEnd}&points=320`);
+    if(S.gapEditor?.id===id){S.gapEditor.peaks=data.peaks||[];drawGapWave();}
+  } catch(error) { toast("Waveform unavailable: "+error.message,"warn"); }
+}
+function closeGapEditor() { S.gapEditor=null; $("gapEditor").hidden=true; }
+$("gapEditorClose").addEventListener("click",closeGapEditor);
+function applyGapEditorInputs(manual=true) {
+  const gap=activeEditorGap(); if(!gap)return;
+  const start=+$("gapStart").value,end=+$("gapEnd").value;
+  if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||start<0||end>S.proj.duration_s) {
+    toast("The gap end must be after its start and inside the media","warn"); return;
+  }
+  snapshot();
+  gap.start=start; gap.end=end; gap.manual=manual;
+  S.proj.audio_gaps=S.audioGaps;
+  recompute(); saveAudioGaps(); drawGapWave();
+}
+$("gapStart").addEventListener("change",()=>applyGapEditorInputs());
+$("gapEnd").addEventListener("change",()=>applyGapEditorInputs());
+$("gapReset").addEventListener("click",()=>{
+  const gap=activeEditorGap();if(!gap)return;
+  $("gapStart").value=gap.detected_start.toFixed(3);
+  $("gapEnd").value=gap.detected_end.toFixed(3);
+  applyGapEditorInputs(false);
+});
+$("gapCutToggle").addEventListener("click",()=>{
+  const gap=activeEditorGap();if(!gap)return;
+  toggleAudioGap(gap.id); openGapEditor(gap.id);
+});
+$("gapWave").addEventListener("pointerdown",(event)=>{
+  const editor=S.gapEditor,gap=activeEditorGap();if(!editor||!gap)return;
+  const rect=event.currentTarget.getBoundingClientRect();
+  const time=editor.windowStart+(event.clientX-rect.left)/rect.width*(editor.windowEnd-editor.windowStart);
+  editor.drag=Math.abs(time-gap.start)<=Math.abs(time-gap.end)?"start":"end";
+  snapshot(); event.currentTarget.setPointerCapture(event.pointerId);
+});
+$("gapWave").addEventListener("pointermove",(event)=>{
+  const editor=S.gapEditor,gap=activeEditorGap();if(!editor?.drag||!gap)return;
+  const rect=event.currentTarget.getBoundingClientRect();
+  const time=Math.max(editor.windowStart,Math.min(editor.windowEnd,
+    editor.windowStart+(event.clientX-rect.left)/rect.width*(editor.windowEnd-editor.windowStart)));
+  if(editor.drag==="start")gap.start=Math.min(time,gap.end-.01);
+  else gap.end=Math.max(time,gap.start+.01);
+  gap.manual=true;
+  $("gapStart").value=gap.start.toFixed(3); $("gapEnd").value=gap.end.toFixed(3);
+  drawGapWave(); recompute();
+});
+function finishGapDrag() {
+  if(!S.gapEditor?.drag)return;
+  S.gapEditor.drag=null;
+  S.proj.audio_gaps=S.audioGaps;
+  saveAudioGaps();
+  document.querySelector(`[data-gap-id="${S.gapEditor.id}"]`)?.classList.add("manual");
+}
+$("gapWave").addEventListener("pointerup",finishGapDrag);
+$("gapWave").addEventListener("pointercancel",finishGapDrag);
 
 /* ======================================================== word timing alignment */
 function renderAlignmentControl() {
@@ -1576,7 +1901,13 @@ async function loadProject() {
   S.proj = P;
   S.cut = new Set(P.tokens.filter((t) => t.cut).map((t) => t.id));
   S.transcriptCutIvs = (P.transcript_cut_intervals || []).map((iv) => [...iv]);
+  S.scopedGapIds = new Set(P.scoped_gap_candidate_ids || []);
   S.cutsSynced = true; S.cutRevision = 0;
+  S.showGaps = false;
+  S.audioGaps = (P.audio_gaps || []).map((gap) => ({...gap}));
+  S.gapSuggestions.clear();
+  S.gapSettings = {...(P.audio_gap_settings || {min_duration_s:.35,silence_db:-40,keep_pause_s:.12})};
+  S.gapDetecting = false; closeGapEditor(); fillGapSettings();
   S.voiceEnhancement = {...S.voiceEnhancement,...(P.voice_enhancement || {})};
   S.undo = []; S.redo = []; S.lastClicked = null; S.sel = new Set();
   S.markers = P.markers || [];
@@ -1638,7 +1969,7 @@ function updateGlobalProgress(st) {
   bar.classList.toggle("indeterminate", indeterminate);
   if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
   label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
-  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",ai:"AI working",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
   $("readyPill").textContent = phaseName[st.phase] || "Working";
   const exporting = st.phase === "export";
   document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
@@ -1666,6 +1997,7 @@ async function poll() {
       if (st.error) toast(st.error, "error", 9000);
       S.exporting = false;
       if (S.aiRunning) { S.aiRunning = false; $("aiBtn").disabled = false; }
+      if (S.gapDetecting) { S.gapDetecting = false; updateGapControls(); }
       if (S.loading) { S.loading = false; $("progressPanel").classList.remove("on"); }
     }
     const busy = ["probe","load_model","transcribe","cluster"].includes(st.phase);
@@ -1674,6 +2006,7 @@ async function poll() {
       $("progressFill").style.width = st.pct + "%";
       $("progressMsg").textContent = `${st.msg}  ·  ${st.pct}%`;
     }
+    if (st.phase === "ready" && S.gapDetecting) await refreshGapResults();
     if (st.phase !== wasPhase) {
       if (st.phase === "ready" && S.loading && st.has_project) {
         S.loading = false;
@@ -1689,7 +2022,7 @@ async function poll() {
       if (st.phase === "ready" && S.aiRunning) await aiFinished();
       wasPhase = st.phase;
     }
-    if (["export","ai","align","preview"].includes(st.phase) && st.msg)
+    if (["export","ai","gaps","align","preview"].includes(st.phase) && st.msg)
       $("durations").title = `${st.msg} (${st.pct}%)`;
   } catch (_) { /* server briefly unreachable; keep polling */ }
   setTimeout(poll, 500);
