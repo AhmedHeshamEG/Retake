@@ -9,11 +9,36 @@ pip install -r requirements.txt
 python retake.py
 ```
 
-The browser opens at `http://localhost:8710`. The command window also prints the private LAN link to open on a phone. Choose or drop a video/audio file, select its spoken language (or leave Auto-detect), and Retake uploads it with visible resumable progress.
+The browser opens at `http://localhost:8710`. The command window also prints a
+private LAN link to open on a phone. Choose or drop a video/audio file, select
+its spoken language (or leave Auto-detect), and Retake uploads it with visible
+resumable progress.
 
-Core transcription, embedding, and optional GGUF weights load from `./models/`.
-Accurate word alignment downloads its language model once into `models/alignment/`
-when that optional runtime is first prepared; later calibration is local.
+Core transcription and embedding weights load from `./models/`. Accurate word
+alignment downloads its language model once into `models/alignment/` when that
+optional runtime is first prepared; later calibration is local.
+
+## Sending video from a phone
+
+Retake serves two addresses: plain HTTP on port 8710, which the desktop has
+always used, and HTTPS on port 8443 for phones. Both run at once, so nothing
+about the desktop workflow changes.
+
+The HTTPS one matters because iOS Safari refuses `navigator.wakeLock` over plain
+HTTP. Without a wake lock the phone screen sleeps partway through a large
+transfer, Safari suspends the tab, and the upload stalls. Over HTTPS the page
+holds the screen awake and the transfer runs to completion.
+
+The certificate is generated on first run, covers this computer's own LAN
+addresses, and never leaves the machine, so the phone will warn once that it is
+not trusted -- choose Advanced and continue. Retake prints the exact address to
+open.
+
+Transfers are resumable either way and no longer give up on their own. If the
+connection drops or the tab is backgrounded, the page waits for it to come back
+and continues from the last confirmed byte rather than failing; chunk size
+adapts to the link, up to 8 MB. Reopening Retake after an interruption asks the
+laptop how much already arrived and offers to continue from there.
 
 ## Docker
 
@@ -59,11 +84,65 @@ Git-ignored `models/` folder. Retake always tries CUDA first; if CUDA is absent,
 out of memory, or errors, the isolated worker exits and Retake retries once on
 CPU without partially updating the project.
 
-## Optional AI cut
+## Cut by instruction
 
-Drop any instruct `.gguf` (recommended: Qwen3-4B-Instruct Q4_K_M) into `models/llm/` and install `pip install llama-cpp-python==0.3.33`. "✦ Cut with AI" accepts short guidance or detailed mixed Arabic/English edit lists. Quoted phrases, keep commands, timestamps, and gaps resolve to exact word/gap token IDs and stay highlighted for review; ambiguous or unmatched instructions are shown instead of guessed. Plain-text reference scripts (`.txt`, `.md`, `.srt`, and similar) remain supported. No GGUF → the AI card explains what is missing; everything else works.
+"✦ Cut by instruction" accepts short guidance or detailed mixed Arabic/English
+edit lists. Quoted phrases, keep commands, timestamps, and gaps resolve to exact
+word/gap token IDs and stay highlighted for review; ambiguous or unmatched
+instructions are shown instead of guessed. Plain-text reference scripts (`.txt`,
+`.md`, `.srt`, and similar) are supported as context.
 
-Tests: `python test_retake.py`. Every project is self-contained under `projects/Project N/`, including its original media, `project.json`, and `exports/`. Reopening a project never retranscribes it.
+Nothing needs installing for this and no model runs locally. Retake resolves
+what it can understand on its own; language it cannot parse is reported as
+unresolved rather than guessed at. For conversational editing, connect an MCP
+client -- see below.
+
+## Editing with Claude, over MCP
+
+`retake_mcp.py` exposes Retake to any MCP client. The division of labour is the
+point: the client supplies the thing Retake cannot do, understanding what you
+meant, and Retake supplies the thing a language model must not be trusted with,
+deciding which real audio a phrase refers to. Ask for "the bit where I fumbled
+the sponsor read" and Retake answers with exact word tokens and their
+timestamps, or says it could not find them. A client can never name a raw time
+span to delete or invent a token ID.
+
+Every mutating tool previews first. `apply_cuts` reports the token IDs that
+would change and the resulting duration, and writes nothing until you call it
+again with `dry_run=false`. Applied edits push onto an undo stack of project
+snapshots that `undo` unwinds one at a time, and edits are deltas, so cutting
+five words never restores the rest of your work.
+
+Start Retake, then point a client at it. For Claude Desktop or Claude Code, add
+to the MCP server config:
+
+```json
+{
+  "mcpServers": {
+    "retake": {
+      "command": "python",
+      "args": ["E:/path/to/Retake/retake_mcp.py"]
+    }
+  }
+}
+```
+
+Clients that speak streamable HTTP can use `http://localhost:8710/mcp`
+directly, which the running editor serves itself. `retake_mcp.py --http --port
+8711` runs the same tools as a standalone HTTP server. Set `RETAKE_URL` if
+Retake listens somewhere other than `http://127.0.0.1:8710`.
+
+The 19 tools cover reading (`get_status`, `list_projects`, `open_project`,
+`get_edit_summary`, `read_transcript`, `find_phrase`, `list_retakes`), editing
+(`plan_edit`, `get_proposals`, `apply_cuts`, `apply_proposals`, `undo`,
+`set_markers`, `set_voice_enhancement`), and jobs (`start_export`,
+`get_job_status`, `export_text`, `get_latest_export`, `recalibrate_timing`).
+`mcp` is an optional dependency: without it the editor runs unchanged and simply
+has no `/mcp` endpoint.
+
+Tests: `python test_retake.py`. Every project is self-contained under
+`projects/Project N/`, including its original media, `project.json`, and
+`exports/`. Reopening a project never retranscribes it.
 
 ## Voice enhancement and export quality
 

@@ -1795,6 +1795,32 @@ async function reacquireWakeLock() {
   try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
 }
 
+/* A backgrounded phone browser cannot run fetch. Rather than burning retries
+   against a tab that is asleep, wait for it to come back and carry on. */
+function whenVisible() {
+  if (document.visibilityState === "visible") return Promise.resolve();
+  return new Promise((resolve) => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      document.removeEventListener("visibilitychange", onVisible);
+      resolve();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+  });
+}
+
+const UPLOAD_MIN_CHUNK = 256 * 1024;
+const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;   /* matches UPLOAD_CHUNK_MAX_BYTES */
+const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
+
+/* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
+   Aim for a few seconds per chunk and let the link decide the size. */
+function nextChunkSize(current, seconds) {
+  if (seconds < 1.5) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
+  if (seconds > 6) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
+  return current;
+}
+
 async function uploadSelectedFile(file) {
   if (S.uploading) return;
   S.uploading = true;
@@ -1811,20 +1837,22 @@ async function uploadSelectedFile(file) {
     if (navigator.wakeLock) {
       try { S.wakeLock = await navigator.wakeLock.request("screen"); wakeLockOk = true; } catch (_) {}
     }
-    if (!wakeLockOk) {
-      toast("Can't keep the screen awake on this connection (needs HTTPS). Keep this tab open and the screen on until the transfer finishes, or it will pause.", "warn", 12000);
+    if (!wakeLockOk && location.protocol !== "https:") {
+      toast("This page can't keep the screen awake over plain HTTP. Open Retake's https:// address instead (the command window prints it) and the transfer will survive a screen lock. It resumes by itself either way.", "warn", 14000);
     }
     document.addEventListener("visibilitychange", reacquireWakeLock);
     const start = await api("/upload/start", descriptor);
     S.uploadSession = start.session; let offset = Number(start.offset) || 0;
     localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
     S.uploadAbort = new AbortController();
-    const chunkSize = 1024 * 1024;
+    let chunkSize = 1024 * 1024;
     while (offset < file.size) {
-      let sent = false;
-      const maxAttempts = 20;
-      for (let attempt = 0; attempt < maxAttempts && !sent; attempt++) {
+      let sent = false, attempt = 0, stalledSince = 0;
+      while (!sent) {
+        /* Locking the phone suspends this tab; resume where we left off. */
+        await whenVisible();
         try {
+          const startedChunk = performance.now();
           const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
           const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
             method:"POST", headers:{"X-Upload-Offset":String(offset)}, body:chunk,
@@ -1832,23 +1860,29 @@ async function uploadSelectedFile(file) {
           });
           const data = await response.json();
           if (response.status === 409 && Number.isFinite(Number(data.offset))) {
-            offset = Number(data.offset); sent = true; continue;
+            offset = Number(data.offset); sent = true; break;
           }
           if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-          offset = Number(data.offset); sent = true;
+          chunkSize = nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000);
+          offset = Number(data.offset); sent = true; stalledSince = 0;
         } catch (error) {
           if (error.name === "AbortError") throw error;
-          if (attempt === maxAttempts - 1) throw new Error(`connection kept dropping after ${maxAttempts} retries: ${error.message}`);
-          const delay = Math.min(10000, 500 * (2 ** Math.min(attempt, 6)));
-          $("progressMsg").textContent = `Connection interrupted · retrying chunk ${attempt + 1}/${maxAttempts}…`;
+          if (!stalledSince) stalledSince = Date.now();
+          if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
+            throw new Error(`the connection has been down for five minutes: ${error.message}`);
+          }
+          /* A drop often means the chunk was too ambitious for this link. */
+          chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
+          const waited = Math.round((Date.now() - stalledSince) / 1000);
+          $("progressMsg").textContent = `Connection interrupted · resuming automatically (${waited}s)…`;
+          const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
           await new Promise((resolve) => setTimeout(resolve, delay));
+          await whenVisible();
           try {
             const resumed = await api("/upload/start", descriptor);
             S.uploadSession = resumed.session;
             offset = Number(resumed.offset) || 0;
-          } catch (resumeError) {
-            if (attempt === 5) throw resumeError;
-          }
+          } catch (_) { /* server still unreachable; the loop keeps waiting */ }
         }
       }
       const pct = file.size ? offset / file.size * 100 : 0;
@@ -2065,10 +2099,28 @@ $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help
   try {
     const pending = JSON.parse(localStorage.getItem("retakePendingTransfer") || "null");
     if (pending?.name && pending?.size) {
-      S.uploadSession = pending.session || null;
-      $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
+      /* The browser cannot re-open a file on its own, so ask for the same one
+         again -- but confirm with the laptop how much of it already arrived, so
+         the offer is honest about what resuming saves. */
+      let received = null;
+      try {
+        const state = await api("/upload/start", pending);
+        received = Number(state.offset) || 0;
+        S.uploadSession = state.session;
+      } catch (_) { S.uploadSession = pending.session || null; }
       $("progressPanel").classList.add("on");
-      $("progressMsg").textContent = "Transfer paused — the connection dropped (often a phone screen lock). No data was lost; tap \"Choose file\" and pick the same file again to resume from where it left off.";
+      if (received === null) {
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
+        $("progressMsg").textContent = "Transfer interrupted. Retake could not be reached to check what arrived — choose the same file again to continue.";
+      } else if (received >= Number(pending.size)) {
+        localStorage.removeItem("retakePendingTransfer");
+        $("progressPanel").classList.remove("on");
+      } else {
+        const pct = Number(pending.size) ? received / Number(pending.size) * 100 : 0;
+        $("progressFill").style.width = `${pct}%`;
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
+        $("progressMsg").textContent = `Transfer interrupted · ${fmtBytes(received)} of ${fmtBytes(pending.size)} is already on the laptop. Nothing was lost — choose the same file again and it continues from there.`;
+      }
       setUploadActions(false, true);
     }
     const st = await api("/status");

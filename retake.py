@@ -32,6 +32,7 @@ import threading
 import time
 import webbrowser
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from array import array
 from fractions import Fraction
 from datetime import datetime, timezone
@@ -54,6 +55,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
 PROJECTS_DIR = ROOT / "projects"
 INCOMING_DIR = PROJECTS_DIR / ".incoming"
+TLS_DIR = MODELS_DIR / "tls"
 INDEX_HTML = ROOT / "index.html"
 
 for d in (MODELS_DIR, PROJECTS_DIR, INCOMING_DIR):
@@ -70,6 +72,9 @@ logging.basicConfig(
 log = logging.getLogger("retake")
 
 PORT = 8710
+HTTPS_PORT = 8443
+TLS_CERT_DAYS = 397
+TLS_CERT_VERSION = 1
 GAP_THRESHOLD_DEFAULT = 0.35
 ACTIVE_GAP_MIN_DEFAULT = 0.35
 ACTIVE_GAP_DB_DEFAULT = -40.0
@@ -84,7 +89,7 @@ ASSISTANT_MAX_TOKEN_IDS = 20_000
 ASSISTANT_TRANSCRIPT_PAGE = 200
 ASSISTANT_BACKUP_KEEP = 20
 MCP_HTTP_PATH = "/mcp"
-UPLOAD_CHUNK_MAX_BYTES = 2 * 1024 * 1024
+UPLOAD_CHUNK_MAX_BYTES = 8 * 1024 * 1024
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
 PREVIEW_PROXY_VERSION = 2
@@ -4816,7 +4821,8 @@ def run_export_text(payload: dict = Body(...)) -> JSONResponse:
 # Entry point
 # --------------------------------------------------------------------------
 
-def lan_urls(port: int = PORT) -> list[str]:
+def lan_addresses() -> list[str]:
+    """Private IPv4 addresses this computer answers on."""
     addresses: set[str] = set()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -4826,7 +4832,96 @@ def lan_urls(port: int = PORT) -> list[str]:
                 addresses.add(address)
     except OSError:
         pass
-    return [f"http://{address}:{port}" for address in sorted(addresses)]
+    return sorted(addresses)
+
+
+def lan_urls(port: int = PORT, scheme: str = "http") -> list[str]:
+    return [f"{scheme}://{address}:{port}" for address in lan_addresses()]
+
+
+def ensure_lan_certificate() -> Optional[tuple[Path, Path]]:
+    """Self-signed certificate covering localhost and this machine's LAN IPs.
+
+    Phones are the reason this exists. Over plain HTTP, iOS Safari refuses
+    `navigator.wakeLock`, so the screen sleeps partway through a large transfer,
+    the tab is suspended, and the upload stalls. HTTPS -- even a certificate the
+    phone has to be told to trust once -- makes the wake lock available and the
+    transfer runs to completion.
+
+    Regenerated when the set of addresses changes or the certificate is close to
+    expiring. It never leaves this machine and lives under the ignored models/
+    folder; the private key is written before the certificate so a half-written
+    pair is detected and rebuilt rather than served.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except ImportError:
+        log.info("HTTPS disabled: `pip install cryptography` to enable phone transfers "
+                 "that survive a screen lock")
+        return None
+
+    addresses = lan_addresses()
+    fingerprint = json.dumps({"hosts": addresses, "version": TLS_CERT_VERSION}, sort_keys=True)
+    TLS_DIR.mkdir(parents=True, exist_ok=True)
+    cert_path, key_path, meta_path = (
+        TLS_DIR / "retake.crt", TLS_DIR / "retake.key", TLS_DIR / "retake.json"
+    )
+
+    if cert_path.exists() and key_path.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            expires = datetime.fromisoformat(meta["expires_at"])
+            fresh = expires - datetime.now(timezone.utc) > timedelta(days=14)
+            if meta.get("fingerprint") == fingerprint and fresh:
+                return cert_path, key_path
+        except (OSError, ValueError, KeyError):
+            pass
+
+    try:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "Retake local"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Retake"),
+        ])
+        alternatives: list[x509.GeneralName] = [
+            x509.DNSName("localhost"),
+            x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+        ]
+        for address in addresses:
+            alternatives.append(x509.IPAddress(ipaddress.ip_address(address)))
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=TLS_CERT_DAYS)
+        certificate = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(expires_at)
+            .add_extension(x509.SubjectAlternativeName(alternatives), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        key_path.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        atomic_write_json(meta_path, {
+            "fingerprint": fingerprint,
+            "expires_at": expires_at.isoformat(),
+            "hosts": addresses,
+        })
+    except Exception as exc:
+        log.warning("HTTPS certificate could not be created: %s", exc)
+        return None
+    log.info("HTTPS certificate ready for %s", ", ".join(addresses) or "localhost only")
+    return cert_path, key_path
 
 
 def main() -> None:
@@ -4836,20 +4931,57 @@ def main() -> None:
         sys.exit(1)
     threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     local_url = f"http://localhost:{PORT}"
-    urls = lan_urls()
+    tls = ensure_lan_certificate()
+    https_urls = lan_urls(HTTPS_PORT, "https") if tls else []
+    http_urls = lan_urls()
+
     print("\nRETAKE is ready")
     print(f"  This computer:       {local_url}")
-    if urls:
-        for index, url in enumerate(urls):
+    if https_urls:
+        for index, url in enumerate(https_urls):
             label = "Phone / local network:" if index == 0 else "                      "
             print(f"  {label} {url}")
+        print()
+        print("  The phone will warn that the certificate is not trusted the first")
+        print("  time. Choose Advanced, then continue -- it is this computer's own")
+        print("  certificate. HTTPS is what lets the phone keep its screen awake, so")
+        print("  a large transfer no longer stalls when the screen locks.")
+        if http_urls:
+            print(f"  Plain HTTP still works at {http_urls[0]} if you prefer.")
+    elif http_urls:
+        for index, url in enumerate(http_urls):
+            label = "Phone / local network:" if index == 0 else "                      "
+            print(f"  {label} {url}")
+        print("  (No HTTPS: transfers will pause when the phone screen locks.)")
     else:
         print("  Phone / local network: no active private network address found")
     print()
     log.info("RETAKE listening on %s", local_url)
+
     if os.name == "nt" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+
+    if not tls:
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+        return
+
+    # Both at once: the desktop keeps the plain-HTTP address it has always used,
+    # and phones get the HTTPS one they need for a wake lock.
+    certificate, key = tls
+    plain = uvicorn.Server(uvicorn.Config(
+        app, host="0.0.0.0", port=PORT, log_level="warning",
+    ))
+    threading.Thread(target=plain.run, daemon=True).start()
+    try:
+        uvicorn.run(
+            app, host="0.0.0.0", port=HTTPS_PORT, log_level="warning",
+            ssl_certfile=str(certificate), ssl_keyfile=str(key),
+        )
+    except OSError as exc:
+        log.warning("HTTPS could not start on port %d (%s); serving HTTP only",
+                    HTTPS_PORT, exc)
+        plain.should_exit = True
+        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
 
 
 if __name__ == "__main__":

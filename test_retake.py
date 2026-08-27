@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -648,6 +650,77 @@ def test_text_attachments_are_bounded_and_binary_is_ignored() -> None:
 def test_model_hubs_are_forced_offline() -> None:
     assert os.environ["HF_HUB_OFFLINE"] == "1"
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_lan_urls_carry_a_scheme_and_port() -> None:
+    assert all(url.startswith("https://") and url.endswith(":8443")
+               for url in lan_urls(retake.HTTPS_PORT, "https"))
+
+
+def test_lan_certificate_covers_localhost_and_every_lan_address() -> None:
+    """iOS only grants a wake lock over HTTPS, so the phone must trust this."""
+    try:
+        from cryptography import x509
+    except ImportError:  # optional dependency
+        return
+    old_dir = retake.TLS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        retake.TLS_DIR = Path(tmp) / "tls"
+        try:
+            pair = retake.ensure_lan_certificate()
+            assert pair is not None
+            certificate_path, key_path = pair
+            assert certificate_path.exists() and key_path.exists()
+            # A real TLS stack has to accept the pair, not just the file bytes.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(certificate_path), str(key_path))
+
+            certificate = x509.load_pem_x509_certificate(certificate_path.read_bytes())
+            names = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            hosts = {str(entry.value) for entry in names}
+            assert "localhost" in hosts and "127.0.0.1" in hosts
+            for address in retake.lan_addresses():
+                assert address in hosts, address
+            assert certificate.not_valid_after_utc > datetime.now(timezone.utc)
+            # Second call reuses it rather than churning a new key.
+            assert retake.ensure_lan_certificate() == pair
+        finally:
+            retake.TLS_DIR = old_dir
+
+
+def test_serving_https_keeps_the_plain_http_address() -> None:
+    """The desktop workflow must not move just because phones need TLS."""
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    main_source = source[source.index("def main() -> None:"):]
+    assert "ssl_certfile=str(certificate)" in main_source
+    assert "port=HTTPS_PORT" in main_source
+    assert "target=plain.run" in main_source
+    # No certificate, or a busy TLS port, must still leave a working editor.
+    assert "if not tls:" in main_source
+    assert "serving HTTP only" in main_source
+
+
+def test_transfer_waits_for_the_tab_instead_of_burning_retries() -> None:
+    """A locked phone suspends fetch; retrying against a sleeping tab is waste."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function whenVisible()" in html
+    assert "await whenVisible();" in html
+    assert "resuming automatically" in html
+    # The old dead end is gone.
+    assert "Transfer paused safely on the laptop" not in html
+    assert "connection kept dropping after" not in html
+    # It gives up only after a long continuous outage, not after N attempts.
+    assert "UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000" in html
+
+
+def test_transfer_chunk_size_adapts_within_the_server_limit() -> None:
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function nextChunkSize(current, seconds)" in html
+    assert "const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;" in html
+    # The client must never propose a chunk the server would reject with 413.
+    assert retake.UPLOAD_CHUNK_MAX_BYTES >= 8 * 1024 * 1024
 
 
 def test_lan_urls_are_http_links() -> None:
