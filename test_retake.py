@@ -16,7 +16,6 @@ from fastapi.testclient import TestClient
 import retake
 
 from retake import (
-    build_ai_chunks,
     clusters_from_similarity,
     deterministic_retake_proposals,
     deterministic_instruction_plan,
@@ -43,7 +42,6 @@ from retake import (
     timestamps_in_text,
     validate_planned_operations,
     validate_voice_enhancement,
-    validate_llm_proposal,
 )
 
 
@@ -351,18 +349,6 @@ def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
             pass
         else:
             raise AssertionError(f"invalid cleanup accepted: {bad!r}")
-
-
-def test_ai_chunks_never_split_clusters() -> None:
-    segments = [{"id": i, "text": "word " * 900} for i in range(6)]
-    clusters = [{"id": 0, "members": [1, 3]}]  # spans indices 1..3
-    chunks = build_ai_chunks(segments, clusters, max_words=2000)
-    # indices 1,2,3 must land in exactly one chunk together
-    holding = [c for c in chunks if 1 in c]
-    assert len(holding) == 1 and {1, 2, 3} <= set(holding[0])
-    # order preserved, everything covered exactly once
-    flat = [i for c in chunks for i in c]
-    assert flat == sorted(flat) == list(range(6))
 
 
 def test_retakes_do_not_chain_through_weak_links() -> None:
@@ -1008,24 +994,20 @@ def test_generic_editor_prompt_has_no_explicit_delete_target() -> None:
     assert "sponsor" in explicit_target_terms("Delete the sponsor message.")
 
 
-def test_ai_rejects_generic_unique_content_and_select_everything() -> None:
+def test_budget_guard_refuses_an_implausibly_broad_automated_edit() -> None:
+    """The guard that stops one confident mistake from deleting the recording."""
     segments = [
         {"id": i, "start": float(i * 5), "end": float(i * 5 + 4),
          "text": f"unique substantive section number {i}"}
         for i in range(20)
     ]
-    by_id = {s["id"]: s for s in segments}
-    invalid = validate_llm_proposal(
-        {"candidate_id": 3, "category": "explicit_target", "evidence": "unique substantive",
-         "reason": "remove it"},
-        by_id, set(by_id), set(), set(),
-    )
-    assert invalid is None
     broad = [
         {"sentence_ids": [s["id"]], "start": s["start"], "end": s["end"]}
         for s in segments
     ]
     assert not enforce_llm_budget(broad, segments, 100.0)
+    assert enforce_llm_budget(broad[:2], segments, 100.0)
+    assert enforce_llm_budget([], segments, 100.0)
 
 
 def test_preview_has_single_flight_seek_controller() -> None:

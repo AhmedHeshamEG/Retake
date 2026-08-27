@@ -421,7 +421,7 @@ header{
       </section>
 
       <section id="aiCard" class="card">
-        <div class="card-head"><span style="color:var(--accent)">✦&nbsp; Cut with AI</span><span class="spacer"></span><button id="aiHistory" class="small">↶ History</button></div>
+        <div class="card-head"><span style="color:var(--accent)">✦&nbsp; Cut by instruction</span><span class="spacer"></span><button id="aiHistory" class="small">↶ History</button></div>
         <div id="aiBar">
           <div class="ai-input-row">
             <button id="aiAttachBtn" title="Attach reference script">⌕</button>
@@ -1496,14 +1496,12 @@ $("markerExport").addEventListener("click", () =>
 /* ===================================================================== AI */
 async function initAI() {
   try {
-    const d = await api("/ai/available");
-    $("aiBar").classList.toggle("unavailable", !d.available);
-    $("aiBtn").disabled = !d.available;
-    $("aiStatus").textContent = d.available
-      ? `Local model ready · ${d.model}`
-      : "Add an instruct .gguf model to models/llm to enable AI cuts.";
-    if (d.available) $("aiBtn").title = "Analyze with " + d.model;
-  } catch (e) { $("aiStatus").textContent = "AI availability could not be checked."; }
+    const d = await api("/assistant/available");
+    $("aiBar").classList.remove("unavailable");
+    $("aiBtn").disabled = false;
+    $("aiStatus").textContent = "Ready · quoted phrases, timestamps and repeated takes resolve exactly.";
+    $("aiBtn").title = `Resolve instructions to exact words. Connect an MCP client at ${d.mcp?.http_path || "/mcp"} for conversational editing.`;
+  } catch (e) { $("aiStatus").textContent = "The assistant could not be reached."; }
 }
 
 function renderAttachments() {
@@ -1529,7 +1527,7 @@ $("aiFiles").addEventListener("change", async (e) => {
     if (remaining <= 0) { toast("Reference text limit reached (12,000 characters)", "warn"); break; }
     if (content.length > remaining) {
       content = content.slice(0, remaining);
-      toast(`${file.name} was trimmed to fit the local model context`, "warn");
+      toast(`${file.name} was trimmed to fit the reference text limit`, "warn");
     }
     S.attachments.push({name:file.name, size:file.size, content}); remaining -= content.length;
   }
@@ -1538,14 +1536,14 @@ $("aiFiles").addEventListener("change", async (e) => {
 
 $("aiBtn").addEventListener("click", async () => {
   try {
-    const result = await api("/ai/run", {
+    const result = await api("/assistant/run", {
       instructions: $("aiInstructions").value,
       attachments: S.attachments.map(({name,content}) => ({name,content})),
     });
     result.warnings?.forEach((w) => toast("Reference: " + w, "warn"));
     S.aiRunning = true;
     $("aiBtn").disabled = true;
-    $("aiStatus").textContent = "Analyzing transcript locally…";
+    $("aiStatus").textContent = "Matching your instructions to exact words…";
     pollAIResult();
   } catch (e) { toast(e.message, "error"); }
 });
@@ -1596,7 +1594,7 @@ function navigateProposal(ids, forceSeek = false) {
 async function pollAIResult() {
   if (!S.aiRunning) return;
   try {
-    const result = await api("/ai/result");
+    const result = await api("/assistant/result");
     if (result.done && !result.running) { await aiFinished(); return; }
   } catch (_) { /* the global status poll will surface server failures */ }
   if (S.aiRunning) setTimeout(pollAIResult, 350);
@@ -1618,7 +1616,7 @@ async function aiFinished() {
   S.aiRunning = false;
   $("aiBtn").disabled = false;
   try {
-    const r = await api("/ai/result");
+    const r = await api("/assistant/result");
     r.warnings?.forEach((w) => toast("AI: " + w, "warn"));
     S.proposals = (r.proposals || []).map((p) => ({
       ...p, selected:p.selected ?? (p.source === "retake rule")
@@ -1974,19 +1972,19 @@ function showWelcome(on) {
 /* ================================================================== polling */
 let wasPhase = "idle";
 function updateGlobalProgress(st) {
-  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","align","export","preview"].includes(st.phase);
+  const busy = ["probe","load_model","transcribe","cluster","gaps","assistant","align","export","preview"].includes(st.phase);
   const bar = $("globalProgress"), fill = $("globalProgressFill"), label = $("globalProgressLabel");
   bar.classList.toggle("on", busy);
   const indeterminate = busy && (st.phase === "load_model" || Number(st.pct) <= 0);
   bar.classList.toggle("indeterminate", indeterminate);
   if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
   label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
-  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",assistant:"Matching edits",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
   $("readyPill").textContent = phaseName[st.phase] || "Working";
   const exporting = st.phase === "export";
   document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
   $("headerExport").disabled = exporting;
-  if (st.phase === "ai" && st.msg) $("aiStatus").textContent = `${st.msg} · ${Math.round(st.pct || 0)}%`;
+  if (st.phase === "assistant" && st.msg) $("aiStatus").textContent = `${st.msg} · ${Math.round(st.pct || 0)}%`;
 }
 async function poll() {
   try {
@@ -2034,7 +2032,7 @@ async function poll() {
       if (st.phase === "ready" && S.aiRunning) await aiFinished();
       wasPhase = st.phase;
     }
-    if (["export","ai","gaps","align","preview"].includes(st.phase) && st.msg)
+    if (["export","assistant","gaps","align","preview"].includes(st.phase) && st.msg)
       $("durations").title = `${st.msg} (${st.pct}%)`;
   } catch (_) { /* server briefly unreachable; keep polling */ }
   setTimeout(poll, 500);
