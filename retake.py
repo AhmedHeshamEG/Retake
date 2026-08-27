@@ -86,6 +86,9 @@ ALIGNMENT_MIN_COVERAGE = 0.85
 ALIGNMENT_MIN_SCORE = 0.45
 ALIGNMENT_MAX_WORD_SECONDS = 2.5
 WORD_CUT_SAFETY_S = 0.06
+# Unaligned Whisper word boundaries drift more than forced-aligned ones, so a
+# cut that absorbs the pause around deleted speech keeps a wider handle there.
+WORD_CUT_SAFETY_UNALIGNED_S = 0.12
 VOICE_ENHANCEMENT_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "profile": "great",
@@ -96,7 +99,12 @@ VOICE_ENHANCEMENT_DEFAULTS: dict[str, Any] = {
 }
 EXPORT_SILENCE_MIN_S = 0.05
 EXPORT_SILENCE_DB_DEFAULT = -45.0
+# Export silence snapping is asymmetric. Moving a kept edge inward (toward
+# speech) only ever discards material ffmpeg measured as silence, so it is
+# allowed a generous budget. Moving an edge outward restores audio that cut
+# composition excluded, so it stays tightly capped.
 EXPORT_EDGE_MAX_SHIFT_S = 0.40
+EXPORT_EDGE_TRIM_MAX_S = 2.00
 EXPORT_TRUE_PEAK_DB = -1.5
 
 # --------------------------------------------------------------------------
@@ -485,12 +493,23 @@ def _timed_interval(item: dict[str, Any]) -> Optional[tuple[float, float]]:
 def consecutive_word_cut_intervals(
     tokens: list[dict[str, Any]],
     safety_handle: float = 0.0,
+    absorb_pauses: bool = False,
+    duration: Optional[float] = None,
 ) -> list[tuple[float, float]]:
     """Collapse every consecutive run of cut spoken words into one interval.
 
     Only a kept spoken word ends a run. Sentence boundaries and represented or
     unrepresented gaps are deliberately ignored, so breaths/noise between two
     neighboring deleted words cannot leak into preview or export.
+
+    With ``absorb_pauses`` the run also claims the non-speech on both of its
+    outer sides: it begins where the previous kept word ended and stops where
+    the next kept word begins, each held back by ``safety_handle``. Whisper
+    reports a deleted sentence as first-word-start .. last-word-end, so without
+    this the breath before it and the pause after it belong to no cut and
+    survive the edit. Runs at the head or tail of the recording extend to 0.0
+    and ``duration`` respectively. Kept speech is never entered: the handle is
+    applied against the neighboring kept word, not the deleted one.
     """
     words: list[tuple[float, float, str, bool]] = []
     for token in tokens:
@@ -512,13 +531,19 @@ def consecutive_word_cut_intervals(
                 run = (run[0], max(run[1], end))
             else:
                 protected_start = start
-                if safety_handle > 0 and previous_kept_end is not None:
+                if absorb_pauses:
+                    protected_start = (
+                        max(0.0, previous_kept_end + safety_handle)
+                        if previous_kept_end is not None
+                        else 0.0
+                    )
+                elif safety_handle > 0 and previous_kept_end is not None:
                     protected_start = max(
                         protected_start, previous_kept_end + safety_handle
                     )
-                run = (protected_start, end)
+                run = (protected_start, max(end, protected_start))
         elif run is not None:
-            protected_end = run[1]
+            protected_end = start - safety_handle if absorb_pauses else run[1]
             if safety_handle > 0:
                 protected_end = min(protected_end, start - safety_handle)
             if protected_end > run[0] + MERGE_EPS:
@@ -528,13 +553,19 @@ def consecutive_word_cut_intervals(
         else:
             previous_kept_end = end
     if run is not None:
-        if run[1] > run[0] + MERGE_EPS:
-            intervals.append(run)
+        run_end = run[1]
+        if absorb_pauses and duration is not None and math.isfinite(duration):
+            run_end = max(run_end, float(duration))
+        if run_end > run[0] + MERGE_EPS:
+            intervals.append((run[0], run_end))
     return intervals
 
 
 def transcript_cut_intervals(
-    tokens: list[dict[str, Any]], safety_handle: float = 0.0,
+    tokens: list[dict[str, Any]],
+    safety_handle: float = 0.0,
+    absorb_pauses: bool = False,
+    duration: Optional[float] = None,
 ) -> list[tuple[float, float]]:
     """Continuous spoken-word runs plus explicitly cut legacy gap tokens."""
     legacy_gap_cuts = [
@@ -544,7 +575,10 @@ def transcript_cut_intervals(
         if (interval := _timed_interval(token)) is not None
     ]
     return merge_intervals(
-        consecutive_word_cut_intervals(tokens, safety_handle) + legacy_gap_cuts
+        consecutive_word_cut_intervals(
+            tokens, safety_handle, absorb_pauses=absorb_pauses, duration=duration
+        )
+        + legacy_gap_cuts
     )
 
 
@@ -558,12 +592,28 @@ def project_uses_aligned_timing(proj: dict[str, Any]) -> bool:
     )
 
 
+def cut_composition_params(proj: dict[str, Any]) -> dict[str, Any]:
+    """The one place preview, saving, and export agree on how cuts compose.
+
+    Absorbing the pause around a deleted run is unconditional, so the handle can
+    no longer be zero: it is the only thing standing between a cut boundary and
+    the neighboring kept word.
+    """
+    aligned = project_uses_aligned_timing(proj)
+    try:
+        duration = float(proj.get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    return {
+        "safety_handle": WORD_CUT_SAFETY_S if aligned else WORD_CUT_SAFETY_UNALIGNED_S,
+        "absorb_pauses": True,
+        "duration": duration if math.isfinite(duration) and duration > 0 else None,
+    }
+
+
 def cut_intervals_from_tokens(proj: dict[str, Any]) -> list[tuple[float, float]]:
     """All accepted edits, with consecutive cut words composed continuously."""
-    safety_handle = WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
-    transcript_cuts = transcript_cut_intervals(
-        proj.get("tokens", []), safety_handle=safety_handle
-    )
+    transcript_cuts = transcript_cut_intervals(proj.get("tokens", []), **cut_composition_params(proj))
     gap_cuts = [
         interval
         for gap in proj.get("audio_gaps", [])
@@ -595,8 +645,7 @@ def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
         if words
     ]
     word_cuts = consecutive_word_cut_intervals(
-        proj.get("tokens", []),
-        safety_handle=WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0,
+        proj.get("tokens", []), **cut_composition_params(proj)
     )
 
     candidates: list[tuple[float, str]] = []
@@ -631,12 +680,12 @@ def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
 def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
     """Project JSON plus authoritative derived intervals, without mutating it."""
     payload = dict(proj)
-    safety_handle = WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
+    params = cut_composition_params(proj)
     payload["word_cut_intervals"] = consecutive_word_cut_intervals(
-        proj.get("tokens", []), safety_handle=safety_handle
+        proj.get("tokens", []), **params
     )
     payload["transcript_cut_intervals"] = transcript_cut_intervals(
-        proj.get("tokens", []), safety_handle=safety_handle
+        proj.get("tokens", []), **params
     )
     payload["cut_intervals"] = cut_intervals_from_tokens(proj)
     payload["scoped_gap_candidate_ids"] = scoped_gap_candidate_ids(proj)
@@ -822,6 +871,7 @@ def refine_export_keep_edges(
     silences: list[tuple[float, float]],
     duration: float,
     max_shift: float = EXPORT_EDGE_MAX_SHIFT_S,
+    max_trim: float = EXPORT_EDGE_TRIM_MAX_S,
 ) -> list[tuple[float, float]]:
     """Snap established keep edges to nearby real silence, or change nothing.
 
@@ -829,9 +879,17 @@ def refine_export_keep_edges(
     keep-list construction. A kept start maps to the speech-side silence end; a
     kept end maps to the speech-side silence start. Distant/invalid candidates
     are rejected rather than guessed.
+
+    The two directions carry different risk, so they carry different budgets.
+    Moving an edge *inward*, toward the speech the keep exists for, only ever
+    drops audio ffmpeg measured as silence, so it gets ``max_trim``. Moving an
+    edge *outward* restores audio that cut composition deliberately excluded and
+    is capped at the much smaller ``max_shift``, which exists only to recover a
+    quiet word attack or release.
     """
     original = [(float(start), float(end)) for start, end in keeps]
-    if not original or not silences or max_shift <= 0:
+    window = max(float(max_shift), float(max_trim))
+    if not original or not silences or window <= 0:
         return original
     cleaned_silences: list[tuple[float, float]] = []
     for raw_start, raw_end in silences:
@@ -852,7 +910,7 @@ def refine_export_keep_edges(
     def nearest_target(boundary: float, edge: str) -> float:
         candidates: list[tuple[float, float, float]] = []
         for silence_start, silence_end in valid_silences:
-            if silence_end < boundary - max_shift or silence_start > boundary + max_shift:
+            if silence_end < boundary - window or silence_start > boundary + window:
                 continue
             if silence_start <= boundary <= silence_end:
                 distance = 0.0
@@ -860,7 +918,10 @@ def refine_export_keep_edges(
                 distance = min(abs(boundary - silence_start), abs(boundary - silence_end))
             target = silence_end if edge == "start" else silence_start
             shift = abs(target - boundary)
-            if shift <= max_shift + MERGE_EPS:
+            # Inward for a keep start is later; inward for a keep end is earlier.
+            trimming = target > boundary if edge == "start" else target < boundary
+            budget = max_trim if trimming else max_shift
+            if shift <= budget + MERGE_EPS:
                 candidates.append((distance, shift, target))
         if not candidates:
             return boundary
@@ -873,6 +934,9 @@ def refine_export_keep_edges(
         new_end = end if duration - end <= MERGE_EPS else nearest_target(end, "end")
         new_start = max(0.0, min(float(duration), new_start))
         new_end = max(0.0, min(float(duration), new_end))
+        # A restored edge must never reach back across the keep that precedes it.
+        if refined and new_start < refined[-1][1]:
+            new_start = max(new_start, refined[-1][1], start)
         if new_end <= new_start + MERGE_EPS:
             new_start, new_end = start, end
         refined.append((new_start, new_end))
@@ -4342,16 +4406,14 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
         gt = payload.get("gap_threshold_s")
         if isinstance(gt, (int, float)) and 0.05 <= gt <= 30:
             proj["gap_threshold_s"] = float(gt)
-        safety_handle = (
-            WORD_CUT_SAFETY_S if project_uses_aligned_timing(proj) else 0.0
-        )
+        params = cut_composition_params(proj)
         response = {
             "ok": True,
             "word_cut_intervals": consecutive_word_cut_intervals(
-                proj["tokens"], safety_handle=safety_handle
+                proj["tokens"], **params
             ),
             "transcript_cut_intervals": transcript_cut_intervals(
-                proj["tokens"], safety_handle=safety_handle
+                proj["tokens"], **params
             ),
             "cut_intervals": cut_intervals_from_tokens(proj),
             "scoped_gap_candidate_ids": scoped_gap_candidate_ids(proj),

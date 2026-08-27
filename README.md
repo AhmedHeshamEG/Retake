@@ -93,10 +93,14 @@ The runtime and checkpoints remain under the Git-ignored `models/` folder.
 
 During media export, Retake first builds the existing authoritative consecutive
 cut/keep intervals. It then inspects only each kept interval's edge and snaps a
-nearby trustworthy join to real waveform silence. This can recover a quiet word
-attack/release or remove a tiny leftover pause without changing saved word
-timestamps, edit selections, text exports, or preview. If no safe nearby silence
-exists, the established speech-safe boundary is used unchanged.
+nearby trustworthy join to real waveform silence. The two directions carry
+different budgets because they carry different risk: moving an edge inward,
+toward the speech the interval exists for, only discards audio measured as
+silence and may travel up to 2.0 s, while moving an edge outward restores
+excluded audio and stays capped at 0.4 s so it can recover a quiet word
+attack/release and nothing more. Neither changes saved word timestamps, edit
+selections, text exports, or preview. If no safe nearby silence exists, the
+established speech-safe boundary is used unchanged.
 
 `Reliable Quality` is the default media export. It creates a high-quality
 H.264/AAC MP4 with continuous frame timing and uses NVIDIA hardware encoding
@@ -122,7 +126,14 @@ silently when decoding is briefly delayed. Safe local reads/autosaves retry
 transient connection failures; job-starting actions such as AI, preview
 preparation, and export are never duplicated automatically.
 
-Consecutive deleted words are composed as one continuous backend cut from the first deleted word's start to the last deleted word's end, even across sentence boundaries. This removes breaths, noise, and unreported timestamp holes inside deleted passages while a kept spoken word always splits the cut.
+Consecutive deleted words are composed as one continuous backend cut, even across
+sentence boundaries, and that cut extends outward into the non-speech on either
+side: it begins where the previous kept word ended and stops where the next kept
+word begins, each held back by a small safety handle. Deleting a sentence
+therefore also removes the breath before it and the pause after it, instead of
+leaving them audible between the sentences you kept. A run with no kept word
+before or after it reaches the start or the end of the recording. A kept spoken
+word always splits the cut, and kept speech is never entered.
 
 ## Deviations
 

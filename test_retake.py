@@ -20,6 +20,8 @@ from retake import (
     clusters_from_similarity,
     deterministic_retake_proposals,
     deterministic_instruction_plan,
+    consecutive_word_cut_intervals,
+    cut_composition_params,
     cut_intervals_from_tokens,
     ensure_audio_gap_state,
     ensure_voice_enhancement_state,
@@ -127,7 +129,9 @@ def test_export_audio_gap_cuts_join_words_without_rewriting_timestamps() -> None
                     "end": 2.0, "seg": 0, "cut": True}],
         "audio_gaps": [{"id": "agap-1", "start": 1.8, "end": 3.0, "cut": True}],
     }
-    assert approx(cut_intervals_from_tokens(proj), [(1.0, 3.0)])
+    # The only word is cut and nothing is kept before it, so the run also takes
+    # the leading second; the legacy gap still extends it to 3.0.
+    assert approx(cut_intervals_from_tokens(proj), [(0.0, 3.0)])
     assert proj["tokens"][0]["start"] == 1.0 and proj["tokens"][0]["end"] == 2.0
 
 
@@ -195,17 +199,23 @@ def test_cut_api_returns_authoritative_runs_and_restore_splits_them() -> None:
                 source_filename=source.name,
             )
             client = TestClient(app)
+            # A cut run absorbs the non-speech on both of its outer sides: it
+            # runs from the previous kept word's end to the next kept word's
+            # start, each held back by the unaligned safety handle (0.12s).
+            # Cutting word 0 therefore also removes the leading 0.1s and the
+            # 1.4s gap that follows it, up to 0.12s before "two".
             assert client.post("/cuts", json={"cut_ids": [0]}).json()[
                 "transcript_cut_intervals"
-            ] == [[.1, .3]]
+            ] == [[0.0, 1.58]]
 
+            # Nothing is kept, so the run reaches both ends of the recording.
             joined = client.post("/cuts", json={"cut_ids": [0, 2, 3]}).json()
-            assert joined["word_cut_intervals"] == [[.1, 2.5]]
-            assert joined["transcript_cut_intervals"] == [[.1, 2.5]]
-            assert client.get("/project").json()["cut_intervals"] == [[.1, 2.5]]
+            assert joined["word_cut_intervals"] == [[0.0, 5.0]]
+            assert joined["transcript_cut_intervals"] == [[0.0, 5.0]]
+            assert client.get("/project").json()["cut_intervals"] == [[0.0, 5.0]]
 
             restored = client.post("/cuts", json={"cut_ids": [0, 3]}).json()
-            assert restored["transcript_cut_intervals"] == [[.1, .3], [2.2, 2.5]]
+            assert restored["transcript_cut_intervals"] == [[0.0, 1.58], [2.12, 5.0]]
             saved = (project_dir / "project.json").read_text(encoding="utf-8")
             assert "transcript_cut_intervals" not in saved and "word_cut_intervals" not in saved
         finally:
@@ -238,6 +248,90 @@ def test_export_keep_edges_reject_overlap_and_invalid_silence() -> None:
     keeps = [(4.95, 5.25)]
     silences = [(4.9, 5.3), (float("nan"), 9.0)]
     assert refine_export_keep_edges(keeps, silences, 10.0) == keeps
+
+
+def _word(idx: int, start: float, end: float, cut: bool = False) -> dict:
+    return {"id": idx, "kind": "word", "text": f"w{idx}", "start": start,
+            "end": end, "seg": 0, "cut": cut}
+
+
+def test_cut_run_absorbs_the_pause_around_deleted_speech() -> None:
+    """The regression this whole behavior exists for.
+
+    Whisper reports a deleted sentence as first-word-start .. last-word-end, so
+    the breath before it and the pause after it used to belong to no cut and
+    survived the edit as audible dead air between two kept sentences.
+    """
+    proj = {
+        "duration_s": 6.0,
+        "tokens": [
+            _word(0, 0.0, 1.0),
+            _word(1, 1.8, 2.4, cut=True),
+            _word(2, 2.5, 3.0, cut=True),
+            _word(3, 4.0, 5.0),
+        ],
+    }
+    handle = cut_composition_params(proj)["safety_handle"]
+    assert approx(cut_intervals_from_tokens(proj), [(1.0 + handle, 4.0 - handle)])
+    # Only the two kept words remain, back to back, with the handle around them.
+    assert approx(
+        keep_list(cut_intervals_from_tokens(proj), 6.0),
+        [(0.0, 1.0 + handle), (4.0 - handle, 6.0)],
+    )
+
+
+def test_cut_run_at_the_head_or_tail_absorbs_to_the_recording_edge() -> None:
+    proj = {
+        "duration_s": 6.0,
+        "tokens": [_word(0, 0.5, 1.0, cut=True), _word(1, 2.0, 3.0),
+                   _word(2, 4.0, 4.5, cut=True)],
+    }
+    handle = cut_composition_params(proj)["safety_handle"]
+    assert approx(
+        cut_intervals_from_tokens(proj),
+        [(0.0, 2.0 - handle), (3.0 + handle, 6.0)],
+    )
+
+
+def test_absorbing_cut_never_enters_adjacent_kept_speech() -> None:
+    """Back-to-back words: absorption must not eat into either neighbor."""
+    tokens = [_word(0, 0.0, 1.0), _word(1, 1.0, 2.0, cut=True), _word(2, 2.0, 3.0)]
+    params = cut_composition_params({"duration_s": 3.0, "tokens": tokens})
+    handle = params["safety_handle"]
+    cuts = consecutive_word_cut_intervals(tokens, **params)
+    assert approx(cuts, [(1.0 + handle, 2.0 - handle)])
+    for start, end in cuts:
+        assert start >= 1.0 and end <= 2.0
+
+
+def test_missing_duration_leaves_a_trailing_run_at_the_last_cut_word() -> None:
+    tokens = [_word(0, 0.0, 1.0), _word(1, 2.0, 3.0, cut=True)]
+    assert approx(
+        consecutive_word_cut_intervals(tokens, safety_handle=0.1, absorb_pauses=True),
+        [(1.1, 3.0)],
+    )
+
+
+def test_export_keep_edges_trim_much_further_than_they_restore() -> None:
+    """Trimming only drops measured silence; restoring returns excluded audio."""
+    # Keep start sits 1.5s inside a silence: trimming forward to speech is allowed.
+    assert refine_export_keep_edges([(5.0, 10.0)], [(4.0, 6.5)], 10.0) == [(6.5, 10.0)]
+    # Keep end sits 1.2s after speech stopped: trimming backward is allowed.
+    assert refine_export_keep_edges([(0.0, 5.0)], [(3.8, 5.4)], 10.0) == [(0.0, 3.8)]
+    # The same distance in the restoring direction is refused.
+    assert refine_export_keep_edges([(5.0, 9.0)], [(3.0, 3.5)], 10.0) == [(5.0, 9.0)]
+    # A small restore still recovers a clipped word release.
+    assert refine_export_keep_edges([(0.0, 5.0)], [(5.2, 6.0)], 10.0) == [(0.0, 5.2)]
+
+
+def test_export_keep_edge_restore_never_reaches_across_the_previous_keep() -> None:
+    refined = refine_export_keep_edges(
+        [(0.0, 4.0), (4.3, 9.0)], [(3.9, 4.05), (4.1, 4.2)], 10.0
+    )
+    for index, (start, end) in enumerate(refined):
+        assert end > start
+        if index:
+            assert start >= refined[index - 1][1]
 
 
 def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:

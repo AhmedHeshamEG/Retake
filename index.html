@@ -1792,6 +1792,11 @@ function setUploadActions(retry, cancel) {
   $("uploadCancel").classList.toggle("on", cancel);
 }
 
+async function reacquireWakeLock() {
+  if (document.visibilityState !== "visible" || !S.uploading || !navigator.wakeLock) return;
+  try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+}
+
 async function uploadSelectedFile(file) {
   if (S.uploading) return;
   S.uploading = true;
@@ -1804,9 +1809,14 @@ async function uploadSelectedFile(file) {
     lastModified:file.lastModified, type:file.type,
   };
   try {
+    let wakeLockOk = false;
     if (navigator.wakeLock) {
-      try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+      try { S.wakeLock = await navigator.wakeLock.request("screen"); wakeLockOk = true; } catch (_) {}
     }
+    if (!wakeLockOk) {
+      toast("Can't keep the screen awake on this connection (needs HTTPS). Keep this tab open and the screen on until the transfer finishes, or it will pause.", "warn", 12000);
+    }
+    document.addEventListener("visibilitychange", reacquireWakeLock);
     const start = await api("/upload/start", descriptor);
     S.uploadSession = start.session; let offset = Number(start.offset) || 0;
     localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
@@ -1814,7 +1824,8 @@ async function uploadSelectedFile(file) {
     const chunkSize = 1024 * 1024;
     while (offset < file.size) {
       let sent = false;
-      for (let attempt = 0; attempt < 6 && !sent; attempt++) {
+      const maxAttempts = 20;
+      for (let attempt = 0; attempt < maxAttempts && !sent; attempt++) {
         try {
           const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
           const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
@@ -1829,9 +1840,9 @@ async function uploadSelectedFile(file) {
           offset = Number(data.offset); sent = true;
         } catch (error) {
           if (error.name === "AbortError") throw error;
-          if (attempt === 5) throw new Error(`connection kept dropping after 6 retries: ${error.message}`);
-          const delay = Math.min(8000, 500 * (2 ** attempt));
-          $("progressMsg").textContent = `Connection interrupted · retrying chunk ${attempt + 1}/6…`;
+          if (attempt === maxAttempts - 1) throw new Error(`connection kept dropping after ${maxAttempts} retries: ${error.message}`);
+          const delay = Math.min(10000, 500 * (2 ** Math.min(attempt, 6)));
+          $("progressMsg").textContent = `Connection interrupted · retrying chunk ${attempt + 1}/${maxAttempts}…`;
           await new Promise((resolve) => setTimeout(resolve, delay));
           try {
             const resumed = await api("/upload/start", descriptor);
@@ -1860,6 +1871,7 @@ async function uploadSelectedFile(file) {
     toast(error.message, "error", 10000);
   } finally {
     S.uploading = false;
+    document.removeEventListener("visibilitychange", reacquireWakeLock);
     if (S.wakeLock) { await S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
   }
 }
@@ -2058,7 +2070,7 @@ $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help
       S.uploadSession = pending.session || null;
       $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
       $("progressPanel").classList.add("on");
-      $("progressMsg").textContent = "Transfer paused safely on the laptop.";
+      $("progressMsg").textContent = "Transfer paused — the connection dropped (often a phone screen lock). No data was lost; tap \"Choose file\" and pick the same file again to resume from where it left off.";
       setUploadActions(false, true);
     }
     const st = await api("/status");
