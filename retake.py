@@ -3796,15 +3796,31 @@ def _load_mcp_endpoint() -> tuple[Any, Any]:
 MCP_SERVER, MCP_APP = _load_mcp_endpoint()
 
 
+_MCP_MANAGER_RUNNING = False
+
+
 @asynccontextmanager
 async def _lifespan(_app: "FastAPI") -> Any:
-    """Run the MCP session manager alongside Retake, when it is available."""
-    if MCP_SERVER is None:
+    """Run the MCP session manager alongside Retake, exactly once.
+
+    Retake serves the same app on two listeners (plain HTTP for this computer,
+    HTTPS for phones), so this lifespan runs twice. The MCP session manager
+    refuses a second `run()` and its task group belongs to whichever loop
+    entered it, which is why both listeners share a single event loop -- see
+    `serve_forever`. The second pass here rides on the manager the first
+    started.
+    """
+    global _MCP_MANAGER_RUNNING
+    if MCP_SERVER is None or _MCP_MANAGER_RUNNING:
         yield
         return
-    async with MCP_SERVER.session_manager.run():
-        log.info("MCP endpoint listening on %s", MCP_HTTP_PATH)
-        yield
+    _MCP_MANAGER_RUNNING = True
+    try:
+        async with MCP_SERVER.session_manager.run():
+            log.info("MCP endpoint listening on %s", MCP_HTTP_PATH)
+            yield
+    finally:
+        _MCP_MANAGER_RUNNING = False
 
 
 app = FastAPI(title="RETAKE", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -4924,6 +4940,53 @@ def ensure_lan_certificate() -> Optional[tuple[Path, Path]]:
     return cert_path, key_path
 
 
+def port_is_free(port: int, host: str = "0.0.0.0") -> bool:
+    """Check a port before uvicorn does, so a clash degrades instead of exiting."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt":
+            # Windows SO_REUSEADDR permits binding a port another socket is
+            # already listening on, which would report every busy port free.
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # Elsewhere it is needed, or a socket in TIME_WAIT reads as busy.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+async def serve_forever(tls: Optional[tuple[Path, Path]]) -> None:
+    """Serve HTTP, and HTTPS too when a certificate is available.
+
+    Both listeners share one event loop on purpose: the MCP session manager
+    mounted at /mcp is a single instance whose task group belongs to the loop
+    that started it, so a second loop in a second thread could not serve it.
+    Whichever listener stops first stops the other, so Ctrl+C ends both.
+    """
+    configs = [uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="warning")]
+    if tls is not None:
+        certificate, key = tls
+        configs.append(uvicorn.Config(
+            app, host="0.0.0.0", port=HTTPS_PORT, log_level="warning",
+            ssl_certfile=str(certificate), ssl_keyfile=str(key),
+        ))
+    servers = [uvicorn.Server(config) for config in configs]
+
+    async def run(server: uvicorn.Server) -> None:
+        try:
+            await server.serve()
+        finally:
+            for other in servers:
+                other.should_exit = True
+
+    await asyncio.gather(*(run(server) for server in servers))
+
+
 def main() -> None:
     resolve_ffmpeg()
     if not INDEX_HTML.exists():
@@ -4961,27 +5024,10 @@ def main() -> None:
     if os.name == "nt" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    if not tls:
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
-        return
-
-    # Both at once: the desktop keeps the plain-HTTP address it has always used,
-    # and phones get the HTTPS one they need for a wake lock.
-    certificate, key = tls
-    plain = uvicorn.Server(uvicorn.Config(
-        app, host="0.0.0.0", port=PORT, log_level="warning",
-    ))
-    threading.Thread(target=plain.run, daemon=True).start()
-    try:
-        uvicorn.run(
-            app, host="0.0.0.0", port=HTTPS_PORT, log_level="warning",
-            ssl_certfile=str(certificate), ssl_keyfile=str(key),
-        )
-    except OSError as exc:
-        log.warning("HTTPS could not start on port %d (%s); serving HTTP only",
-                    HTTPS_PORT, exc)
-        plain.should_exit = True
-        uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    if tls and not port_is_free(HTTPS_PORT):
+        log.warning("HTTPS port %d is already in use; serving HTTP only", HTTPS_PORT)
+        tls = None
+    asyncio.run(serve_forever(tls))
 
 
 if __name__ == "__main__":

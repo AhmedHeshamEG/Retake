@@ -693,13 +693,52 @@ def test_lan_certificate_covers_localhost_and_every_lan_address() -> None:
 def test_serving_https_keeps_the_plain_http_address() -> None:
     """The desktop workflow must not move just because phones need TLS."""
     source = Path(retake.__file__).read_text(encoding="utf-8")
+    serving = source[source.index("async def serve_forever("):]
+    assert "port=PORT" in serving and "port=HTTPS_PORT" in serving
+    assert "ssl_certfile=str(certificate)" in serving
+    # A missing certificate leaves exactly the plain HTTP listener.
+    assert "if tls is not None:" in serving
     main_source = source[source.index("def main() -> None:"):]
-    assert "ssl_certfile=str(certificate)" in main_source
-    assert "port=HTTPS_PORT" in main_source
-    assert "target=plain.run" in main_source
-    # No certificate, or a busy TLS port, must still leave a working editor.
-    assert "if not tls:" in main_source
     assert "serving HTTP only" in main_source
+
+
+def test_both_listeners_share_one_event_loop_and_one_mcp_manager() -> None:
+    """The regression that stopped HTTPS from starting at all.
+
+    Running the same app on two uvicorn servers runs the lifespan twice, and
+    StreamableHTTPSessionManager.run() refuses a second call -- so the second
+    listener died on startup. The manager also binds to the loop that started
+    it, so the two listeners cannot live in separate threads.
+    """
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    serving = source[source.index("async def serve_forever("):]
+    # One loop: gathered coroutines, not a thread per server.
+    assert "await asyncio.gather(" in serving
+    assert "threading.Thread" not in serving
+    # Stopping one listener stops the other, so Ctrl+C ends the process.
+    assert "other.should_exit = True" in serving
+
+    lifespan = source[source.index("async def _lifespan("):]
+    lifespan = lifespan[:lifespan.index("app = FastAPI(")]
+    assert "_MCP_MANAGER_RUNNING" in lifespan
+    assert "or _MCP_MANAGER_RUNNING:" in lifespan
+
+
+def test_port_clash_degrades_instead_of_exiting() -> None:
+    import socket as _socket
+
+    held = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    held.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    held.bind(("0.0.0.0", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    try:
+        assert retake.port_is_free(port) is False
+    finally:
+        held.close()
+    # A port nothing holds is reported free, and probing does not keep it.
+    assert retake.port_is_free(port) is True
+    assert retake.port_is_free(port) is True
 
 
 def test_transfer_waits_for_the_tab_instead_of_burning_retries() -> None:
