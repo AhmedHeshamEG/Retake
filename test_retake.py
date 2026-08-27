@@ -332,6 +332,244 @@ def test_export_keep_edge_restore_never_reaches_across_the_previous_keep() -> No
             assert start >= refined[index - 1][1]
 
 
+@contextmanager
+def assistant_project():
+    """A tiny open project on disk, restored afterwards."""
+    old_current = dict(retake.CURRENT)
+    old_projects = retake.PROJECTS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        retake.PROJECTS_DIR = root
+        project_dir = root / "Project 1"
+        (project_dir / "media").mkdir(parents=True)
+        source = project_dir / "media" / "original.wav"
+        source.write_bytes(b"RIFF0000WAVE")
+        project = {
+            "schema_version": 1, "source_path": str(source), "duration_s": 12.0,
+            "language": "en",
+            "tokens": [
+                {"id": 0, "kind": "word", "text": "keep", "start": 0.0, "end": 1.0,
+                 "seg": 0, "cut": False},
+                {"id": 1, "kind": "word", "text": "this", "start": 1.1, "end": 1.8,
+                 "seg": 0, "cut": False},
+                {"id": 2, "kind": "word", "text": "remove", "start": 4.0, "end": 4.6,
+                 "seg": 1, "cut": False},
+                {"id": 3, "kind": "word", "text": "that", "start": 4.7, "end": 5.2,
+                 "seg": 1, "cut": False},
+                {"id": 4, "kind": "word", "text": "end", "start": 9.0, "end": 9.8,
+                 "seg": 2, "cut": False},
+            ],
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.8, "text": "keep this"},
+                {"id": 1, "start": 4.0, "end": 5.2, "text": "remove that"},
+                {"id": 2, "start": 9.0, "end": 9.8, "text": "end"},
+            ],
+            "clusters": [], "markers": [],
+        }
+        retake.atomic_write_json(project_dir / "project.json", project)
+        retake.CURRENT.update(
+            project=project, media_path=str(source),
+            project_dir=str(project_dir), source_filename="original.wav",
+        )
+        try:
+            yield TestClient(app), project, project_dir
+        finally:
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.PROJECTS_DIR = old_projects
+
+
+def test_assistant_edits_preview_before_they_write() -> None:
+    """dry_run is the default and must leave the project completely alone."""
+    with assistant_project() as (client, project, project_dir):
+        preview = client.post("/assistant/cuts", json={"token_ids": [2, 3]}).json()
+        assert preview["dry_run"] is True
+        assert preview["changed_token_ids"] == [2, 3]
+        # The preview reports the real consequence...
+        assert preview["after"]["edited_duration_s"] < preview["before"]["edited_duration_s"]
+        # ...without any of it having happened.
+        assert [t["cut"] for t in project["tokens"]] == [False] * 5
+        assert "backup" not in preview
+        assert not retake.assistant_backups(project_dir)
+
+        applied = client.post(
+            "/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False}
+        ).json()
+        assert applied["dry_run"] is False and applied["backup"]
+        assert [t["cut"] for t in retake.CURRENT["project"]["tokens"]] == [
+            False, False, True, True, False
+        ]
+
+
+def test_assistant_undo_unwinds_edits_in_reverse_order() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        client.post("/assistant/cuts", json={"token_ids": [0, 1], "dry_run": False})
+        cuts = lambda: [t["cut"] for t in retake.CURRENT["project"]["tokens"]]
+        assert cuts() == [True, True, True, True, False]
+        first = client.post("/assistant/undo", json={}).json()
+        assert first["remaining_undo_steps"] == 1
+        assert cuts() == [False, False, True, True, False]
+        client.post("/assistant/undo", json={})
+        assert cuts() == [False] * 5
+        assert client.post("/assistant/undo", json={}).status_code == 404
+
+
+def test_assistant_backup_holds_the_state_before_the_edit() -> None:
+    """The regression that makes undo a no-op if the snapshot is taken late."""
+    with assistant_project() as (client, _project, project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        backups = retake.assistant_backups(project_dir)
+        assert len(backups) == 1
+        saved = json.loads(backups[0].read_text(encoding="utf-8"))
+        assert [t["cut"] for t in saved["tokens"]] == [False] * 5
+
+
+def test_assistant_cuts_are_a_delta_not_a_replacement() -> None:
+    """Editing named tokens must never restore unrelated ones."""
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [0], "dry_run": False})
+        client.post("/assistant/cuts", json={"token_ids": [4], "dry_run": False})
+        assert [t["cut"] for t in retake.CURRENT["project"]["tokens"]] == [
+            True, False, False, False, True
+        ]
+
+
+def test_assistant_rejects_unknown_tokens_and_bad_modes() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        assert client.post("/assistant/cuts", json={"token_ids": [999]}).status_code == 400
+        assert client.post(
+            "/assistant/cuts", json={"token_ids": [0], "mode": "delete"}
+        ).status_code == 400
+        assert client.post("/assistant/cuts", json={"token_ids": []}).status_code == 400
+        assert client.post(
+            "/assistant/cuts", json={"token_ids": ["one"]}
+        ).status_code == 400
+
+
+def test_assistant_find_reports_misses_instead_of_guessing() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        hit = client.post("/assistant/find", json={"phrase": "remove that"}).json()
+        assert hit["status"] == "exact" and hit["token_ids"] == [2, 3]
+        assert hit["start"] == 4.0 and hit["end"] == 5.2
+        miss = client.post(
+            "/assistant/find", json={"phrase": "never spoken words here"}
+        ).json()
+        assert miss["status"] != "exact" and miss["token_ids"] == []
+        assert client.post("/assistant/find", json={"phrase": "  "}).status_code == 400
+
+
+def test_assistant_transcript_paginates_and_filters() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        first = client.get("/assistant/transcript", params={"limit": 2}).json()
+        assert first["total"] == 3 and first["next_offset"] == 2
+        assert [row["segment_id"] for row in first["segments"]] == [0, 1]
+        assert first["segments"][0]["words"][0]["id"] == 0
+        last = client.get(
+            "/assistant/transcript", params={"limit": 2, "offset": 2}
+        ).json()
+        assert last["next_offset"] is None and last["returned"] == 1
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        only_cut = client.get("/assistant/transcript", params={"only": "cut"}).json()
+        assert [row["segment_id"] for row in only_cut["segments"]] == [1]
+        assert client.get(
+            "/assistant/transcript", params={"only": "sideways"}
+        ).status_code == 400
+
+
+def test_assistant_summary_reports_the_composed_edit() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        summary = client.get("/assistant/summary").json()
+        assert summary["duration_s"] == 12.0
+        assert summary["cut_word_count"] == 2
+        assert summary["edited_duration_s"] < 12.0
+        assert summary["undo_available"] is True
+        # The absorbed pause is visible here, not just at export time.
+        assert summary["cut_intervals"] == [[1.92, 8.88]]
+
+
+def test_assistant_endpoints_require_an_open_project() -> None:
+    old = dict(retake.CURRENT)
+    retake.CURRENT.clear()
+    retake.CURRENT.update(project=None, media_path=None, project_dir=None)
+    try:
+        client = TestClient(app)
+        for method, path in (
+            ("get", "/assistant/summary"), ("get", "/assistant/transcript"),
+            ("get", "/assistant/retakes"),
+        ):
+            assert getattr(client, method)(path).status_code == 404, path
+        assert client.post("/assistant/find", json={"phrase": "x"}).status_code == 404
+        assert client.post("/assistant/cuts", json={"token_ids": [0]}).status_code == 404
+        assert client.post("/assistant/undo", json={}).status_code == 404
+    finally:
+        retake.CURRENT.clear()
+        retake.CURRENT.update(old)
+
+
+def test_assistant_is_always_available_without_a_model() -> None:
+    payload = TestClient(app).get("/assistant/available").json()
+    assert payload["available"] is True
+    assert payload["engine"] == "deterministic"
+    assert payload["mcp"]["http_path"] == retake.MCP_HTTP_PATH
+
+
+def test_no_local_llm_remains() -> None:
+    """The GGUF path is gone; the deterministic resolver is not."""
+    source = Path(__file__).with_name("retake.py").read_text(encoding="utf-8")
+    for gone in ("llama_cpp", "list_ggufs", "LLM_DIR", ".gguf", "AI_SYSTEM_PROMPT"):
+        assert gone not in source, gone
+    for kept in ("resolve_phrase_tokens", "resolve_detailed_operations",
+                 "validate_planned_operations", "deterministic_instruction_plan"):
+        assert kept in source, kept
+
+
+def test_mcp_server_exposes_the_documented_tool_surface() -> None:
+    import asyncio
+
+    import retake_mcp
+
+    tools = {tool.name: tool for tool in asyncio.run(retake_mcp.mcp.list_tools())}
+    expected = {
+        "get_status", "list_projects", "open_project", "get_edit_summary",
+        "read_transcript", "find_phrase", "list_retakes", "plan_edit",
+        "get_proposals", "apply_cuts", "apply_proposals", "undo", "set_markers",
+        "set_voice_enhancement", "start_export", "get_job_status", "export_text",
+        "get_latest_export", "recalibrate_timing",
+    }
+    assert expected <= set(tools), expected - set(tools)
+    # Every tool has to explain itself; MCP clients only see descriptions.
+    for name, tool in tools.items():
+        assert (tool.description or "").strip(), name
+
+
+def test_mcp_mutating_tools_default_to_a_dry_run() -> None:
+    import asyncio
+
+    import retake_mcp
+
+    tools = {tool.name: tool for tool in asyncio.run(retake_mcp.mcp.list_tools())}
+    for name in ("apply_cuts", "apply_proposals", "set_markers",
+                 "set_voice_enhancement", "start_export", "recalibrate_timing"):
+        schema = tools[name].input_schema
+        assert "dry_run" in schema["properties"], name
+        assert schema["properties"]["dry_run"].get("default") is True, name
+        assert "dry_run" not in schema.get("required", []), name
+
+
+def test_mcp_endpoint_is_mounted_and_optional() -> None:
+    assert retake.MCP_HTTP_PATH == "/mcp"
+    mounted = [
+        route for route in app.routes
+        if getattr(route, "path", None) == retake.MCP_HTTP_PATH
+    ]
+    assert mounted, "the /mcp endpoint should be mounted when mcp is installed"
+    source = Path(__file__).with_name("retake.py").read_text(encoding="utf-8")
+    # The editor must still start when the optional dependency is absent.
+    assert "MCP endpoint disabled" in source
+
+
 def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
     proj = {"tokens": []}
     assert ensure_voice_enhancement_state(proj)

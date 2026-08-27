@@ -10,11 +10,13 @@ See context.md for the binding spec.
 from __future__ import annotations
 
 import asyncio
+import copy
 import csv
 import difflib
 import hashlib
 import importlib.util
 import ipaddress
+import itertools
 import json
 import logging
 import math
@@ -29,6 +31,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from contextlib import asynccontextmanager
 from array import array
 from fractions import Fraction
 from datetime import datetime, timezone
@@ -77,6 +80,9 @@ AI_ATTACHMENT_MAX_BYTES = 512 * 1024
 AI_ATTACHMENT_MAX_CHARS = 12_000
 AI_INSTRUCTION_MAX_CHARS = 50_000
 ASSISTANT_MAX_OPERATIONS = 400
+ASSISTANT_MAX_TOKEN_IDS = 20_000
+ASSISTANT_TRANSCRIPT_PAGE = 200
+ASSISTANT_BACKUP_KEEP = 20
 MCP_HTTP_PATH = "/mcp"
 UPLOAD_CHUNK_MAX_BYTES = 2 * 1024 * 1024
 RETAKE_MAX_SPAN_S = 90.0
@@ -3762,7 +3768,44 @@ def fully_cut_segments(proj: dict[str, Any]) -> set[int]:
 # HTTP API
 # --------------------------------------------------------------------------
 
-app = FastAPI(title="RETAKE", docs_url=None, redoc_url=None)
+def _load_mcp_endpoint() -> tuple[Any, Any]:
+    """The same MCP server retake_mcp.py serves over stdio, as an ASGI app.
+
+    One tool surface, two transports. Optional: the editor runs unchanged when
+    the `mcp` package is not installed, it just has no /mcp endpoint.
+    """
+    try:
+        from retake_mcp import mcp as mcp_server
+    except Exception as exc:  # missing dependency, or an import-time failure
+        log.info("MCP endpoint disabled (%s); `pip install mcp` to enable %s",
+                 exc, MCP_HTTP_PATH)
+        return None, None
+    try:
+        # Mounted at MCP_HTTP_PATH, so the inner app owns the mount root.
+        return mcp_server, mcp_server.streamable_http_app(streamable_http_path="/")
+    except Exception as exc:
+        log.warning("MCP endpoint could not be built: %s", exc)
+        return None, None
+
+
+MCP_SERVER, MCP_APP = _load_mcp_endpoint()
+
+
+@asynccontextmanager
+async def _lifespan(_app: "FastAPI") -> Any:
+    """Run the MCP session manager alongside Retake, when it is available."""
+    if MCP_SERVER is None:
+        yield
+        return
+    async with MCP_SERVER.session_manager.run():
+        log.info("MCP endpoint listening on %s", MCP_HTTP_PATH)
+        yield
+
+
+app = FastAPI(title="RETAKE", docs_url=None, redoc_url=None, lifespan=_lifespan)
+
+if MCP_APP is not None:
+    app.mount(MCP_HTTP_PATH, MCP_APP)
 
 MIME_EXTRA = {".mkv": "video/x-matroska", ".m4a": "audio/mp4",
               ".webm": "video/webm", ".mov": "video/quicktime",
@@ -4313,6 +4356,368 @@ def assistant_run(payload: dict = Body(...)) -> JSONResponse:
 def assistant_result() -> JSONResponse:
     with _STATE_LOCK:
         return JSONResponse(dict(AI_STATE))
+
+
+# --------------------------------------------------------------------------
+# Assistant surface
+#
+# Everything an MCP client needs, expressed so that the client supplies
+# language and Retake supplies the token selection. Mutating routes take
+# dry_run and back the project up before they write, so a confident mistake is
+# always previewable and always reversible.
+# --------------------------------------------------------------------------
+
+def assistant_backups(project_dir: Path) -> list[Path]:
+    """Newest first."""
+    return sorted(project_dir.glob("project.assistant-backup-*.json"), reverse=True)
+
+
+_ASSISTANT_BACKUP_SEQ = itertools.count()
+
+
+def write_assistant_backup(
+    snapshot: dict[str, Any], project_dir: Path,
+) -> Optional[str]:
+    """Persist a pre-edit snapshot, then prune to ASSISTANT_BACKUP_KEEP.
+
+    The caller passes the state as it was *before* its edit; taking the
+    snapshot here would capture the mutation the backup exists to undo. The
+    counter keeps names ordered when two edits land in the same second, since
+    undo restores by filename order.
+    """
+    stamp = "".join(ch for ch in utc_now() if ch.isalnum())
+    sequence = next(_ASSISTANT_BACKUP_SEQ)
+    backup = project_dir / f"project.assistant-backup-{stamp}-{sequence:06d}.json"
+    atomic_write_json(backup, snapshot)
+    for stale in assistant_backups(project_dir)[ASSISTANT_BACKUP_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return backup.name
+
+
+def assistant_edit_summary(proj: dict[str, Any]) -> dict[str, Any]:
+    """What the current edit actually produces, without rendering anything."""
+    duration = float(proj.get("duration_s") or 0.0)
+    cuts = cut_intervals_from_tokens(proj)
+    keeps = keep_list(cuts, duration)
+    removed = sum(end - start for start, end in cuts)
+    words = [t for t in proj.get("tokens", []) if t.get("kind") == "word"]
+    return {
+        "duration_s": round(duration, 3),
+        "edited_duration_s": round(max(0.0, duration - removed), 3),
+        "removed_s": round(removed, 3),
+        "removed_fraction": round(removed / duration, 4) if duration > 0 else 0.0,
+        "cut_intervals": [[round(a, 3), round(b, 3)] for a, b in cuts],
+        "keep_intervals": [[round(a, 3), round(b, 3)] for a, b in keeps],
+        "word_count": len(words),
+        "cut_word_count": sum(1 for t in words if t.get("cut")),
+        "segment_count": len(proj.get("segments", [])),
+        "fully_cut_segments": sorted(fully_cut_segments(proj)),
+        "cut_composition": cut_composition_params(proj),
+    }
+
+
+@app.get("/assistant/summary")
+def get_assistant_summary() -> JSONResponse:
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        project_dir = CURRENT.get("project_dir")
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        summary = assistant_edit_summary(proj)
+        summary["language"] = proj.get("language")
+        summary["aligned"] = project_uses_aligned_timing(proj)
+        summary["source_filename"] = CURRENT.get("source_filename")
+    summary["project"] = Path(project_dir).name if project_dir else None
+    summary["undo_available"] = bool(project_dir and assistant_backups(Path(project_dir)))
+    return JSONResponse(summary)
+
+
+@app.get("/assistant/transcript")
+def get_assistant_transcript(
+    start: float = 0.0, end: float = -1.0, offset: int = 0,
+    limit: int = ASSISTANT_TRANSCRIPT_PAGE, only: str = "all",
+) -> JSONResponse:
+    """Segments with their word token IDs, paginated because recordings are long."""
+    if only not in {"all", "kept", "cut"}:
+        return JSONResponse({"error": "only must be all, kept or cut"}, status_code=400)
+    limit = max(1, min(int(limit), ASSISTANT_TRANSCRIPT_PAGE))
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        duration = float(proj.get("duration_s") or 0.0)
+        upper = duration if end is None or end < 0 else float(end)
+        words_by_segment: dict[Any, list[dict[str, Any]]] = {}
+        for token in proj.get("tokens", []):
+            if token.get("kind") != "word":
+                continue
+            words_by_segment.setdefault(token.get("seg"), []).append(token)
+
+        rows: list[dict[str, Any]] = []
+        for segment in proj.get("segments", []):
+            interval = _timed_interval(segment)
+            if interval is None or interval[1] < float(start) or interval[0] > upper:
+                continue
+            words = words_by_segment.get(segment.get("id"), [])
+            cut_words = sum(1 for w in words if w.get("cut"))
+            if only == "kept" and words and cut_words == len(words):
+                continue
+            if only == "cut" and cut_words == 0:
+                continue
+            rows.append({
+                "segment_id": segment.get("id"),
+                "start": round(interval[0], 3),
+                "end": round(interval[1], 3),
+                "text": segment.get("text", ""),
+                "cut_words": cut_words,
+                "word_count": len(words),
+                "fully_cut": bool(words) and cut_words == len(words),
+                "words": [
+                    {"id": int(w["id"]), "text": w.get("text", ""),
+                     "start": round(float(w["start"]), 3),
+                     "end": round(float(w["end"]), 3), "cut": bool(w.get("cut"))}
+                    for w in words
+                ],
+            })
+    offset = max(0, int(offset))
+    page = rows[offset:offset + limit]
+    return JSONResponse({
+        "segments": page, "offset": offset, "limit": limit,
+        "returned": len(page), "total": len(rows),
+        "next_offset": offset + len(page) if offset + len(page) < len(rows) else None,
+        "duration_s": round(duration, 3),
+    })
+
+
+@app.post("/assistant/find")
+def assistant_find(payload: dict = Body(...)) -> JSONResponse:
+    """Locate a spoken phrase and report the exact token span, or why not."""
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        duration = float(proj.get("duration_s") or 0.0)
+        phrase = str(payload.get("phrase", "") or payload.get("query", ""))
+        if not phrase.strip():
+            return JSONResponse({"error": "phrase is required"}, status_code=400)
+        try:
+            window_start = float(payload.get("start", 0.0) or 0.0)
+            raw_end = payload.get("end")
+            window_end = duration if raw_end is None else float(raw_end)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "start and end must be numbers"}, status_code=400)
+        occurrence = payload.get("occurrence")
+        if occurrence not in (None, "first", "last"):
+            return JSONResponse({"error": "occurrence must be first or last"}, status_code=400)
+        result = resolve_phrase_tokens(
+            proj.get("tokens", []), phrase, window_start, window_end,
+            all_matches=bool(payload.get("all_matches")), occurrence=occurrence,
+        )
+        token_by_id = {
+            int(t["id"]): t for t in proj.get("tokens", []) if t.get("kind") == "word"
+        }
+    matched = [token_by_id[i] for i in result.get("token_ids", []) if i in token_by_id]
+    if matched:
+        result["start"] = round(min(float(t["start"]) for t in matched), 3)
+        result["end"] = round(max(float(t["end"]) for t in matched), 3)
+        result["text"] = " ".join(str(t.get("text", "")) for t in matched)
+        result["already_cut"] = all(bool(t.get("cut")) for t in matched)
+    return JSONResponse(result)
+
+
+@app.get("/assistant/retakes")
+def get_assistant_retakes() -> JSONResponse:
+    """Repeated takes the app already grouped, with their token IDs."""
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        if proj is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        segments = proj.get("segments", [])
+        by_index = dict(enumerate(segments))
+        already_cut = fully_cut_segments(proj)
+        words_by_segment: dict[Any, list[int]] = {}
+        for token in proj.get("tokens", []):
+            if token.get("kind") == "word":
+                words_by_segment.setdefault(token.get("seg"), []).append(int(token["id"]))
+        groups = []
+        for cluster in sanitize_clusters(segments, proj.get("clusters", [])):
+            members = []
+            for index in cluster.get("members", []):
+                segment = by_index.get(index)
+                if segment is None:
+                    continue
+                members.append({
+                    "segment_id": segment.get("id"),
+                    "start": round(float(segment.get("start", 0.0)), 3),
+                    "end": round(float(segment.get("end", 0.0)), 3),
+                    "text": segment.get("text", ""),
+                    "token_ids": words_by_segment.get(segment.get("id"), []),
+                    "already_cut": segment.get("id") in already_cut,
+                })
+            if members:
+                groups.append({"cluster_id": cluster.get("id"), "takes": members})
+    return JSONResponse({"retakes": groups, "count": len(groups)})
+
+
+def apply_assistant_token_edit(
+    token_ids: list[int], mode: str, dry_run: bool,
+) -> tuple[dict[str, Any], int]:
+    """Cut/keep/toggle explicit word tokens, previewing the effect either way.
+
+    This is a delta, unlike /cuts which replaces the whole selection. A client
+    that only knows about the words it just searched for must not be able to
+    silently restore everything else.
+    """
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        raw_dir = CURRENT.get("project_dir")
+        if proj is None:
+            return {"error": "no project"}, 404
+        by_id = {int(t["id"]): t for t in proj.get("tokens", []) if t.get("kind") == "word"}
+        unknown = [i for i in token_ids if i not in by_id]
+        if unknown:
+            return {"error": "unknown token ids", "unknown_token_ids": unknown[:20]}, 400
+        before = assistant_edit_summary(proj)
+        changing: list[int] = []
+        for token_id in token_ids:
+            current = bool(by_id[token_id].get("cut"))
+            target = True if mode == "cut" else False if mode == "keep" else not current
+            if target != current:
+                changing.append(token_id)
+        # Captured before the mutation so undo has somewhere to go back to.
+        snapshot = copy.deepcopy(proj) if not dry_run and changing else None
+        for token_id in changing:
+            by_id[token_id]["cut"] = not bool(by_id[token_id].get("cut"))
+        after = assistant_edit_summary(proj)
+        if dry_run:
+            for token_id in changing:
+                by_id[token_id]["cut"] = not bool(by_id[token_id].get("cut"))
+
+    keys = ("edited_duration_s", "removed_s", "cut_word_count")
+    response: dict[str, Any] = {
+        "ok": True, "dry_run": dry_run, "mode": mode,
+        "changed_token_ids": changing, "changed": len(changing),
+        "before": {k: before[k] for k in keys},
+        "after": {k: after[k] for k in keys},
+    }
+    if dry_run:
+        response["note"] = "nothing was written; call again with dry_run=false to apply"
+        return response, 200
+    if snapshot is not None and raw_dir:
+        response["backup"] = write_assistant_backup(snapshot, Path(raw_dir))
+    save_current_project()
+    return response, 200
+
+
+@app.post("/assistant/cuts")
+def assistant_cuts(payload: dict = Body(...)) -> JSONResponse:
+    mode = str(payload.get("mode", "cut"))
+    if mode not in {"cut", "keep", "toggle"}:
+        return JSONResponse({"error": "mode must be cut, keep or toggle"}, status_code=400)
+    raw_ids = payload.get("token_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return JSONResponse({"error": "token_ids must be a non-empty list"}, status_code=400)
+    try:
+        token_ids = [int(value) for value in raw_ids]
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "token_ids must be integers"}, status_code=400)
+    if len(token_ids) > ASSISTANT_MAX_TOKEN_IDS:
+        return JSONResponse(
+            {"error": f"at most {ASSISTANT_MAX_TOKEN_IDS} token ids per call"},
+            status_code=400,
+        )
+    body, status = apply_assistant_token_edit(
+        token_ids, mode, payload.get("dry_run", True) is not False
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/assistant/apply-proposals")
+def assistant_apply_proposals(payload: dict = Body(default={})) -> JSONResponse:
+    """Accept staged proposals from the last assistant run."""
+    dry_run = payload.get("dry_run", True) is not False
+    with _STATE_LOCK:
+        proposals = list(AI_STATE.get("proposals") or [])
+    if not proposals:
+        return JSONResponse({"error": "no proposals are staged"}, status_code=404)
+    wanted = payload.get("indexes")
+    if wanted is None:
+        selected = list(range(len(proposals)))
+    elif isinstance(wanted, list):
+        try:
+            selected = [int(value) for value in wanted]
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "indexes must be integers"}, status_code=400)
+        invalid = [i for i in selected if not 0 <= i < len(proposals)]
+        if invalid:
+            return JSONResponse({"error": "index out of range", "invalid": invalid}, status_code=400)
+    else:
+        return JSONResponse({"error": "indexes must be a list"}, status_code=400)
+
+    token_ids: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    for index in selected:
+        proposal = proposals[index]
+        cuttable = (
+            proposal.get("action") == "cut_phrase"
+            and proposal.get("status") in {"exact", "approximate"}
+        )
+        if not cuttable:
+            skipped.append({
+                "index": index,
+                "reason": proposal.get("status") or proposal.get("action") or "not cuttable",
+            })
+            continue
+        token_ids.extend(int(value) for value in proposal.get("token_ids", []))
+    token_ids = sorted(set(token_ids))
+    if not token_ids:
+        return JSONResponse(
+            {"error": "none of the selected proposals resolve to cuttable words",
+             "skipped": skipped},
+            status_code=400,
+        )
+    body, status = apply_assistant_token_edit(token_ids, "cut", dry_run)
+    if status == 200:
+        skipped_indexes = {item["index"] for item in skipped}
+        body["applied_proposals"] = [i for i in selected if i not in skipped_indexes]
+        body["skipped_proposals"] = skipped
+    return JSONResponse(body, status_code=status)
+
+
+@app.post("/assistant/undo")
+def assistant_undo(payload: dict = Body(default={})) -> JSONResponse:
+    """Restore the newest assistant backup and consume it."""
+    with _STATE_LOCK:
+        raw_dir = CURRENT.get("project_dir")
+        if CURRENT["project"] is None or not raw_dir:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        project_dir = Path(raw_dir)
+        backups = assistant_backups(project_dir)
+        if not backups:
+            return JSONResponse({"error": "nothing to undo"}, status_code=404)
+        newest = backups[0]
+        try:
+            restored = json.loads(newest.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return JSONResponse({"error": f"backup unreadable: {exc}"}, status_code=500)
+        if not isinstance(restored, dict) or "tokens" not in restored:
+            return JSONResponse({"error": "backup is not a project"}, status_code=500)
+        CURRENT["project"] = restored
+        summary = assistant_edit_summary(restored)
+    save_current_project()
+    try:
+        newest.unlink()
+    except OSError:
+        pass
+    return JSONResponse({
+        "ok": True, "restored_from": newest.name,
+        "remaining_undo_steps": len(assistant_backups(project_dir)),
+        "edited_duration_s": summary["edited_duration_s"],
+        "cut_word_count": summary["cut_word_count"],
+    })
 
 
 @app.post("/voice-enhancement")
