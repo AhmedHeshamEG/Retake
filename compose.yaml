@@ -3,6 +3,7 @@ services:
     build: .
     ports:
       - "${RETAKE_PORT:-8710}:8710"
+      - "${RETAKE_HTTPS_PORT:-8443}:8443"
     volumes:
       - ./models:/app/models
       - ./projects:/app/projects
