@@ -572,6 +572,110 @@ def test_mcp_endpoint_is_mounted_and_optional() -> None:
     assert "MCP endpoint disabled" in source
 
 
+SKILL_PATH = Path(__file__).with_name("skills") / "retake-brain" / "SKILL.md"
+
+
+def skill_example_cutlist() -> str:
+    """The example block out of SKILL.md, so the two can never drift apart."""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    start = skill.index("**Cluster 2 ")
+    return skill[start:skill.index("**Closing -")].strip()
+
+
+def test_skill_example_cutlist_parses_completely() -> None:
+    """Every command the skill documents must be one the parser understands."""
+    cutlist = skill_example_cutlist()
+    operations, covered = deterministic_instruction_plan(cutlist)
+    lines = cutlist.splitlines()
+    assert not (retake._actionable_instruction_lines(lines) - covered)
+
+    by_action: dict[str, list[dict]] = {}
+    for op in operations:
+        by_action.setdefault(op["action"], []).append(op)
+    assert set(by_action) == {"keep_phrase", "cut_phrase", "cut_gap", "needs_decision"}
+
+    # "(أول مرة)" and "(آخر مرة)" are the skill's ordinal markers.
+    assert by_action["cut_phrase"][0]["occurrence"] == "first"
+    assert by_action["keep_phrase"][-1]["occurrence"] == "last"
+    # The gap command carries both of its timestamps.
+    gap = by_action["cut_gap"][0]
+    assert (round(gap["start"], 1), round(gap["end"], 1)) == (75.5, 97.9)
+
+
+def test_arabic_last_marker_scopes_cuts_and_keeps() -> None:
+    """'آخر مرة' was silently ignored, so the wrong take was kept."""
+    for line, action in (
+        ('خلّي: "the same sentence" (آخر مرة)', "keep_phrase"),
+        ('شيل: "the same sentence" (آخر مرة)', "cut_phrase"),
+        ('keep: "the same sentence" (last)', "keep_phrase"),
+    ):
+        operations, _ = deterministic_instruction_plan(line)
+        assert len(operations) == 1, line
+        assert operations[0]["action"] == action, line
+        assert operations[0]["occurrence"] == "last", line
+    first, _ = deterministic_instruction_plan('شيل: "x" (أول مرة)')
+    assert first[0]["occurrence"] == "first"
+
+
+def test_decision_block_options_are_never_executed() -> None:
+    """Both branches use the command grammar; running both would self-conflict."""
+    cutlist = (
+        'قرار مطلوب: بتقول "12 days" و"two weeks" — اختار الرقم الصح:\n'
+        '- لو 12 days → خلّي: "it stayed for 12 days" + شيل: "it stayed for two weeks"\n'
+        '- لو two weeks → خلّي: "it stayed for two weeks" + شيل: "it was 12 days"\n'
+        '\n'
+        'شيل: "a real command after the block"'
+    )
+    operations, _ = deterministic_instruction_plan(cutlist)
+    actions = [op["action"] for op in operations]
+    assert actions.count("needs_decision") == 1
+    # Nothing from either branch became an edit...
+    for op in operations:
+        assert "12 days" not in op["phrase"] and "two weeks" not in op["phrase"]
+    # ...but the block does not swallow the commands that follow it.
+    assert any(op["phrase"] == "a real command after the block" for op in operations)
+
+
+def test_cluster_headers_scope_the_search_window() -> None:
+    """The skill promises headers bound the search; the parser must honour it."""
+    cutlist = skill_example_cutlist()
+    _lines, bounds = retake._instruction_context(cutlist, 600.0)
+    operations, _ = deterministic_instruction_plan(cutlist)
+    windows = {op["line"]: bounds[op["line"]] for op in operations}
+    # Commands under "Cluster 2 (00:58.9 -> 01:37.9)" search only that range.
+    assert all(
+        (round(lo, 1), round(hi, 1)) == (58.9, 97.9)
+        for line, (lo, hi) in windows.items() if line < 8
+    )
+    assert all(
+        (round(lo, 1), round(hi, 1)) == (213.9, 257.7)
+        for line, (lo, hi) in windows.items() if line > 8
+    )
+
+
+def test_skill_matches_the_app_it_drives() -> None:
+    """Guidance that describes removed features is worse than no guidance."""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    # The manual gap editor is gone. The skill may only mention its button in
+    # order to disown it, never to recommend it.
+    assert "There is no" in skill and "cut all gaps" in skill
+    assert "Never suggest it." in skill
+    assert "recommending the app" not in skill
+    # Cuts absorb their own surrounding pause, so listing those gaps is noise.
+    assert "absorbs the non-speech" in skill
+    # The MCP loop it documents has to use the tools that exist.
+    import asyncio
+
+    import retake_mcp
+
+    available = {t.name for t in asyncio.run(retake_mcp.mcp.list_tools())}
+    for named in ("get_status", "list_projects", "open_project", "read_transcript",
+                  "find_phrase", "plan_edit", "apply_proposals", "undo",
+                  "start_export", "recalibrate_timing"):
+        assert named in skill, named
+        assert named in available, named
+
+
 def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
     proj = {"tokens": []}
     assert ensure_voice_enhancement_state(proj)

@@ -1897,7 +1897,7 @@ _TIME_RE = re.compile(
 )
 _DETAIL_ACTION_RE = re.compile(
     r"(?:شيل|احذف|خل[ّ]?ي|خلي|remove|delete|cut|keep|retain|gap|silence|"
-    r"لازم\s+تختار|choose|←)", re.IGNORECASE,
+    r"لازم\s+تختار|قرار\s+مطلوب|choose|←)", re.IGNORECASE,
 )
 
 
@@ -2279,6 +2279,8 @@ def _compact_transcript_index(proj: dict[str, Any]) -> str:
 
 _QUOTED_RE = re.compile(r'["“«](.+?)["”»]')
 _CUT_MARKER_RE = re.compile(r"(?:شيل|احذف|remove|delete|cut|drop)", re.IGNORECASE)
+# A bullet under a "needs decision" line: one branch of a choice, not an order.
+_DECISION_OPTION_RE = re.compile(r"^\s*(?:[-*+\u2022]|\d+[.)])\s+")
 _KEEP_MARKER_RE = re.compile(r"(?:خل[ّ]?ي|خلي|keep|retain)", re.IGNORECASE)
 
 
@@ -2300,7 +2302,20 @@ def deterministic_instruction_plan(
     """Parse the common quoted Arabic/English edit-list syntax without inference."""
     raw: list[dict[str, Any]] = []
     covered: set[int] = set()
+    in_decision = False
     for line_no, line in enumerate(instructions.splitlines(), 1):
+        # A decision block lists the commands for each branch of a choice the
+        # human still has to make. Its bullets are written in this same grammar,
+        # so parsing them would apply every branch at once -- keeping and
+        # cutting the same material. They stay context until someone chooses.
+        if _DECISION_OPTION_RE.match(line):
+            if in_decision:
+                covered.add(line_no)
+                continue
+        elif not line.strip():
+            pass
+        else:
+            in_decision = False
         if not _DETAIL_ACTION_RE.search(line):
             continue
         times = timestamps_in_text(line)
@@ -2315,7 +2330,12 @@ def deterministic_instruction_plan(
             occurrence = None
             if re.search(r"(?:\bfirst\b|أول|الاول|الأول)", line, re.IGNORECASE):
                 occurrence = "first"
-            if action == "keep_phrase" and re.search(r"(?:\blast\b|\bsecond\b|التاني[ةه]?|الثاني[ةه]?)", line, re.IGNORECASE):
+            # "آخر مرة" is the ordinary way to say this in the edit lists this
+            # parser exists for, and it scopes a cut as much as a keep.
+            if re.search(
+                r"(?:\blast\b|\bsecond\b|التاني[ةه]?|الثاني[ةه]?|"
+                r"آخر|اخر|الأخير[ةه]?|الاخير[ةه]?)", line, re.IGNORECASE,
+            ):
                 occurrence = "last"
             raw.append({
                 "line": line_no, "action": action, "phrase": quote.group(1),
@@ -2353,8 +2373,9 @@ def deterministic_instruction_plan(
             covered.add(line_no)
 
         if re.search(
-            r"(?:لازم\s+تختار|اختار\s+الرقم|needs?\s+(?:a\s+)?decision|"
-            r"choose\s+the\s+correct|contradict)", line, re.IGNORECASE,
+            r"(?:لازم\s+تختار|اختار\s+الرقم|قرار\s+مطلوب|"
+            r"needs?\s+(?:a\s+)?decision|choose\s+the\s+correct|contradict)",
+            line, re.IGNORECASE,
         ):
             raw.append({
                 "line": line_no, "action": "needs_decision", "phrase": "",
@@ -2362,6 +2383,7 @@ def deterministic_instruction_plan(
                 "reason": "The instruction requires an editorial or factual choice",
             })
             covered.add(line_no)
+            in_decision = True
     return raw, covered
 
 
@@ -3782,8 +3804,10 @@ def _load_mcp_endpoint() -> tuple[Any, Any]:
     try:
         from retake_mcp import mcp as mcp_server
     except Exception as exc:  # missing dependency, or an import-time failure
-        log.info("MCP endpoint disabled (%s); `pip install mcp` to enable %s",
-                 exc, MCP_HTTP_PATH)
+        # Name the interpreter: Retake is usually started from a virtualenv, and
+        # a bare "pip install mcp" lands in whichever Python is on PATH instead.
+        log.info('MCP endpoint disabled (%s). To enable %s run:  "%s" -m pip '
+                 "install mcp", exc, MCP_HTTP_PATH, sys.executable)
         return None, None
     try:
         # Mounted at MCP_HTTP_PATH, so the inner app owns the mount root.
@@ -4875,8 +4899,8 @@ def ensure_lan_certificate() -> Optional[tuple[Path, Path]]:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
     except ImportError:
-        log.info("HTTPS disabled: `pip install cryptography` to enable phone transfers "
-                 "that survive a screen lock")
+        log.info('HTTPS disabled. For phone transfers that survive a screen lock, '
+                 'run:  "%s" -m pip install cryptography', sys.executable)
         return None
 
     addresses = lan_addresses()
@@ -5015,9 +5039,16 @@ def main() -> None:
         for index, url in enumerate(http_urls):
             label = "Phone / local network:" if index == 0 else "                      "
             print(f"  {label} {url}")
-        print("  (No HTTPS: transfers will pause when the phone screen locks.)")
+        print()
+        print("  No HTTPS, so a phone transfer will pause when the screen locks.")
+        print(f'  To enable it:  "{sys.executable}" -m pip install cryptography')
     else:
         print("  Phone / local network: no active private network address found")
+    if MCP_SERVER is not None:
+        print(f"  Assistant (MCP):     {local_url}{MCP_HTTP_PATH}  |  stdio: retake_mcp.py")
+    else:
+        print("  Assistant (MCP):     not installed. To enable it:")
+        print(f'                       "{sys.executable}" -m pip install mcp')
     print()
     log.info("RETAKE listening on %s", local_url)
 

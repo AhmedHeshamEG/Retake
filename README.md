@@ -9,6 +9,12 @@ pip install -r requirements.txt
 python retake.py
 ```
 
+On Windows, `Start Retake.cmd` launches the bundled `.venv`. If you use a
+virtualenv, install into that same interpreter -- a bare `pip install` lands in
+whichever Python is on PATH, and Retake will then start without HTTPS or the MCP
+endpoint. It prints the exact command to fix that on startup, naming the
+interpreter it is actually running under.
+
 The browser opens at `http://localhost:8710`. The command window also prints a
 private LAN link to open on a phone. Choose or drop a video/audio file, select
 its spoken language (or leave Auto-detect), and Retake uploads it with visible
@@ -140,6 +146,29 @@ The 19 tools cover reading (`get_status`, `list_projects`, `open_project`,
 `mcp` is an optional dependency: without it the editor runs unchanged and simply
 has no `/mcp` endpoint.
 
+## The retake-brain skill
+
+`retake-brain.skill` is an Agent Skill for Claude that turns a raw recording
+into a decisive cut-list: it reconstructs what the video is trying to say,
+groups every re-attempt of each beat, and picks one winner per cluster ("last
+complete attempt wins"), flagging only the calls that genuinely need ears --
+mid-sentence splices, delivery choices, and facts the speaker contradicted.
+
+With the MCP server connected it reads the transcript from the open project and
+applies the list itself, through a dry run you approve. Without it, it works
+from an uploaded SRT and prints the list for you to paste into "Cut by
+instruction" -- the command grammar it emits is the one Retake's parser reads.
+
+Install the `.skill` file into Claude. To change it, edit
+`skills/retake-brain/SKILL.md` and rebuild:
+
+```
+python skills/build_skill.py
+```
+
+The test suite checks the skill's own worked example against the real parser, so
+the two cannot drift apart.
+
 Tests: `python test_retake.py`. Every project is self-contained under
 `projects/Project N/`, including its original media, `project.json`, and
 `exports/`. Reopening a project never retranscribes it.
@@ -223,3 +252,7 @@ word always splits the cut, and kept speech is never entered.
   projects and AI instructions. The removed manual real-audio gap editor's saved
   records are left untouched for compatibility but are intentionally inert, so
   an invisible cut can never affect preview or export.
+
+## Licence
+
+MIT. See `LICENSE`.
