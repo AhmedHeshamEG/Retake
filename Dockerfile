@@ -16,10 +16,11 @@ RUN python -m pip install --no-cache-dir -r requirements.txt \
     && python -m pip install --no-cache-dir -r requirements-alignment.txt \
     && python -m pip install --no-cache-dir -r requirements-enhancement.txt
 
-COPY retake.py alignment_worker.py enhancement_worker.py index.html ./
-RUN mkdir -p /app/models/llm /app/projects/.incoming
+COPY retake.py retake_mcp.py alignment_worker.py enhancement_worker.py index.html ./
+RUN mkdir -p /app/models/tls /app/projects/.incoming
 
-EXPOSE 8710
+# 8710 plain HTTP (and the /mcp endpoint); 8443 HTTPS for phone transfers.
+EXPOSE 8710 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8710/status', timeout=3)"

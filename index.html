@@ -421,7 +421,7 @@ header{
       </section>
 
       <section id="aiCard" class="card">
-        <div class="card-head"><span style="color:var(--accent)">✦&nbsp; Cut with AI</span><span class="spacer"></span><button id="aiHistory" class="small">↶ History</button></div>
+        <div class="card-head"><span style="color:var(--accent)">✦&nbsp; Cut by instruction</span><span class="spacer"></span><button id="aiHistory" class="small">↶ History</button></div>
         <div id="aiBar">
           <div class="ai-input-row">
             <button id="aiAttachBtn" title="Attach reference script">⌕</button>
@@ -1496,14 +1496,12 @@ $("markerExport").addEventListener("click", () =>
 /* ===================================================================== AI */
 async function initAI() {
   try {
-    const d = await api("/ai/available");
-    $("aiBar").classList.toggle("unavailable", !d.available);
-    $("aiBtn").disabled = !d.available;
-    $("aiStatus").textContent = d.available
-      ? `Local model ready · ${d.model}`
-      : "Add an instruct .gguf model to models/llm to enable AI cuts.";
-    if (d.available) $("aiBtn").title = "Analyze with " + d.model;
-  } catch (e) { $("aiStatus").textContent = "AI availability could not be checked."; }
+    const d = await api("/assistant/available");
+    $("aiBar").classList.remove("unavailable");
+    $("aiBtn").disabled = false;
+    $("aiStatus").textContent = "Ready · quoted phrases, timestamps and repeated takes resolve exactly.";
+    $("aiBtn").title = `Resolve instructions to exact words. Connect an MCP client at ${d.mcp?.http_path || "/mcp"} for conversational editing.`;
+  } catch (e) { $("aiStatus").textContent = "The assistant could not be reached."; }
 }
 
 function renderAttachments() {
@@ -1529,7 +1527,7 @@ $("aiFiles").addEventListener("change", async (e) => {
     if (remaining <= 0) { toast("Reference text limit reached (12,000 characters)", "warn"); break; }
     if (content.length > remaining) {
       content = content.slice(0, remaining);
-      toast(`${file.name} was trimmed to fit the local model context`, "warn");
+      toast(`${file.name} was trimmed to fit the reference text limit`, "warn");
     }
     S.attachments.push({name:file.name, size:file.size, content}); remaining -= content.length;
   }
@@ -1538,14 +1536,14 @@ $("aiFiles").addEventListener("change", async (e) => {
 
 $("aiBtn").addEventListener("click", async () => {
   try {
-    const result = await api("/ai/run", {
+    const result = await api("/assistant/run", {
       instructions: $("aiInstructions").value,
       attachments: S.attachments.map(({name,content}) => ({name,content})),
     });
     result.warnings?.forEach((w) => toast("Reference: " + w, "warn"));
     S.aiRunning = true;
     $("aiBtn").disabled = true;
-    $("aiStatus").textContent = "Analyzing transcript locally…";
+    $("aiStatus").textContent = "Matching your instructions to exact words…";
     pollAIResult();
   } catch (e) { toast(e.message, "error"); }
 });
@@ -1596,7 +1594,7 @@ function navigateProposal(ids, forceSeek = false) {
 async function pollAIResult() {
   if (!S.aiRunning) return;
   try {
-    const result = await api("/ai/result");
+    const result = await api("/assistant/result");
     if (result.done && !result.running) { await aiFinished(); return; }
   } catch (_) { /* the global status poll will surface server failures */ }
   if (S.aiRunning) setTimeout(pollAIResult, 350);
@@ -1618,7 +1616,7 @@ async function aiFinished() {
   S.aiRunning = false;
   $("aiBtn").disabled = false;
   try {
-    const r = await api("/ai/result");
+    const r = await api("/assistant/result");
     r.warnings?.forEach((w) => toast("AI: " + w, "warn"));
     S.proposals = (r.proposals || []).map((p) => ({
       ...p, selected:p.selected ?? (p.source === "retake rule")
@@ -1792,6 +1790,37 @@ function setUploadActions(retry, cancel) {
   $("uploadCancel").classList.toggle("on", cancel);
 }
 
+async function reacquireWakeLock() {
+  if (document.visibilityState !== "visible" || !S.uploading || !navigator.wakeLock) return;
+  try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+}
+
+/* A backgrounded phone browser cannot run fetch. Rather than burning retries
+   against a tab that is asleep, wait for it to come back and carry on. */
+function whenVisible() {
+  if (document.visibilityState === "visible") return Promise.resolve();
+  return new Promise((resolve) => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      document.removeEventListener("visibilitychange", onVisible);
+      resolve();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+  });
+}
+
+const UPLOAD_MIN_CHUNK = 256 * 1024;
+const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;   /* matches UPLOAD_CHUNK_MAX_BYTES */
+const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
+
+/* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
+   Aim for a few seconds per chunk and let the link decide the size. */
+function nextChunkSize(current, seconds) {
+  if (seconds < 1.5) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
+  if (seconds > 6) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
+  return current;
+}
+
 async function uploadSelectedFile(file) {
   if (S.uploading) return;
   S.uploading = true;
@@ -1804,18 +1833,26 @@ async function uploadSelectedFile(file) {
     lastModified:file.lastModified, type:file.type,
   };
   try {
+    let wakeLockOk = false;
     if (navigator.wakeLock) {
-      try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+      try { S.wakeLock = await navigator.wakeLock.request("screen"); wakeLockOk = true; } catch (_) {}
     }
+    if (!wakeLockOk && location.protocol !== "https:") {
+      toast("This page can't keep the screen awake over plain HTTP. Open Retake's https:// address instead (the command window prints it) and the transfer will survive a screen lock. It resumes by itself either way.", "warn", 14000);
+    }
+    document.addEventListener("visibilitychange", reacquireWakeLock);
     const start = await api("/upload/start", descriptor);
     S.uploadSession = start.session; let offset = Number(start.offset) || 0;
     localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
     S.uploadAbort = new AbortController();
-    const chunkSize = 1024 * 1024;
+    let chunkSize = 1024 * 1024;
     while (offset < file.size) {
-      let sent = false;
-      for (let attempt = 0; attempt < 6 && !sent; attempt++) {
+      let sent = false, attempt = 0, stalledSince = 0;
+      while (!sent) {
+        /* Locking the phone suspends this tab; resume where we left off. */
+        await whenVisible();
         try {
+          const startedChunk = performance.now();
           const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
           const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
             method:"POST", headers:{"X-Upload-Offset":String(offset)}, body:chunk,
@@ -1823,23 +1860,29 @@ async function uploadSelectedFile(file) {
           });
           const data = await response.json();
           if (response.status === 409 && Number.isFinite(Number(data.offset))) {
-            offset = Number(data.offset); sent = true; continue;
+            offset = Number(data.offset); sent = true; break;
           }
           if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-          offset = Number(data.offset); sent = true;
+          chunkSize = nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000);
+          offset = Number(data.offset); sent = true; stalledSince = 0;
         } catch (error) {
           if (error.name === "AbortError") throw error;
-          if (attempt === 5) throw new Error(`connection kept dropping after 6 retries: ${error.message}`);
-          const delay = Math.min(8000, 500 * (2 ** attempt));
-          $("progressMsg").textContent = `Connection interrupted · retrying chunk ${attempt + 1}/6…`;
+          if (!stalledSince) stalledSince = Date.now();
+          if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
+            throw new Error(`the connection has been down for five minutes: ${error.message}`);
+          }
+          /* A drop often means the chunk was too ambitious for this link. */
+          chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
+          const waited = Math.round((Date.now() - stalledSince) / 1000);
+          $("progressMsg").textContent = `Connection interrupted · resuming automatically (${waited}s)…`;
+          const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
           await new Promise((resolve) => setTimeout(resolve, delay));
+          await whenVisible();
           try {
             const resumed = await api("/upload/start", descriptor);
             S.uploadSession = resumed.session;
             offset = Number(resumed.offset) || 0;
-          } catch (resumeError) {
-            if (attempt === 5) throw resumeError;
-          }
+          } catch (_) { /* server still unreachable; the loop keeps waiting */ }
         }
       }
       const pct = file.size ? offset / file.size * 100 : 0;
@@ -1860,6 +1903,7 @@ async function uploadSelectedFile(file) {
     toast(error.message, "error", 10000);
   } finally {
     S.uploading = false;
+    document.removeEventListener("visibilitychange", reacquireWakeLock);
     if (S.wakeLock) { await S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
   }
 }
@@ -1962,19 +2006,19 @@ function showWelcome(on) {
 /* ================================================================== polling */
 let wasPhase = "idle";
 function updateGlobalProgress(st) {
-  const busy = ["probe","load_model","transcribe","cluster","gaps","ai","align","export","preview"].includes(st.phase);
+  const busy = ["probe","load_model","transcribe","cluster","gaps","assistant","align","export","preview"].includes(st.phase);
   const bar = $("globalProgress"), fill = $("globalProgressFill"), label = $("globalProgressLabel");
   bar.classList.toggle("on", busy);
   const indeterminate = busy && (st.phase === "load_model" || Number(st.pct) <= 0);
   bar.classList.toggle("indeterminate", indeterminate);
   if (!indeterminate) fill.style.width = `${Math.max(0,Math.min(100,Number(st.pct)||0))}%`;
   label.textContent = busy ? `${st.msg || st.phase} · ${Math.round(st.pct || 0)}%` : "";
-  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",ai:"AI working",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
+  const phaseName = {probe:"Opening",load_model:"Loading",transcribe:"Transcribing",cluster:"Matching",gaps:"Detecting gaps",assistant:"Matching edits",align:"Calibrating timing",export:"Exporting",preview:"Smooth Preview",ready:"Ready",idle:"Ready"};
   $("readyPill").textContent = phaseName[st.phase] || "Working";
   const exporting = st.phase === "export";
   document.querySelectorAll(".export-tile").forEach((el) => el.disabled = exporting);
   $("headerExport").disabled = exporting;
-  if (st.phase === "ai" && st.msg) $("aiStatus").textContent = `${st.msg} · ${Math.round(st.pct || 0)}%`;
+  if (st.phase === "assistant" && st.msg) $("aiStatus").textContent = `${st.msg} · ${Math.round(st.pct || 0)}%`;
 }
 async function poll() {
   try {
@@ -2022,7 +2066,7 @@ async function poll() {
       if (st.phase === "ready" && S.aiRunning) await aiFinished();
       wasPhase = st.phase;
     }
-    if (["export","ai","gaps","align","preview"].includes(st.phase) && st.msg)
+    if (["export","assistant","gaps","align","preview"].includes(st.phase) && st.msg)
       $("durations").title = `${st.msg} (${st.pct}%)`;
   } catch (_) { /* server briefly unreachable; keep polling */ }
   setTimeout(poll, 500);
@@ -2055,10 +2099,28 @@ $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help
   try {
     const pending = JSON.parse(localStorage.getItem("retakePendingTransfer") || "null");
     if (pending?.name && pending?.size) {
-      S.uploadSession = pending.session || null;
-      $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
+      /* The browser cannot re-open a file on its own, so ask for the same one
+         again -- but confirm with the laptop how much of it already arrived, so
+         the offer is honest about what resuming saves. */
+      let received = null;
+      try {
+        const state = await api("/upload/start", pending);
+        received = Number(state.offset) || 0;
+        S.uploadSession = state.session;
+      } catch (_) { S.uploadSession = pending.session || null; }
       $("progressPanel").classList.add("on");
-      $("progressMsg").textContent = "Transfer paused safely on the laptop.";
+      if (received === null) {
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
+        $("progressMsg").textContent = "Transfer interrupted. Retake could not be reached to check what arrived — choose the same file again to continue.";
+      } else if (received >= Number(pending.size)) {
+        localStorage.removeItem("retakePendingTransfer");
+        $("progressPanel").classList.remove("on");
+      } else {
+        const pct = Number(pending.size) ? received / Number(pending.size) * 100 : 0;
+        $("progressFill").style.width = `${pct}%`;
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
+        $("progressMsg").textContent = `Transfer interrupted · ${fmtBytes(received)} of ${fmtBytes(pending.size)} is already on the laptop. Nothing was lost — choose the same file again and it continues from there.`;
+      }
       setUploadActions(false, true);
     }
     const st = await api("/status");

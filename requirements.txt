@@ -5,6 +5,9 @@ faster-whisper==1.2.1
 sentence-transformers==5.6.0
 rapidfuzz==3.14.5
 imageio-ffmpeg==0.6.0
-# Optional — only needed for the "✦ Cut with AI" button (needs a C compiler or a
-# prebuilt wheel for your platform). Everything else works without it:
-# llama-cpp-python==0.3.33
+# Model Context Protocol server (retake_mcp.py). Lets Claude -- or any other MCP
+# client -- drive Retake conversationally. The editor itself works without it.
+mcp>=2.1.1
+# Self-signed LAN certificate, so a phone can keep its screen awake while it
+# uploads. Without it Retake serves plain HTTP and says so.
+cryptography>=42.0

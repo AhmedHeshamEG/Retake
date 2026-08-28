@@ -9,11 +9,42 @@ pip install -r requirements.txt
 python retake.py
 ```
 
-The browser opens at `http://localhost:8710`. The command window also prints the private LAN link to open on a phone. Choose or drop a video/audio file, select its spoken language (or leave Auto-detect), and Retake uploads it with visible resumable progress.
+On Windows, `Start Retake.cmd` launches the bundled `.venv`. If you use a
+virtualenv, install into that same interpreter -- a bare `pip install` lands in
+whichever Python is on PATH, and Retake will then start without HTTPS or the MCP
+endpoint. It prints the exact command to fix that on startup, naming the
+interpreter it is actually running under.
 
-Core transcription, embedding, and optional GGUF weights load from `./models/`.
-Accurate word alignment downloads its language model once into `models/alignment/`
-when that optional runtime is first prepared; later calibration is local.
+The browser opens at `http://localhost:8710`. The command window also prints a
+private LAN link to open on a phone. Choose or drop a video/audio file, select
+its spoken language (or leave Auto-detect), and Retake uploads it with visible
+resumable progress.
+
+Core transcription and embedding weights load from `./models/`. Accurate word
+alignment downloads its language model once into `models/alignment/` when that
+optional runtime is first prepared; later calibration is local.
+
+## Sending video from a phone
+
+Retake serves two addresses: plain HTTP on port 8710, which the desktop has
+always used, and HTTPS on port 8443 for phones. Both run at once, so nothing
+about the desktop workflow changes.
+
+The HTTPS one matters because iOS Safari refuses `navigator.wakeLock` over plain
+HTTP. Without a wake lock the phone screen sleeps partway through a large
+transfer, Safari suspends the tab, and the upload stalls. Over HTTPS the page
+holds the screen awake and the transfer runs to completion.
+
+The certificate is generated on first run, covers this computer's own LAN
+addresses, and never leaves the machine, so the phone will warn once that it is
+not trusted -- choose Advanced and continue. Retake prints the exact address to
+open.
+
+Transfers are resumable either way and no longer give up on their own. If the
+connection drops or the tab is backgrounded, the page waits for it to come back
+and continues from the last confirmed byte rather than failing; chunk size
+adapts to the link, up to 8 MB. Reopening Retake after an interruption asks the
+laptop how much already arrived and offers to continue from there.
 
 ## Docker
 
@@ -59,11 +90,88 @@ Git-ignored `models/` folder. Retake always tries CUDA first; if CUDA is absent,
 out of memory, or errors, the isolated worker exits and Retake retries once on
 CPU without partially updating the project.
 
-## Optional AI cut
+## Cut by instruction
 
-Drop any instruct `.gguf` (recommended: Qwen3-4B-Instruct Q4_K_M) into `models/llm/` and install `pip install llama-cpp-python==0.3.33`. "✦ Cut with AI" accepts short guidance or detailed mixed Arabic/English edit lists. Quoted phrases, keep commands, timestamps, and gaps resolve to exact word/gap token IDs and stay highlighted for review; ambiguous or unmatched instructions are shown instead of guessed. Plain-text reference scripts (`.txt`, `.md`, `.srt`, and similar) remain supported. No GGUF → the AI card explains what is missing; everything else works.
+"✦ Cut by instruction" accepts short guidance or detailed mixed Arabic/English
+edit lists. Quoted phrases, keep commands, timestamps, and gaps resolve to exact
+word/gap token IDs and stay highlighted for review; ambiguous or unmatched
+instructions are shown instead of guessed. Plain-text reference scripts (`.txt`,
+`.md`, `.srt`, and similar) are supported as context.
 
-Tests: `python test_retake.py`. Every project is self-contained under `projects/Project N/`, including its original media, `project.json`, and `exports/`. Reopening a project never retranscribes it.
+Nothing needs installing for this and no model runs locally. Retake resolves
+what it can understand on its own; language it cannot parse is reported as
+unresolved rather than guessed at. For conversational editing, connect an MCP
+client -- see below.
+
+## Editing with Claude, over MCP
+
+`retake_mcp.py` exposes Retake to any MCP client. The division of labour is the
+point: the client supplies the thing Retake cannot do, understanding what you
+meant, and Retake supplies the thing a language model must not be trusted with,
+deciding which real audio a phrase refers to. Ask for "the bit where I fumbled
+the sponsor read" and Retake answers with exact word tokens and their
+timestamps, or says it could not find them. A client can never name a raw time
+span to delete or invent a token ID.
+
+Every mutating tool previews first. `apply_cuts` reports the token IDs that
+would change and the resulting duration, and writes nothing until you call it
+again with `dry_run=false`. Applied edits push onto an undo stack of project
+snapshots that `undo` unwinds one at a time, and edits are deltas, so cutting
+five words never restores the rest of your work.
+
+Start Retake, then point a client at it. For Claude Desktop or Claude Code, add
+to the MCP server config:
+
+```json
+{
+  "mcpServers": {
+    "retake": {
+      "command": "python",
+      "args": ["E:/path/to/Retake/retake_mcp.py"]
+    }
+  }
+}
+```
+
+Clients that speak streamable HTTP can use `http://localhost:8710/mcp`
+directly, which the running editor serves itself. `retake_mcp.py --http --port
+8711` runs the same tools as a standalone HTTP server. Set `RETAKE_URL` if
+Retake listens somewhere other than `http://127.0.0.1:8710`.
+
+The 19 tools cover reading (`get_status`, `list_projects`, `open_project`,
+`get_edit_summary`, `read_transcript`, `find_phrase`, `list_retakes`), editing
+(`plan_edit`, `get_proposals`, `apply_cuts`, `apply_proposals`, `undo`,
+`set_markers`, `set_voice_enhancement`), and jobs (`start_export`,
+`get_job_status`, `export_text`, `get_latest_export`, `recalibrate_timing`).
+`mcp` is an optional dependency: without it the editor runs unchanged and simply
+has no `/mcp` endpoint.
+
+## The retake-brain skill
+
+`retake-brain.skill` is an Agent Skill for Claude that turns a raw recording
+into a decisive cut-list: it reconstructs what the video is trying to say,
+groups every re-attempt of each beat, and picks one winner per cluster ("last
+complete attempt wins"), flagging only the calls that genuinely need ears --
+mid-sentence splices, delivery choices, and facts the speaker contradicted.
+
+With the MCP server connected it reads the transcript from the open project and
+applies the list itself, through a dry run you approve. Without it, it works
+from an uploaded SRT and prints the list for you to paste into "Cut by
+instruction" -- the command grammar it emits is the one Retake's parser reads.
+
+Install the `.skill` file into Claude. To change it, edit
+`skills/retake-brain/SKILL.md` and rebuild:
+
+```
+python skills/build_skill.py
+```
+
+The test suite checks the skill's own worked example against the real parser, so
+the two cannot drift apart.
+
+Tests: `python test_retake.py`. Every project is self-contained under
+`projects/Project N/`, including its original media, `project.json`, and
+`exports/`. Reopening a project never retranscribes it.
 
 ## Voice enhancement and export quality
 
@@ -93,10 +201,14 @@ The runtime and checkpoints remain under the Git-ignored `models/` folder.
 
 During media export, Retake first builds the existing authoritative consecutive
 cut/keep intervals. It then inspects only each kept interval's edge and snaps a
-nearby trustworthy join to real waveform silence. This can recover a quiet word
-attack/release or remove a tiny leftover pause without changing saved word
-timestamps, edit selections, text exports, or preview. If no safe nearby silence
-exists, the established speech-safe boundary is used unchanged.
+nearby trustworthy join to real waveform silence. The two directions carry
+different budgets because they carry different risk: moving an edge inward,
+toward the speech the interval exists for, only discards audio measured as
+silence and may travel up to 2.0 s, while moving an edge outward restores
+excluded audio and stays capped at 0.4 s so it can recover a quiet word
+attack/release and nothing more. Neither changes saved word timestamps, edit
+selections, text exports, or preview. If no safe nearby silence exists, the
+established speech-safe boundary is used unchanged.
 
 `Reliable Quality` is the default media export. It creates a high-quality
 H.264/AAC MP4 with continuous frame timing and uses NVIDIA hardware encoding
@@ -122,7 +234,14 @@ silently when decoding is briefly delayed. Safe local reads/autosaves retry
 transient connection failures; job-starting actions such as AI, preview
 preparation, and export are never duplicated automatically.
 
-Consecutive deleted words are composed as one continuous backend cut from the first deleted word's start to the last deleted word's end, even across sentence boundaries. This removes breaths, noise, and unreported timestamp holes inside deleted passages while a kept spoken word always splits the cut.
+Consecutive deleted words are composed as one continuous backend cut, even across
+sentence boundaries, and that cut extends outward into the non-speech on either
+side: it begins where the previous kept word ended and stops where the next kept
+word begins, each held back by a small safety handle. Deleting a sentence
+therefore also removes the breath before it and the pause after it, instead of
+leaving them audible between the sentences you kept. A run with no kept word
+before or after it reaches the start or the end of the recording. A kept spoken
+word always splits the cut, and kept speech is never entered.
 
 ## Deviations
 
@@ -133,3 +252,7 @@ Consecutive deleted words are composed as one continuous backend cut from the fi
   projects and AI instructions. The removed manual real-audio gap editor's saved
   records are left untouched for compatibility but are intentionally inert, so
   an invisible cut can never affect preview or export.
+
+## Licence
+
+MIT. See `LICENSE`.

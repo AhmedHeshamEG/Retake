@@ -6,20 +6,23 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 import retake
 
 from retake import (
-    build_ai_chunks,
     clusters_from_similarity,
     deterministic_retake_proposals,
     deterministic_instruction_plan,
+    consecutive_word_cut_intervals,
+    cut_composition_params,
     cut_intervals_from_tokens,
     ensure_audio_gap_state,
     ensure_voice_enhancement_state,
@@ -41,7 +44,6 @@ from retake import (
     timestamps_in_text,
     validate_planned_operations,
     validate_voice_enhancement,
-    validate_llm_proposal,
 )
 
 
@@ -127,7 +129,9 @@ def test_export_audio_gap_cuts_join_words_without_rewriting_timestamps() -> None
                     "end": 2.0, "seg": 0, "cut": True}],
         "audio_gaps": [{"id": "agap-1", "start": 1.8, "end": 3.0, "cut": True}],
     }
-    assert approx(cut_intervals_from_tokens(proj), [(1.0, 3.0)])
+    # The only word is cut and nothing is kept before it, so the run also takes
+    # the leading second; the legacy gap still extends it to 3.0.
+    assert approx(cut_intervals_from_tokens(proj), [(0.0, 3.0)])
     assert proj["tokens"][0]["start"] == 1.0 and proj["tokens"][0]["end"] == 2.0
 
 
@@ -195,17 +199,23 @@ def test_cut_api_returns_authoritative_runs_and_restore_splits_them() -> None:
                 source_filename=source.name,
             )
             client = TestClient(app)
+            # A cut run absorbs the non-speech on both of its outer sides: it
+            # runs from the previous kept word's end to the next kept word's
+            # start, each held back by the unaligned safety handle (0.12s).
+            # Cutting word 0 therefore also removes the leading 0.1s and the
+            # 1.4s gap that follows it, up to 0.12s before "two".
             assert client.post("/cuts", json={"cut_ids": [0]}).json()[
                 "transcript_cut_intervals"
-            ] == [[.1, .3]]
+            ] == [[0.0, 1.58]]
 
+            # Nothing is kept, so the run reaches both ends of the recording.
             joined = client.post("/cuts", json={"cut_ids": [0, 2, 3]}).json()
-            assert joined["word_cut_intervals"] == [[.1, 2.5]]
-            assert joined["transcript_cut_intervals"] == [[.1, 2.5]]
-            assert client.get("/project").json()["cut_intervals"] == [[.1, 2.5]]
+            assert joined["word_cut_intervals"] == [[0.0, 5.0]]
+            assert joined["transcript_cut_intervals"] == [[0.0, 5.0]]
+            assert client.get("/project").json()["cut_intervals"] == [[0.0, 5.0]]
 
             restored = client.post("/cuts", json={"cut_ids": [0, 3]}).json()
-            assert restored["transcript_cut_intervals"] == [[.1, .3], [2.2, 2.5]]
+            assert restored["transcript_cut_intervals"] == [[0.0, 1.58], [2.12, 5.0]]
             saved = (project_dir / "project.json").read_text(encoding="utf-8")
             assert "transcript_cut_intervals" not in saved and "word_cut_intervals" not in saved
         finally:
@@ -240,6 +250,432 @@ def test_export_keep_edges_reject_overlap_and_invalid_silence() -> None:
     assert refine_export_keep_edges(keeps, silences, 10.0) == keeps
 
 
+def _word(idx: int, start: float, end: float, cut: bool = False) -> dict:
+    return {"id": idx, "kind": "word", "text": f"w{idx}", "start": start,
+            "end": end, "seg": 0, "cut": cut}
+
+
+def test_cut_run_absorbs_the_pause_around_deleted_speech() -> None:
+    """The regression this whole behavior exists for.
+
+    Whisper reports a deleted sentence as first-word-start .. last-word-end, so
+    the breath before it and the pause after it used to belong to no cut and
+    survived the edit as audible dead air between two kept sentences.
+    """
+    proj = {
+        "duration_s": 6.0,
+        "tokens": [
+            _word(0, 0.0, 1.0),
+            _word(1, 1.8, 2.4, cut=True),
+            _word(2, 2.5, 3.0, cut=True),
+            _word(3, 4.0, 5.0),
+        ],
+    }
+    handle = cut_composition_params(proj)["safety_handle"]
+    assert approx(cut_intervals_from_tokens(proj), [(1.0 + handle, 4.0 - handle)])
+    # Only the two kept words remain, back to back, with the handle around them.
+    assert approx(
+        keep_list(cut_intervals_from_tokens(proj), 6.0),
+        [(0.0, 1.0 + handle), (4.0 - handle, 6.0)],
+    )
+
+
+def test_cut_run_at_the_head_or_tail_absorbs_to_the_recording_edge() -> None:
+    proj = {
+        "duration_s": 6.0,
+        "tokens": [_word(0, 0.5, 1.0, cut=True), _word(1, 2.0, 3.0),
+                   _word(2, 4.0, 4.5, cut=True)],
+    }
+    handle = cut_composition_params(proj)["safety_handle"]
+    assert approx(
+        cut_intervals_from_tokens(proj),
+        [(0.0, 2.0 - handle), (3.0 + handle, 6.0)],
+    )
+
+
+def test_absorbing_cut_never_enters_adjacent_kept_speech() -> None:
+    """Back-to-back words: absorption must not eat into either neighbor."""
+    tokens = [_word(0, 0.0, 1.0), _word(1, 1.0, 2.0, cut=True), _word(2, 2.0, 3.0)]
+    params = cut_composition_params({"duration_s": 3.0, "tokens": tokens})
+    handle = params["safety_handle"]
+    cuts = consecutive_word_cut_intervals(tokens, **params)
+    assert approx(cuts, [(1.0 + handle, 2.0 - handle)])
+    for start, end in cuts:
+        assert start >= 1.0 and end <= 2.0
+
+
+def test_missing_duration_leaves_a_trailing_run_at_the_last_cut_word() -> None:
+    tokens = [_word(0, 0.0, 1.0), _word(1, 2.0, 3.0, cut=True)]
+    assert approx(
+        consecutive_word_cut_intervals(tokens, safety_handle=0.1, absorb_pauses=True),
+        [(1.1, 3.0)],
+    )
+
+
+def test_export_keep_edges_trim_much_further_than_they_restore() -> None:
+    """Trimming only drops measured silence; restoring returns excluded audio."""
+    # Keep start sits 1.5s inside a silence: trimming forward to speech is allowed.
+    assert refine_export_keep_edges([(5.0, 10.0)], [(4.0, 6.5)], 10.0) == [(6.5, 10.0)]
+    # Keep end sits 1.2s after speech stopped: trimming backward is allowed.
+    assert refine_export_keep_edges([(0.0, 5.0)], [(3.8, 5.4)], 10.0) == [(0.0, 3.8)]
+    # The same distance in the restoring direction is refused.
+    assert refine_export_keep_edges([(5.0, 9.0)], [(3.0, 3.5)], 10.0) == [(5.0, 9.0)]
+    # A small restore still recovers a clipped word release.
+    assert refine_export_keep_edges([(0.0, 5.0)], [(5.2, 6.0)], 10.0) == [(0.0, 5.2)]
+
+
+def test_export_keep_edge_restore_never_reaches_across_the_previous_keep() -> None:
+    refined = refine_export_keep_edges(
+        [(0.0, 4.0), (4.3, 9.0)], [(3.9, 4.05), (4.1, 4.2)], 10.0
+    )
+    for index, (start, end) in enumerate(refined):
+        assert end > start
+        if index:
+            assert start >= refined[index - 1][1]
+
+
+@contextmanager
+def assistant_project():
+    """A tiny open project on disk, restored afterwards."""
+    old_current = dict(retake.CURRENT)
+    old_projects = retake.PROJECTS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        retake.PROJECTS_DIR = root
+        project_dir = root / "Project 1"
+        (project_dir / "media").mkdir(parents=True)
+        source = project_dir / "media" / "original.wav"
+        source.write_bytes(b"RIFF0000WAVE")
+        project = {
+            "schema_version": 1, "source_path": str(source), "duration_s": 12.0,
+            "language": "en",
+            "tokens": [
+                {"id": 0, "kind": "word", "text": "keep", "start": 0.0, "end": 1.0,
+                 "seg": 0, "cut": False},
+                {"id": 1, "kind": "word", "text": "this", "start": 1.1, "end": 1.8,
+                 "seg": 0, "cut": False},
+                {"id": 2, "kind": "word", "text": "remove", "start": 4.0, "end": 4.6,
+                 "seg": 1, "cut": False},
+                {"id": 3, "kind": "word", "text": "that", "start": 4.7, "end": 5.2,
+                 "seg": 1, "cut": False},
+                {"id": 4, "kind": "word", "text": "end", "start": 9.0, "end": 9.8,
+                 "seg": 2, "cut": False},
+            ],
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 1.8, "text": "keep this"},
+                {"id": 1, "start": 4.0, "end": 5.2, "text": "remove that"},
+                {"id": 2, "start": 9.0, "end": 9.8, "text": "end"},
+            ],
+            "clusters": [], "markers": [],
+        }
+        retake.atomic_write_json(project_dir / "project.json", project)
+        retake.CURRENT.update(
+            project=project, media_path=str(source),
+            project_dir=str(project_dir), source_filename="original.wav",
+        )
+        try:
+            yield TestClient(app), project, project_dir
+        finally:
+            retake.CURRENT.clear()
+            retake.CURRENT.update(old_current)
+            retake.PROJECTS_DIR = old_projects
+
+
+def test_assistant_edits_preview_before_they_write() -> None:
+    """dry_run is the default and must leave the project completely alone."""
+    with assistant_project() as (client, project, project_dir):
+        preview = client.post("/assistant/cuts", json={"token_ids": [2, 3]}).json()
+        assert preview["dry_run"] is True
+        assert preview["changed_token_ids"] == [2, 3]
+        # The preview reports the real consequence...
+        assert preview["after"]["edited_duration_s"] < preview["before"]["edited_duration_s"]
+        # ...without any of it having happened.
+        assert [t["cut"] for t in project["tokens"]] == [False] * 5
+        assert "backup" not in preview
+        assert not retake.assistant_backups(project_dir)
+
+        applied = client.post(
+            "/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False}
+        ).json()
+        assert applied["dry_run"] is False and applied["backup"]
+        assert [t["cut"] for t in retake.CURRENT["project"]["tokens"]] == [
+            False, False, True, True, False
+        ]
+
+
+def test_assistant_undo_unwinds_edits_in_reverse_order() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        client.post("/assistant/cuts", json={"token_ids": [0, 1], "dry_run": False})
+        cuts = lambda: [t["cut"] for t in retake.CURRENT["project"]["tokens"]]
+        assert cuts() == [True, True, True, True, False]
+        first = client.post("/assistant/undo", json={}).json()
+        assert first["remaining_undo_steps"] == 1
+        assert cuts() == [False, False, True, True, False]
+        client.post("/assistant/undo", json={})
+        assert cuts() == [False] * 5
+        assert client.post("/assistant/undo", json={}).status_code == 404
+
+
+def test_assistant_backup_holds_the_state_before_the_edit() -> None:
+    """The regression that makes undo a no-op if the snapshot is taken late."""
+    with assistant_project() as (client, _project, project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        backups = retake.assistant_backups(project_dir)
+        assert len(backups) == 1
+        saved = json.loads(backups[0].read_text(encoding="utf-8"))
+        assert [t["cut"] for t in saved["tokens"]] == [False] * 5
+
+
+def test_assistant_cuts_are_a_delta_not_a_replacement() -> None:
+    """Editing named tokens must never restore unrelated ones."""
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [0], "dry_run": False})
+        client.post("/assistant/cuts", json={"token_ids": [4], "dry_run": False})
+        assert [t["cut"] for t in retake.CURRENT["project"]["tokens"]] == [
+            True, False, False, False, True
+        ]
+
+
+def test_assistant_rejects_unknown_tokens_and_bad_modes() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        assert client.post("/assistant/cuts", json={"token_ids": [999]}).status_code == 400
+        assert client.post(
+            "/assistant/cuts", json={"token_ids": [0], "mode": "delete"}
+        ).status_code == 400
+        assert client.post("/assistant/cuts", json={"token_ids": []}).status_code == 400
+        assert client.post(
+            "/assistant/cuts", json={"token_ids": ["one"]}
+        ).status_code == 400
+
+
+def test_assistant_find_reports_misses_instead_of_guessing() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        hit = client.post("/assistant/find", json={"phrase": "remove that"}).json()
+        assert hit["status"] == "exact" and hit["token_ids"] == [2, 3]
+        assert hit["start"] == 4.0 and hit["end"] == 5.2
+        miss = client.post(
+            "/assistant/find", json={"phrase": "never spoken words here"}
+        ).json()
+        assert miss["status"] != "exact" and miss["token_ids"] == []
+        assert client.post("/assistant/find", json={"phrase": "  "}).status_code == 400
+
+
+def test_assistant_transcript_paginates_and_filters() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        first = client.get("/assistant/transcript", params={"limit": 2}).json()
+        assert first["total"] == 3 and first["next_offset"] == 2
+        assert [row["segment_id"] for row in first["segments"]] == [0, 1]
+        assert first["segments"][0]["words"][0]["id"] == 0
+        last = client.get(
+            "/assistant/transcript", params={"limit": 2, "offset": 2}
+        ).json()
+        assert last["next_offset"] is None and last["returned"] == 1
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        only_cut = client.get("/assistant/transcript", params={"only": "cut"}).json()
+        assert [row["segment_id"] for row in only_cut["segments"]] == [1]
+        assert client.get(
+            "/assistant/transcript", params={"only": "sideways"}
+        ).status_code == 400
+
+
+def test_assistant_summary_reports_the_composed_edit() -> None:
+    with assistant_project() as (client, _project, _project_dir):
+        client.post("/assistant/cuts", json={"token_ids": [2, 3], "dry_run": False})
+        summary = client.get("/assistant/summary").json()
+        assert summary["duration_s"] == 12.0
+        assert summary["cut_word_count"] == 2
+        assert summary["edited_duration_s"] < 12.0
+        assert summary["undo_available"] is True
+        # The absorbed pause is visible here, not just at export time.
+        assert summary["cut_intervals"] == [[1.92, 8.88]]
+
+
+def test_assistant_endpoints_require_an_open_project() -> None:
+    old = dict(retake.CURRENT)
+    retake.CURRENT.clear()
+    retake.CURRENT.update(project=None, media_path=None, project_dir=None)
+    try:
+        client = TestClient(app)
+        for method, path in (
+            ("get", "/assistant/summary"), ("get", "/assistant/transcript"),
+            ("get", "/assistant/retakes"),
+        ):
+            assert getattr(client, method)(path).status_code == 404, path
+        assert client.post("/assistant/find", json={"phrase": "x"}).status_code == 404
+        assert client.post("/assistant/cuts", json={"token_ids": [0]}).status_code == 404
+        assert client.post("/assistant/undo", json={}).status_code == 404
+    finally:
+        retake.CURRENT.clear()
+        retake.CURRENT.update(old)
+
+
+def test_assistant_is_always_available_without_a_model() -> None:
+    payload = TestClient(app).get("/assistant/available").json()
+    assert payload["available"] is True
+    assert payload["engine"] == "deterministic"
+    assert payload["mcp"]["http_path"] == retake.MCP_HTTP_PATH
+
+
+def test_no_local_llm_remains() -> None:
+    """The GGUF path is gone; the deterministic resolver is not."""
+    source = Path(__file__).with_name("retake.py").read_text(encoding="utf-8")
+    for gone in ("llama_cpp", "list_ggufs", "LLM_DIR", ".gguf", "AI_SYSTEM_PROMPT"):
+        assert gone not in source, gone
+    for kept in ("resolve_phrase_tokens", "resolve_detailed_operations",
+                 "validate_planned_operations", "deterministic_instruction_plan"):
+        assert kept in source, kept
+
+
+def test_mcp_server_exposes_the_documented_tool_surface() -> None:
+    import asyncio
+
+    import retake_mcp
+
+    tools = {tool.name: tool for tool in asyncio.run(retake_mcp.mcp.list_tools())}
+    expected = {
+        "get_status", "list_projects", "open_project", "get_edit_summary",
+        "read_transcript", "find_phrase", "list_retakes", "plan_edit",
+        "get_proposals", "apply_cuts", "apply_proposals", "undo", "set_markers",
+        "set_voice_enhancement", "start_export", "get_job_status", "export_text",
+        "get_latest_export", "recalibrate_timing",
+    }
+    assert expected <= set(tools), expected - set(tools)
+    # Every tool has to explain itself; MCP clients only see descriptions.
+    for name, tool in tools.items():
+        assert (tool.description or "").strip(), name
+
+
+def test_mcp_mutating_tools_default_to_a_dry_run() -> None:
+    import asyncio
+
+    import retake_mcp
+
+    tools = {tool.name: tool for tool in asyncio.run(retake_mcp.mcp.list_tools())}
+    for name in ("apply_cuts", "apply_proposals", "set_markers",
+                 "set_voice_enhancement", "start_export", "recalibrate_timing"):
+        schema = tools[name].input_schema
+        assert "dry_run" in schema["properties"], name
+        assert schema["properties"]["dry_run"].get("default") is True, name
+        assert "dry_run" not in schema.get("required", []), name
+
+
+def test_mcp_endpoint_is_mounted_and_optional() -> None:
+    assert retake.MCP_HTTP_PATH == "/mcp"
+    mounted = [
+        route for route in app.routes
+        if getattr(route, "path", None) == retake.MCP_HTTP_PATH
+    ]
+    assert mounted, "the /mcp endpoint should be mounted when mcp is installed"
+    source = Path(__file__).with_name("retake.py").read_text(encoding="utf-8")
+    # The editor must still start when the optional dependency is absent.
+    assert "MCP endpoint disabled" in source
+
+
+SKILL_PATH = Path(__file__).with_name("skills") / "retake-brain" / "SKILL.md"
+
+
+def skill_example_cutlist() -> str:
+    """The example block out of SKILL.md, so the two can never drift apart."""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    start = skill.index("**Cluster 2 ")
+    return skill[start:skill.index("**Closing -")].strip()
+
+
+def test_skill_example_cutlist_parses_completely() -> None:
+    """Every command the skill documents must be one the parser understands."""
+    cutlist = skill_example_cutlist()
+    operations, covered = deterministic_instruction_plan(cutlist)
+    lines = cutlist.splitlines()
+    assert not (retake._actionable_instruction_lines(lines) - covered)
+
+    by_action: dict[str, list[dict]] = {}
+    for op in operations:
+        by_action.setdefault(op["action"], []).append(op)
+    assert set(by_action) == {"keep_phrase", "cut_phrase", "cut_gap", "needs_decision"}
+
+    # "(أول مرة)" and "(آخر مرة)" are the skill's ordinal markers.
+    assert by_action["cut_phrase"][0]["occurrence"] == "first"
+    assert by_action["keep_phrase"][-1]["occurrence"] == "last"
+    # The gap command carries both of its timestamps.
+    gap = by_action["cut_gap"][0]
+    assert (round(gap["start"], 1), round(gap["end"], 1)) == (75.5, 97.9)
+
+
+def test_arabic_last_marker_scopes_cuts_and_keeps() -> None:
+    """'آخر مرة' was silently ignored, so the wrong take was kept."""
+    for line, action in (
+        ('خلّي: "the same sentence" (آخر مرة)', "keep_phrase"),
+        ('شيل: "the same sentence" (آخر مرة)', "cut_phrase"),
+        ('keep: "the same sentence" (last)', "keep_phrase"),
+    ):
+        operations, _ = deterministic_instruction_plan(line)
+        assert len(operations) == 1, line
+        assert operations[0]["action"] == action, line
+        assert operations[0]["occurrence"] == "last", line
+    first, _ = deterministic_instruction_plan('شيل: "x" (أول مرة)')
+    assert first[0]["occurrence"] == "first"
+
+
+def test_decision_block_options_are_never_executed() -> None:
+    """Both branches use the command grammar; running both would self-conflict."""
+    cutlist = (
+        'قرار مطلوب: بتقول "12 days" و"two weeks" — اختار الرقم الصح:\n'
+        '- لو 12 days → خلّي: "it stayed for 12 days" + شيل: "it stayed for two weeks"\n'
+        '- لو two weeks → خلّي: "it stayed for two weeks" + شيل: "it was 12 days"\n'
+        '\n'
+        'شيل: "a real command after the block"'
+    )
+    operations, _ = deterministic_instruction_plan(cutlist)
+    actions = [op["action"] for op in operations]
+    assert actions.count("needs_decision") == 1
+    # Nothing from either branch became an edit...
+    for op in operations:
+        assert "12 days" not in op["phrase"] and "two weeks" not in op["phrase"]
+    # ...but the block does not swallow the commands that follow it.
+    assert any(op["phrase"] == "a real command after the block" for op in operations)
+
+
+def test_cluster_headers_scope_the_search_window() -> None:
+    """The skill promises headers bound the search; the parser must honour it."""
+    cutlist = skill_example_cutlist()
+    _lines, bounds = retake._instruction_context(cutlist, 600.0)
+    operations, _ = deterministic_instruction_plan(cutlist)
+    windows = {op["line"]: bounds[op["line"]] for op in operations}
+    # Commands under "Cluster 2 (00:58.9 -> 01:37.9)" search only that range.
+    assert all(
+        (round(lo, 1), round(hi, 1)) == (58.9, 97.9)
+        for line, (lo, hi) in windows.items() if line < 8
+    )
+    assert all(
+        (round(lo, 1), round(hi, 1)) == (213.9, 257.7)
+        for line, (lo, hi) in windows.items() if line > 8
+    )
+
+
+def test_skill_matches_the_app_it_drives() -> None:
+    """Guidance that describes removed features is worse than no guidance."""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    # The manual gap editor is gone. The skill may only mention its button in
+    # order to disown it, never to recommend it.
+    assert "There is no" in skill and "cut all gaps" in skill
+    assert "Never suggest it." in skill
+    assert "recommending the app" not in skill
+    # Cuts absorb their own surrounding pause, so listing those gaps is noise.
+    assert "absorbs the non-speech" in skill
+    # The MCP loop it documents has to use the tools that exist.
+    import asyncio
+
+    import retake_mcp
+
+    available = {t.name for t in asyncio.run(retake_mcp.mcp.list_tools())}
+    for named in ("get_status", "list_projects", "open_project", "read_transcript",
+                  "find_phrase", "plan_edit", "apply_proposals", "undo",
+                  "start_export", "recalibrate_timing"):
+        assert named in skill, named
+        assert named in available, named
+
+
 def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
     proj = {"tokens": []}
     assert ensure_voice_enhancement_state(proj)
@@ -257,18 +693,6 @@ def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
             pass
         else:
             raise AssertionError(f"invalid cleanup accepted: {bad!r}")
-
-
-def test_ai_chunks_never_split_clusters() -> None:
-    segments = [{"id": i, "text": "word " * 900} for i in range(6)]
-    clusters = [{"id": 0, "members": [1, 3]}]  # spans indices 1..3
-    chunks = build_ai_chunks(segments, clusters, max_words=2000)
-    # indices 1,2,3 must land in exactly one chunk together
-    holding = [c for c in chunks if 1 in c]
-    assert len(holding) == 1 and {1, 2, 3} <= set(holding[0])
-    # order preserved, everything covered exactly once
-    flat = [i for c in chunks for i in c]
-    assert flat == sorted(flat) == list(range(6))
 
 
 def test_retakes_do_not_chain_through_weak_links() -> None:
@@ -330,6 +754,116 @@ def test_text_attachments_are_bounded_and_binary_is_ignored() -> None:
 def test_model_hubs_are_forced_offline() -> None:
     assert os.environ["HF_HUB_OFFLINE"] == "1"
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_lan_urls_carry_a_scheme_and_port() -> None:
+    assert all(url.startswith("https://") and url.endswith(":8443")
+               for url in lan_urls(retake.HTTPS_PORT, "https"))
+
+
+def test_lan_certificate_covers_localhost_and_every_lan_address() -> None:
+    """iOS only grants a wake lock over HTTPS, so the phone must trust this."""
+    try:
+        from cryptography import x509
+    except ImportError:  # optional dependency
+        return
+    old_dir = retake.TLS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        retake.TLS_DIR = Path(tmp) / "tls"
+        try:
+            pair = retake.ensure_lan_certificate()
+            assert pair is not None
+            certificate_path, key_path = pair
+            assert certificate_path.exists() and key_path.exists()
+            # A real TLS stack has to accept the pair, not just the file bytes.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(certificate_path), str(key_path))
+
+            certificate = x509.load_pem_x509_certificate(certificate_path.read_bytes())
+            names = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            hosts = {str(entry.value) for entry in names}
+            assert "localhost" in hosts and "127.0.0.1" in hosts
+            for address in retake.lan_addresses():
+                assert address in hosts, address
+            assert certificate.not_valid_after_utc > datetime.now(timezone.utc)
+            # Second call reuses it rather than churning a new key.
+            assert retake.ensure_lan_certificate() == pair
+        finally:
+            retake.TLS_DIR = old_dir
+
+
+def test_serving_https_keeps_the_plain_http_address() -> None:
+    """The desktop workflow must not move just because phones need TLS."""
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    serving = source[source.index("async def serve_forever("):]
+    assert "port=PORT" in serving and "port=HTTPS_PORT" in serving
+    assert "ssl_certfile=str(certificate)" in serving
+    # A missing certificate leaves exactly the plain HTTP listener.
+    assert "if tls is not None:" in serving
+    main_source = source[source.index("def main() -> None:"):]
+    assert "serving HTTP only" in main_source
+
+
+def test_both_listeners_share_one_event_loop_and_one_mcp_manager() -> None:
+    """The regression that stopped HTTPS from starting at all.
+
+    Running the same app on two uvicorn servers runs the lifespan twice, and
+    StreamableHTTPSessionManager.run() refuses a second call -- so the second
+    listener died on startup. The manager also binds to the loop that started
+    it, so the two listeners cannot live in separate threads.
+    """
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    serving = source[source.index("async def serve_forever("):]
+    # One loop: gathered coroutines, not a thread per server.
+    assert "await asyncio.gather(" in serving
+    assert "threading.Thread" not in serving
+    # Stopping one listener stops the other, so Ctrl+C ends the process.
+    assert "other.should_exit = True" in serving
+
+    lifespan = source[source.index("async def _lifespan("):]
+    lifespan = lifespan[:lifespan.index("app = FastAPI(")]
+    assert "_MCP_MANAGER_RUNNING" in lifespan
+    assert "or _MCP_MANAGER_RUNNING:" in lifespan
+
+
+def test_port_clash_degrades_instead_of_exiting() -> None:
+    import socket as _socket
+
+    held = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    held.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    held.bind(("0.0.0.0", 0))
+    held.listen(1)
+    port = held.getsockname()[1]
+    try:
+        assert retake.port_is_free(port) is False
+    finally:
+        held.close()
+    # A port nothing holds is reported free, and probing does not keep it.
+    assert retake.port_is_free(port) is True
+    assert retake.port_is_free(port) is True
+
+
+def test_transfer_waits_for_the_tab_instead_of_burning_retries() -> None:
+    """A locked phone suspends fetch; retrying against a sleeping tab is waste."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function whenVisible()" in html
+    assert "await whenVisible();" in html
+    assert "resuming automatically" in html
+    # The old dead end is gone.
+    assert "Transfer paused safely on the laptop" not in html
+    assert "connection kept dropping after" not in html
+    # It gives up only after a long continuous outage, not after N attempts.
+    assert "UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000" in html
+
+
+def test_transfer_chunk_size_adapts_within_the_server_limit() -> None:
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function nextChunkSize(current, seconds)" in html
+    assert "const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;" in html
+    # The client must never propose a chunk the server would reject with 413.
+    assert retake.UPLOAD_CHUNK_MAX_BYTES >= 8 * 1024 * 1024
 
 
 def test_lan_urls_are_http_links() -> None:
@@ -914,24 +1448,20 @@ def test_generic_editor_prompt_has_no_explicit_delete_target() -> None:
     assert "sponsor" in explicit_target_terms("Delete the sponsor message.")
 
 
-def test_ai_rejects_generic_unique_content_and_select_everything() -> None:
+def test_budget_guard_refuses_an_implausibly_broad_automated_edit() -> None:
+    """The guard that stops one confident mistake from deleting the recording."""
     segments = [
         {"id": i, "start": float(i * 5), "end": float(i * 5 + 4),
          "text": f"unique substantive section number {i}"}
         for i in range(20)
     ]
-    by_id = {s["id"]: s for s in segments}
-    invalid = validate_llm_proposal(
-        {"candidate_id": 3, "category": "explicit_target", "evidence": "unique substantive",
-         "reason": "remove it"},
-        by_id, set(by_id), set(), set(),
-    )
-    assert invalid is None
     broad = [
         {"sentence_ids": [s["id"]], "start": s["start"], "end": s["end"]}
         for s in segments
     ]
     assert not enforce_llm_budget(broad, segments, 100.0)
+    assert enforce_llm_budget(broad[:2], segments, 100.0)
+    assert enforce_llm_budget([], segments, 100.0)
 
 
 def test_preview_has_single_flight_seek_controller() -> None:
