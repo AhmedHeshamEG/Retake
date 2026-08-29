@@ -31,6 +31,7 @@ from retake import (
     merge_intervals,
     parse_silencedetect_output,
     refine_export_keep_edges,
+    trim_interior_silence,
     retake_text_match,
     sanitize_clusters,
     validate_ai_attachments,
@@ -324,6 +325,55 @@ def test_export_keep_edges_trim_much_further_than_they_restore() -> None:
     assert refine_export_keep_edges([(0.0, 5.0)], [(5.2, 6.0)], 10.0) == [(0.0, 5.2)]
 
 
+def test_export_keep_edge_spends_its_whole_budget_inside_long_silence() -> None:
+    """The longest dead air used to be the only kind nothing touched.
+
+    An edge sitting inside a silence far longer than the trim budget failed the
+    "is the far side within budget" test and was left exactly where it was, so
+    a fifteen-second pause survived a cut while a one-second pause did not.
+    Every second between the edge and the budget is measured silence, so the
+    budget is spent instead of the candidate being thrown away.
+    """
+    assert refine_export_keep_edges([(0.0, 20.0)], [(15.0, 30.0)], 100.0) == [(0.0, 18.0)]
+    assert refine_export_keep_edges([(50.0, 90.0)], [(40.0, 60.0)], 100.0) == [(52.0, 90.0)]
+    # Restoring is still refused at that distance: those seconds are not silence
+    # the keep list already owns.
+    assert refine_export_keep_edges([(20.0, 50.0)], [(10.0, 17.0)], 100.0) == [(20.0, 50.0)]
+
+
+def test_interior_silence_is_shortened_to_a_natural_pause() -> None:
+    """Dead air between two kept sentences belongs to no cut, so only this
+    reaches it."""
+    keeps = [(0.0, 30.0)]
+    trimmed = trim_interior_silence(keeps, [(10.0, 18.0)], 60.0)
+    assert trimmed == [(0.0, 10.175), (17.825, 30.0)]
+    # What is left is a real pause, balanced across the join: half the retained
+    # silence stays on each side, so the speaker still breathes.
+    kept_pause = (10.175 - 10.0) + (18.0 - 17.825)
+    assert round(kept_pause, 3) == retake.EXPORT_INTERIOR_PAUSE_KEEP_S
+    assert round(8.0 - kept_pause, 3) == round(17.825 - 10.175, 3)
+
+
+def test_interior_silence_leaves_speech_rhythm_alone() -> None:
+    # Below the floor: this is how the person talks, not dead air.
+    assert trim_interior_silence([(0.0, 30.0)], [(10.0, 10.8)], 60.0) == [(0.0, 30.0)]
+    assert trim_interior_silence([(0.0, 30.0)], [], 60.0) == [(0.0, 30.0)]
+    # A silence touching an edge is edge snapping's business, not this one.
+    assert trim_interior_silence([(10.0, 30.0)], [(8.0, 14.0)], 60.0) == [(10.0, 30.0)]
+    assert trim_interior_silence([(10.0, 30.0)], [(26.0, 33.0)], 60.0) == [(10.0, 30.0)]
+
+
+def test_interior_silence_keeps_intervals_ordered_and_non_overlapping() -> None:
+    trimmed = trim_interior_silence(
+        [(0.0, 40.0), (50.0, 80.0)], [(5.0, 9.0), (20.0, 24.0), (60.0, 70.0)], 100.0
+    )
+    for index, (start, end) in enumerate(trimmed):
+        assert end > start
+        if index:
+            assert start >= trimmed[index - 1][1]
+    assert sum(end - start for start, end in trimmed) < 70.0
+
+
 def test_export_keep_edge_restore_never_reaches_across_the_previous_keep() -> None:
     refined = refine_export_keep_edges(
         [(0.0, 4.0), (4.3, 9.0)], [(3.9, 4.05), (4.1, 4.2)], 10.0
@@ -560,6 +610,20 @@ def test_mcp_mutating_tools_default_to_a_dry_run() -> None:
         assert "dry_run" not in schema.get("required", []), name
 
 
+def test_project_mcp_config_points_at_the_servers_own_interpreter() -> None:
+    """A globally-installed `mcp` is exactly what this config exists to avoid."""
+    config = json.loads(
+        (Path(retake.__file__).with_name(".mcp.json")).read_text(encoding="utf-8")
+    )
+    server = config["mcpServers"]["retake"]
+    assert server["type"] == "stdio"
+    assert ".venv" in server["command"]
+    script = Path(retake.__file__).with_name(server["args"][0])
+    assert script.name == "retake_mcp.py" and script.exists()
+    # It must talk to the editor's own address, not guess one.
+    assert server["env"]["RETAKE_URL"].endswith(str(retake.PORT))
+
+
 def test_mcp_endpoint_is_mounted_and_optional() -> None:
     assert retake.MCP_HTTP_PATH == "/mcp"
     mounted = [
@@ -674,6 +738,19 @@ def test_skill_matches_the_app_it_drives() -> None:
                   "start_export", "recalibrate_timing"):
         assert named in skill, named
         assert named in available, named
+
+
+def test_skill_is_written_entirely_in_english() -> None:
+    """The skill edits Arabic recordings; it does not write Arabic itself."""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    arabic = [ch for ch in skill if "؀" <= ch <= "ۿ"]
+    assert not arabic, f"Arabic characters left in SKILL.md: {''.join(arabic)[:80]}"
+    # The English command grammar it now documents is the one the parser reads.
+    for form in ('cut: "', 'keep: "', "cut gap:", "Needs a decision:",
+                 "(first)", "(last)", "(every time)"):
+        assert form in skill, form
+    # Quoted transcript text still stays in its original language.
+    assert "in the transcript's own" in skill and "language" in skill
 
 
 def test_voice_enhancement_defaults_validation_and_loudness_mapping() -> None:
@@ -848,22 +925,63 @@ def test_port_clash_degrades_instead_of_exiting() -> None:
 def test_transfer_waits_for_the_tab_instead_of_burning_retries() -> None:
     """A locked phone suspends fetch; retrying against a sleeping tab is waste."""
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
-    assert "function whenVisible()" in html
-    assert "await whenVisible();" in html
+    assert "function whenRunnable()" in html
+    # ...and only after a chunk has already failed. A working link is never
+    # made to wait for the tab to become visible.
+    assert html.count("await whenRunnable();") == 1
     assert "resuming automatically" in html
-    # The old dead end is gone.
+    # The old dead ends are gone.
     assert "Transfer paused safely on the laptop" not in html
     assert "connection kept dropping after" not in html
+    assert "Transfer interrupted" not in html
     # It gives up only after a long continuous outage, not after N attempts.
     assert "UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000" in html
+
+
+def test_transfer_keeps_the_phone_awake_without_a_certificate() -> None:
+    """wakeLock needs HTTPS; an audio loop keeps a locked phone uploading."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function startKeepAlive()" in html
+    assert "function stopKeepAlive()" in html
+    assert "keepAliveEl.loop = true" in html
+    # Playback has to start inside the tap that opens the picker.
+    assert 'startKeepAlive(); $("mediaFile").click();' in html
+    # Nothing may push the creator towards trusting a self-signed certificate.
+    assert "Open Retake's https:// address instead" not in html
+
+
+def test_transfer_offers_resume_rather_than_a_restart() -> None:
+    """A phone that dropped the file keeps every byte already on the laptop."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "needsReselect" in html
+    assert "nothing was lost" in html
+    assert 'S.uploadFile ? "Retry" : "Resume"' in html
 
 
 def test_transfer_chunk_size_adapts_within_the_server_limit() -> None:
     html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
     assert "function nextChunkSize(current, seconds)" in html
+    # A chunk interrupted mid-flight is re-sent in full, so the client stays
+    # well under the server ceiling rather than at it.
     assert "const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;" in html
-    # The client must never propose a chunk the server would reject with 413.
     assert retake.UPLOAD_CHUNK_MAX_BYTES >= 8 * 1024 * 1024
+
+
+def test_transfer_fills_the_link_with_several_connections() -> None:
+    """One chunk at a time left the link idle for a round trip after each one."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "const UPLOAD_LANES = 4" in html
+    assert "async function runTransfer(file, descriptor)" in html
+    # Lanes must stay under the browser's six-connections-per-host limit, or
+    # status polling starves behind the transfer.
+    assert retake.UPLOAD_CHUNK_MAX_BYTES >= 8 * 1024 * 1024
+
+
+def test_a_locked_screen_does_not_pause_between_chunks() -> None:
+    """The audio loop keeps the tab running, so hidden must not mean waiting."""
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert 'document.visibilityState === "visible" || keepAliveRunning()' in html
+    assert "keepAliveRunning() ? 1500" not in html
 
 
 def test_lan_urls_are_http_links() -> None:
@@ -886,10 +1004,12 @@ def test_chunk_upload_resumes_and_preserves_bytes() -> None:
             "/upload/start", json={"name": name, "size": 6, "fingerprint": fingerprint}
         )
         assert resumed.json()["offset"] == 3
-        wrong = client.post(
-            f"/upload/chunk/{session}", content=b"x", headers={"X-Upload-Offset": "0"}
+        # Re-sending a range that already arrived is harmless: lanes retry, and
+        # a resumed transfer re-sends whatever the laptop had not written down.
+        again = client.post(
+            f"/upload/chunk/{session}", content=b"abc", headers={"X-Upload-Offset": "0"}
         )
-        assert wrong.status_code == 409 and wrong.json()["offset"] == 3
+        assert again.status_code == 200 and again.json()["offset"] == 3
         second = client.post(
             f"/upload/chunk/{session}", content=b"def", headers={"X-Upload-Offset": "3"}
         )
@@ -900,6 +1020,50 @@ def test_chunk_upload_resumes_and_preserves_bytes() -> None:
         assert output.read_bytes() == b"abcdef"
         assert output == root / "Project 1" / "media" / "original.bin"
         assert (root / "Project 1" / "exports").is_dir()
+
+
+def test_chunks_may_arrive_out_of_order() -> None:
+    """Parallel lanes finish in whatever order the link allows."""
+    with temporary_project_root():
+        client = TestClient(app)
+        name = f"retake-upload-test-{uuid.uuid4().hex}.bin"
+        fingerprint = uuid.uuid4().hex
+        start = client.post(
+            "/upload/start", json={"name": name, "size": 9, "fingerprint": fingerprint}
+        )
+        session = start.json()["session"]
+        tail = client.post(
+            f"/upload/chunk/{session}", content=b"ghi", headers={"X-Upload-Offset": "6"}
+        )
+        # The tail is stored, but a resume can only start where the run from
+        # zero ends, so nothing is confirmed yet.
+        assert tail.status_code == 200 and tail.json()["offset"] == 0
+        assert client.post("/upload/finish", json={"session": session}).status_code == 409
+        client.post(f"/upload/chunk/{session}", content=b"def", headers={"X-Upload-Offset": "3"})
+        head = client.post(
+            f"/upload/chunk/{session}", content=b"abc", headers={"X-Upload-Offset": "0"}
+        )
+        assert head.json()["offset"] == 9
+        done = client.post("/upload/finish", json={"session": session})
+        assert done.status_code == 200
+        assert Path(done.json()["path"]).read_bytes() == b"abcdefghi"
+
+
+def test_upload_rejects_offsets_past_the_declared_size() -> None:
+    with temporary_project_root():
+        client = TestClient(app)
+        name = f"retake-upload-test-{uuid.uuid4().hex}.bin"
+        start = client.post(
+            "/upload/start",
+            json={"name": name, "size": 4, "fingerprint": uuid.uuid4().hex},
+        )
+        session = start.json()["session"]
+        assert client.post(
+            f"/upload/chunk/{session}", content=b"x", headers={"X-Upload-Offset": "9"}
+        ).status_code == 409
+        assert client.post(
+            f"/upload/chunk/{session}", content=b"toolong", headers={"X-Upload-Offset": "0"}
+        ).status_code == 400
 
 
 def test_media_uses_native_http_range_delivery() -> None:
@@ -1654,8 +1818,12 @@ def test_export_refinement_runs_after_keep_composition_without_text_export_chang
     end = source.index("def export_text", start)
     media_export = source[start:end]
     assert media_export.index("keep_list(cuts") < media_export.index("refine_export_keep_edges")
+    # Interior dead air is shortened only after the edges are settled, so the
+    # two never argue about the same silence.
+    assert media_export.index("refine_export_keep_edges") < media_export.index("trim_interior_silence")
     text_export = source[end:source.index("def fully_cut_segments", end)]
     assert "refine_export_keep_edges" not in text_export
+    assert "trim_interior_silence" not in text_export
 
 
 def test_display_dimensions_apply_phone_rotation() -> None:

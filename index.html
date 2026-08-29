@@ -606,6 +606,7 @@ const S = {
   aiRunning: false,
   loading: false,           // transcription in flight
   uploadFile: null,
+  uploadResume: null,
   uploadSession: null,
   uploadAbort: null,
   uploading: false,
@@ -1788,37 +1789,216 @@ async function refreshProjects() {
 function setUploadActions(retry, cancel) {
   $("uploadRetry").classList.toggle("on", retry);
   $("uploadCancel").classList.toggle("on", cancel);
+  /* "Retry" implies starting over. Nothing already on the laptop is ever
+     re-sent, so when there is something to continue from, say so. */
+  $("uploadRetry").textContent = S.uploadFile ? "Retry" : "Resume";
 }
 
-async function reacquireWakeLock() {
-  if (document.visibilityState !== "visible" || !S.uploading || !navigator.wakeLock) return;
-  try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+/* ------------------------------------------------- keeping a transfer alive
+   A phone that locks its screen suspends the tab, and a suspended tab cannot
+   run fetch -- which is what used to strand a transfer halfway. The obvious
+   fix, navigator.wakeLock, is unavailable here on purpose: it requires a
+   secure context, and a LAN address cannot have one without a certificate the
+   phone must first be talked into trusting. That road is closed.
+
+   A page that is playing audio keeps running while the screen is off; that is
+   how every web audio player works, and it needs no certificate. So for as
+   long as a transfer is in flight, Retake loops one second of inaudible tone.
+   Playback has to begin inside a real tap, so it starts from the same gesture
+   that chooses the file. */
+let keepAliveEl = null, keepAliveUrl = null, keepAliveWatchdog = 0;
+
+function silentLoopUrl() {
+  if (keepAliveUrl) return keepAliveUrl;
+  const rate = 8000, frames = rate, bytes = frames * 2;
+  const buffer = new ArrayBuffer(44 + bytes), view = new DataView(buffer);
+  const ascii = (at, text) => { for (let i = 0; i < text.length; i++) view.setUint8(at + i, text.charCodeAt(i)); };
+  ascii(0, "RIFF"); view.setUint32(4, 36 + bytes, true); ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  ascii(36, "data"); view.setUint32(40, bytes, true);
+  /* One LSB of a 100 Hz tone: below the noise floor of any speaker, but not
+     digital silence, which some phones discard as "nothing is playing". */
+  for (let i = 0; i < frames; i++) {
+    view.setInt16(44 + i * 2, Math.round(Math.sin(2 * Math.PI * 100 * i / rate)), true);
+  }
+  keepAliveUrl = URL.createObjectURL(new Blob([buffer], {type:"audio/wav"}));
+  return keepAliveUrl;
 }
 
-/* A backgrounded phone browser cannot run fetch. Rather than burning retries
-   against a tab that is asleep, wait for it to come back and carry on. */
-function whenVisible() {
-  if (document.visibilityState === "visible") return Promise.resolve();
+/* Called from the tap that starts a transfer, so playback is user-activated. */
+function startKeepAlive() {
+  /* A laptop does not suspend its own tab, and has no reason to open an audio
+     session for a local file copy. This is a phone workaround only. */
+  const phone = matchMedia?.("(pointer: coarse)").matches;
+  try {
+    if (!phone) throw new Error("desktop");
+    if (!keepAliveEl) {
+      keepAliveEl = new Audio(silentLoopUrl());
+      keepAliveEl.loop = true; keepAliveEl.volume = 0.02;
+      keepAliveEl.setAttribute("playsinline", "");
+    }
+    keepAliveEl.play().catch(() => {});
+    /* Armed from the tap that opens the picker, which the person may simply
+       cancel. Nothing must be left playing behind a picker nobody used. */
+    clearTimeout(keepAliveWatchdog);
+    keepAliveWatchdog = setTimeout(() => { if (!S.uploading) stopKeepAlive(); }, 90000);
+  } catch (_) {}
+  if (navigator.wakeLock) {
+    navigator.wakeLock.request("screen").then((lock) => { S.wakeLock = lock; }).catch(() => {});
+  }
+}
+
+function stopKeepAlive() {
+  clearTimeout(keepAliveWatchdog); keepAliveWatchdog = 0;
+  try { keepAliveEl?.pause(); } catch (_) {}
+  if (S.wakeLock) { S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
+}
+
+function keepAliveRunning() {
+  return !!keepAliveEl && !keepAliveEl.paused && !keepAliveEl.ended;
+}
+
+/* Restart both after the screen comes back, in case either was torn down. */
+async function reacquireKeepAlive() {
+  if (document.visibilityState !== "visible" || !S.uploading) return;
+  startKeepAlive();
+}
+
+/* Reached only after a chunk has already failed. If the tab really is frozen,
+   fetch cannot run and waiting beats burning retries -- but while the audio loop
+   is playing the tab is not frozen, and a hidden window must never be made to
+   wait for a link that is working. */
+function whenRunnable() {
+  if (document.visibilityState === "visible" || keepAliveRunning()) return Promise.resolve();
   return new Promise((resolve) => {
-    const onVisible = () => {
-      if (document.visibilityState !== "visible") return;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
       document.removeEventListener("visibilitychange", onVisible);
+      clearTimeout(timer);
       resolve();
     };
+    const onVisible = () => { if (document.visibilityState === "visible") finish(); };
     document.addEventListener("visibilitychange", onVisible);
+    const timer = setTimeout(finish, 60000);
   });
 }
 
 const UPLOAD_MIN_CHUNK = 256 * 1024;
-const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;   /* matches UPLOAD_CHUNK_MAX_BYTES */
+/* A chunk interrupted mid-flight is re-sent in full, so the client stays under
+   the server's ceiling rather than at it. */
+const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;
+/* One chunk at a time leaves the link idle for a whole round trip after every
+   chunk, which is what held phone transfers down to a few hundred KB/s. Four
+   connections keep bytes on the wire while the laptop is answering, and stay
+   inside the six-per-host limit the browser enforces, so polling still gets
+   through. */
+const UPLOAD_LANES = 4;
 const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
 
 /* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
-   Aim for a few seconds per chunk and let the link decide the size. */
+   Aim for a second or two per chunk and let the link decide the size. */
 function nextChunkSize(current, seconds) {
-  if (seconds < 1.5) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
-  if (seconds > 6) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
+  if (seconds < 1) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
+  if (seconds > 3) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
   return current;
+}
+
+/* Sends one file over several connections at once. Each chunk carries the
+   offset it belongs at, so the laptop writes them wherever they land and the
+   lanes never have to wait for one another. */
+async function runTransfer(file, descriptor) {
+  const start = await api("/upload/start", descriptor);
+  S.uploadSession = start.session;
+  localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
+  S.uploadAbort = new AbortController();
+
+  const ceiling = Math.min(UPLOAD_MAX_CHUNK, Number(start.chunk_max) || UPLOAD_MAX_CHUNK);
+  const base = Math.min(file.size, Number(start.offset) || 0);
+  let cursor = base, acked = base, chunkSize = Math.min(ceiling, 1024 * 1024);
+  let failure = null;
+  const startedAt = performance.now();
+
+  const report = () => {
+    const pct = file.size ? acked / file.size * 100 : 0;
+    const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
+    $("progressFill").style.width = `${pct}%`;
+    $("progressMsg").textContent =
+      `Uploading ${fmtBytes(acked)} of ${fmtBytes(file.size)} · ${fmtBytes((acked - base) / seconds)}/s`;
+  };
+  report();
+
+  async function lane() {
+    while (!failure && cursor < file.size) {
+      /* Claiming the range before any await is safe: nothing else runs in
+         between, so two lanes can never claim the same bytes. */
+      const offset = cursor, end = Math.min(file.size, cursor + chunkSize);
+      cursor = end;
+      let sent = false, attempt = 0, stalledSince = 0;
+      while (!sent && !failure) {
+        try {
+          const startedChunk = performance.now();
+          /* Read before sending. A phone that evicted the tab can hand back a
+             File whose bytes are gone, and reading it here says so plainly
+             instead of looking like ten minutes of network trouble. */
+          let body;
+          try {
+            body = await file.slice(offset, end).arrayBuffer();
+          } catch {
+            const stale = new Error("the phone released this file while the screen was off");
+            stale.needsReselect = true;
+            throw stale;
+          }
+          const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
+            method:"POST", headers:{"X-Upload-Offset":String(offset)}, body,
+            signal:S.uploadAbort.signal,
+          });
+          let data = {};
+          try { data = await response.json(); } catch (_) {}
+          if (response.status === 404) {
+            /* The laptop forgot this transfer; start it again from whatever it
+               still has, rather than pushing bytes into nothing. */
+            const gone = new Error("upload session expired");
+            gone.needsRestart = true;
+            throw gone;
+          }
+          if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+          chunkSize = Math.min(ceiling, nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000));
+          acked += end - offset; sent = true;
+          report();
+        } catch (error) {
+          if (error.name === "AbortError" || error.needsReselect || error.needsRestart) {
+            failure = failure || error;
+            throw error;
+          }
+          if (!stalledSince) stalledSince = Date.now();
+          if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
+            failure = failure || error;
+            throw new Error(`the connection has been down for five minutes: ${error.message}`);
+          }
+          /* A drop often means the chunks were too ambitious for this link, so
+             every lane after this one carries less. */
+          chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
+          const waited = Math.round((Date.now() - stalledSince) / 1000);
+          $("progressMsg").textContent = `Connection interrupted · resuming automatically (${waited}s)…`;
+          const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          /* Only now is it worth asking whether the tab is running at all.
+             Asking before every chunk stalled a hidden window for nothing. */
+          await whenRunnable();
+        }
+      }
+    }
+  }
+
+  const lanes = Math.max(1, Math.min(UPLOAD_LANES, Math.ceil((file.size - base) / chunkSize)));
+  const results = await Promise.allSettled(Array.from({length:lanes}, lane));
+  const broke = results.find((r) => r.status === "rejected");
+  if (broke) throw broke.reason;
+  return await api("/upload/finish", {session:start.session});
 }
 
 async function uploadSelectedFile(file) {
@@ -1827,98 +2007,75 @@ async function uploadSelectedFile(file) {
   S.uploadFile = file;
   $("selectedFile").textContent = `${file.name} · ${fmtBytes(file.size)}`;
   $("progressPanel").classList.add("on"); setUploadActions(false, true);
-  const startedAt = performance.now();
   const descriptor = {
     name:file.name, size:file.size, fingerprint:`${file.lastModified}:${file.type}`,
     lastModified:file.lastModified, type:file.type,
   };
   try {
-    let wakeLockOk = false;
-    if (navigator.wakeLock) {
-      try { S.wakeLock = await navigator.wakeLock.request("screen"); wakeLockOk = true; } catch (_) {}
-    }
-    if (!wakeLockOk && location.protocol !== "https:") {
-      toast("This page can't keep the screen awake over plain HTTP. Open Retake's https:// address instead (the command window prints it) and the transfer will survive a screen lock. It resumes by itself either way.", "warn", 14000);
-    }
-    document.addEventListener("visibilitychange", reacquireWakeLock);
-    const start = await api("/upload/start", descriptor);
-    S.uploadSession = start.session; let offset = Number(start.offset) || 0;
-    localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
-    S.uploadAbort = new AbortController();
-    let chunkSize = 1024 * 1024;
-    while (offset < file.size) {
-      let sent = false, attempt = 0, stalledSince = 0;
-      while (!sent) {
-        /* Locking the phone suspends this tab; resume where we left off. */
-        await whenVisible();
-        try {
-          const startedChunk = performance.now();
-          const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
-          const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
-            method:"POST", headers:{"X-Upload-Offset":String(offset)}, body:chunk,
-            signal:S.uploadAbort.signal,
-          });
-          const data = await response.json();
-          if (response.status === 409 && Number.isFinite(Number(data.offset))) {
-            offset = Number(data.offset); sent = true; break;
-          }
-          if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-          chunkSize = nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000);
-          offset = Number(data.offset); sent = true; stalledSince = 0;
-        } catch (error) {
-          if (error.name === "AbortError") throw error;
-          if (!stalledSince) stalledSince = Date.now();
-          if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
-            throw new Error(`the connection has been down for five minutes: ${error.message}`);
-          }
-          /* A drop often means the chunk was too ambitious for this link. */
-          chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
-          const waited = Math.round((Date.now() - stalledSince) / 1000);
-          $("progressMsg").textContent = `Connection interrupted · resuming automatically (${waited}s)…`;
-          const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          await whenVisible();
-          try {
-            const resumed = await api("/upload/start", descriptor);
-            S.uploadSession = resumed.session;
-            offset = Number(resumed.offset) || 0;
-          } catch (_) { /* server still unreachable; the loop keeps waiting */ }
-        }
+    startKeepAlive();
+    document.addEventListener("visibilitychange", reacquireKeepAlive);
+    let complete = null;
+    for (let restart = 0; complete === null; restart++) {
+      try {
+        complete = await runTransfer(file, descriptor);
+      } catch (error) {
+        if (!error.needsRestart || restart >= 2) throw error;
+        $("progressMsg").textContent = "Reconnecting to Retake…";
       }
-      const pct = file.size ? offset / file.size * 100 : 0;
-      const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
-      $("progressFill").style.width = `${pct}%`;
-      $("progressMsg").textContent = `Uploading ${fmtBytes(offset)} of ${fmtBytes(file.size)} · ${fmtBytes(offset / seconds)}/s`;
     }
-    const complete = await api("/upload/finish", {session:start.session});
     S.uploadSession = null; S.uploadAbort = null;
     localStorage.removeItem("retakePendingTransfer");
+    S.uploadResume = null;
+    $("progressFill").style.width = "100%";
     $("progressMsg").textContent = "Upload complete · opening media";
     setUploadActions(false, false);
     await openPath(complete.path, $("languageSelect").value, complete.source_filename);
   } catch (error) {
     if (error.name === "AbortError") return;
-    $("progressMsg").textContent = `Upload paused: ${error.message}`;
-    setUploadActions(true, false);
-    toast(error.message, "error", 10000);
+    if (error.needsReselect) {
+      /* Safari cannot re-open a file by itself, so this is the one moment a
+         transfer genuinely needs a tap. Everything already sent is kept. */
+      S.uploadFile = null;
+      S.uploadResume = descriptor;
+      $("progressMsg").textContent =
+        `Paused — nothing was lost. `
+        + "Tap Resume and pick the same file to carry on from there.";
+      setUploadActions(true, false);
+    } else {
+      $("progressMsg").textContent = `Upload paused: ${error.message}`;
+      setUploadActions(true, false);
+      toast(error.message, "error", 10000);
+    }
   } finally {
     S.uploading = false;
-    document.removeEventListener("visibilitychange", reacquireWakeLock);
-    if (S.wakeLock) { await S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
+    document.removeEventListener("visibilitychange", reacquireKeepAlive);
+    stopKeepAlive();
   }
 }
 
-$("chooseFile").addEventListener("click", () => $("mediaFile").click());
+/* Playback must begin inside the tap itself, so arm the keep-alive here as
+   well as in uploadSelectedFile; by the time the picker returns, the gesture
+   has expired. */
+$("chooseFile").addEventListener("click", () => { startKeepAlive(); $("mediaFile").click(); });
+$("mediaFile").addEventListener("cancel", () => { if (!S.uploading) stopKeepAlive(); });
 $("mediaFile").addEventListener("change", (event) => {
   const file = event.target.files?.[0]; event.target.value = "";
-  if (file) uploadSelectedFile(file);
+  if (!file) { if (!S.uploading) stopKeepAlive(); return; }
+  uploadSelectedFile(file);
 });
-$("uploadRetry").addEventListener("click", () => { if (S.uploadFile) uploadSelectedFile(S.uploadFile); });
+$("uploadRetry").addEventListener("click", () => {
+  if (S.uploadFile) { uploadSelectedFile(S.uploadFile); return; }
+  /* Resuming a transfer the phone forgot: the same file produces the same
+     server session, so picking it again continues from the byte that arrived. */
+  startKeepAlive();
+  $("mediaFile").click();
+});
 $("uploadCancel").addEventListener("click", async () => {
   S.uploadAbort?.abort();
   if (S.uploadSession) await api("/upload/cancel", {session:S.uploadSession}).catch(() => {});
-  S.uploadSession = null; S.uploadAbort = null; S.uploadFile = null;
+  S.uploadSession = null; S.uploadAbort = null; S.uploadFile = null; S.uploadResume = null;
   localStorage.removeItem("retakePendingTransfer");
+  stopKeepAlive();
   $("progressPanel").classList.remove("on"); $("selectedFile").textContent = "No file selected";
   setUploadActions(false, false);
 });
@@ -2109,19 +2266,21 @@ $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help
         S.uploadSession = state.session;
       } catch (_) { S.uploadSession = pending.session || null; }
       $("progressPanel").classList.add("on");
+      S.uploadFile = null; S.uploadResume = pending;
       if (received === null) {
         $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
-        $("progressMsg").textContent = "Transfer interrupted. Retake could not be reached to check what arrived — choose the same file again to continue.";
+        $("progressMsg").textContent = "Transfer paused — Retake could not be reached to check what arrived. Tap Resume once it is running again.";
       } else if (received >= Number(pending.size)) {
         localStorage.removeItem("retakePendingTransfer");
+        S.uploadResume = null;
         $("progressPanel").classList.remove("on");
       } else {
         const pct = Number(pending.size) ? received / Number(pending.size) * 100 : 0;
         $("progressFill").style.width = `${pct}%`;
-        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
-        $("progressMsg").textContent = `Transfer interrupted · ${fmtBytes(received)} of ${fmtBytes(pending.size)} is already on the laptop. Nothing was lost — choose the same file again and it continues from there.`;
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
+        $("progressMsg").textContent = `Paused at ${fmtBytes(received)} of ${fmtBytes(pending.size)} — nothing was lost. Tap Resume and pick the same file to carry on from there.`;
       }
-      setUploadActions(false, true);
+      setUploadActions(!!S.uploadResume, !!S.uploadResume);
     }
     const st = await api("/status");
     S.errSeq = st.err_seq;

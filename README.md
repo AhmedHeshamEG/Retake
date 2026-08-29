@@ -27,24 +27,41 @@ optional runtime is first prepared; later calibration is local.
 ## Sending video from a phone
 
 Retake serves two addresses: plain HTTP on port 8710, which the desktop has
-always used, and HTTPS on port 8443 for phones. Both run at once, so nothing
-about the desktop workflow changes.
+always used, and HTTPS on port 8443. Both run at once, so nothing about the
+desktop workflow changes, and **the plain HTTP address is the one to use from a
+phone**. It needs no certificate and no warning screen.
 
-The HTTPS one matters because iOS Safari refuses `navigator.wakeLock` over plain
-HTTP. Without a wake lock the phone screen sleeps partway through a large
-transfer, Safari suspends the tab, and the upload stalls. Over HTTPS the page
-holds the screen awake and the transfer runs to completion.
+A locked phone suspends the browser tab, and a suspended tab cannot upload. The
+obvious fix, `navigator.wakeLock`, needs a secure context, and a LAN address
+cannot have one without a certificate the phone has to be talked into trusting
+-- a warning screen in exchange for a screen lock is a bad trade. So the page
+does what a web audio player does instead: while a transfer is running it loops
+one second of inaudible tone, which keeps the tab alive with the screen off. It
+starts from the same tap that picks the file, and stops when the transfer ends.
 
-The certificate is generated on first run, covers this computer's own LAN
-addresses, and never leaves the machine, so the phone will warn once that it is
-not trusted -- choose Advanced and continue. Retake prints the exact address to
-open.
+HTTPS on 8443 is still served for anything that genuinely wants a secure
+context. Its certificate is generated on first run, covers this computer's own
+LAN addresses, and never leaves the machine, so a phone will warn once that it
+is not trusted. Nothing about phone transfers requires it.
 
-Transfers are resumable either way and no longer give up on their own. If the
-connection drops or the tab is backgrounded, the page waits for it to come back
-and continues from the last confirmed byte rather than failing; chunk size
-adapts to the link, up to 8 MB. Reopening Retake after an interruption asks the
-laptop how much already arrived and offers to continue from there.
+A transfer runs over four connections at once. Sending one chunk at a time left
+the link idle for a full round trip after every chunk -- laptop writes the bytes
+down, answers, and only then does the phone start sending again -- which is what
+held phone uploads to a few hundred KB/s no matter how fast the Wi-Fi was. Each
+chunk now carries the offset it belongs at, so the laptop writes it wherever it
+lands and the four lanes never wait for one another. Chunk size adapts to the
+link, up to 8 MB.
+
+Transfers are resumable and no longer give up on their own. If the connection
+drops or the tab is backgrounded, the page waits for it to come back and
+continues from the last confirmed byte rather than failing. A resume starts at
+the end of the unbroken run from byte zero, so a lane that finished ahead of a
+lane that did not costs a few re-sent megabytes and never a corrupt file.
+
+The one thing a browser cannot do by itself is re-open a file it was handed. If
+a phone drops the file entirely -- which is the only failure left -- Retake says
+how much already arrived, and tapping **Resume** and picking the same file
+continues from that byte. Nothing already on the laptop is ever re-sent.
 
 ## Docker
 
@@ -119,14 +136,20 @@ again with `dry_run=false`. Applied edits push onto an undo stack of project
 snapshots that `undo` unwinds one at a time, and edits are deltas, so cutting
 five words never restores the rest of your work.
 
-Start Retake, then point a client at it. For Claude Desktop or Claude Code, add
-to the MCP server config:
+Start Retake, then point a client at it. Claude Code picks the server up from
+the `.mcp.json` in this repository as soon as a session is started here -- it
+launches `retake_mcp.py` from the project's own `.venv`, so a global
+`pip install mcp` is never needed. Approve it once when Claude Code asks, and
+`/mcp` will list `retake`.
+
+For Claude Desktop, or to make the server available outside this directory, add
+it to that client's own MCP server config:
 
 ```json
 {
   "mcpServers": {
     "retake": {
-      "command": "python",
+      "command": "E:/path/to/Retake/.venv/Scripts/python.exe",
       "args": ["E:/path/to/Retake/retake_mcp.py"]
     }
   }

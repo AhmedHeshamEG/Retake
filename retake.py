@@ -89,7 +89,12 @@ ASSISTANT_MAX_TOKEN_IDS = 20_000
 ASSISTANT_TRANSCRIPT_PAGE = 200
 ASSISTANT_BACKUP_KEEP = 20
 MCP_HTTP_PATH = "/mcp"
-UPLOAD_CHUNK_MAX_BYTES = 8 * 1024 * 1024
+UPLOAD_CHUNK_MAX_BYTES = 16 * 1024 * 1024
+# Chunks land out of order across several connections, so the receipt log is
+# kept in memory and only mirrored to disk this often. A stale figure on disk
+# costs a resumed transfer a few re-sent megabytes; fsyncing every chunk cost
+# it most of the link.
+UPLOAD_META_FLUSH_S = 2.0
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
 PREVIEW_PROXY_VERSION = 2
@@ -117,6 +122,13 @@ EXPORT_SILENCE_DB_DEFAULT = -45.0
 # composition excluded, so it stays tightly capped.
 EXPORT_EDGE_MAX_SHIFT_S = 0.40
 EXPORT_EDGE_TRIM_MAX_S = 2.00
+# Dead air *inside* a kept stretch belongs to no cut, so nothing above removes
+# it: two sentences the creator kept can still have eight seconds of thinking
+# between them. Export shortens such a pause to a natural length. The floor is
+# deliberately high -- a pause under it is speech rhythm, not dead air -- and
+# what is left is a real pause, never a hard butt join.
+EXPORT_INTERIOR_SILENCE_MIN_S = 1.20
+EXPORT_INTERIOR_PAUSE_KEEP_S = 0.35
 EXPORT_TRUE_PEAK_DB = -1.5
 
 # --------------------------------------------------------------------------
@@ -924,17 +936,26 @@ def refine_export_keep_edges(
         for silence_start, silence_end in valid_silences:
             if silence_end < boundary - window or silence_start > boundary + window:
                 continue
-            if silence_start <= boundary <= silence_end:
-                distance = 0.0
-            else:
-                distance = min(abs(boundary - silence_start), abs(boundary - silence_end))
+            inside = silence_start <= boundary <= silence_end
+            distance = 0.0 if inside else min(
+                abs(boundary - silence_start), abs(boundary - silence_end)
+            )
             target = silence_end if edge == "start" else silence_start
             shift = abs(target - boundary)
             # Inward for a keep start is later; inward for a keep end is earlier.
             trimming = target > boundary if edge == "start" else target < boundary
             budget = max_trim if trimming else max_shift
-            if shift <= budget + MERGE_EPS:
-                candidates.append((distance, shift, target))
+            if shift > budget + MERGE_EPS:
+                # An edge sitting inside a silence longer than the budget used
+                # to be refused outright, so the longest dead air -- the kind
+                # most worth removing -- was the only kind left untouched.
+                # Every one of those seconds is measured silence, so spend the
+                # whole budget and stop there.
+                if not (inside and trimming):
+                    continue
+                target = boundary + budget if edge == "start" else boundary - budget
+                shift = budget
+            candidates.append((distance, shift, target))
         if not candidates:
             return boundary
         candidates.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -959,6 +980,73 @@ def refine_export_keep_edges(
         if index and start < refined[index - 1][1] - MERGE_EPS:
             return original
     return [(round(start, 6), round(end, 6)) for start, end in refined]
+
+
+def trim_interior_silence(
+    keeps: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+    duration: float,
+    min_silence: float = EXPORT_INTERIOR_SILENCE_MIN_S,
+    keep_pause: float = EXPORT_INTERIOR_PAUSE_KEEP_S,
+) -> list[tuple[float, float]]:
+    """Shorten long dead air *inside* kept audio, leaving a natural pause.
+
+    Cut composition and edge snapping both work outwards from cuts, so neither
+    can reach a silence with kept speech on either side of it. This does, and
+    only that: a kept stretch is split around each measured silence longer than
+    ``min_silence``, with ``keep_pause`` seconds of that silence retained,
+    balanced across the join so the speaker still breathes.
+
+    It is export-only and, like edge snapping, never touches transcript
+    timestamps or project state. Anything it removes was measured as silence by
+    ffmpeg and was surrounded on both sides by audio the creator kept.
+    """
+    original = [(float(start), float(end)) for start, end in keeps]
+    if not original or not silences or min_silence <= keep_pause:
+        return original
+    interior: list[tuple[float, float]] = []
+    for raw_start, raw_end in silences:
+        try:
+            silence_start, silence_end = float(raw_start), float(raw_end)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(silence_start) or not math.isfinite(silence_end):
+            continue
+        silence_start = max(0.0, silence_start)
+        silence_end = min(float(duration), silence_end)
+        if silence_end - silence_start >= min_silence - MERGE_EPS:
+            interior.append((silence_start, silence_end))
+    if not interior:
+        return original
+    interior = merge_intervals(interior)
+
+    margin = keep_pause / 2.0
+    trimmed: list[tuple[float, float]] = []
+    for start, end in original:
+        cursor = start
+        for silence_start, silence_end in interior:
+            # Strictly interior: an overlap with either edge is edge snapping's
+            # job, and re-deciding it here could undo the handles it respected.
+            if silence_start <= cursor + MERGE_EPS or silence_end >= end - MERGE_EPS:
+                continue
+            if silence_end - silence_start < min_silence - MERGE_EPS:
+                continue
+            left, right = silence_start + margin, silence_end - margin
+            if right <= left + MERGE_EPS or left <= cursor + MERGE_EPS:
+                continue
+            trimmed.append((cursor, left))
+            cursor = right
+        if end > cursor + MERGE_EPS:
+            trimmed.append((cursor, end))
+        elif not trimmed or trimmed[-1][1] < end:
+            # Never lose a kept region to arithmetic; fall back to keeping it.
+            trimmed.append((start, end))
+    for index, (start, end) in enumerate(trimmed):
+        if end <= start + MERGE_EPS:
+            return original
+        if index and start < trimmed[index - 1][1] - MERGE_EPS:
+            return original
+    return [(round(start, 6), round(end, 6)) for start, end in trimmed]
 
 
 # --------------------------------------------------------------------------
@@ -3641,6 +3729,13 @@ def export_job(mode: str, enhancement: Optional[dict[str, Any]] = None) -> None:
                 keeps = refine_export_keep_edges(
                     keeps, silences, float(proj["duration_s"])
                 )
+                before_interior = sum(b - a for a, b in keeps)
+                keeps = trim_interior_silence(
+                    keeps, silences, float(proj["duration_s"])
+                )
+                removed = before_interior - sum(b - a for a, b in keeps)
+                if removed > MERGE_EPS:
+                    log.info("export shortened %.2fs of dead air inside kept audio", removed)
             except Exception as exc:
                 log.warning("export silence snapping skipped: %s", exc)
                 warnings.append("silence snapping was unavailable; original safe joins were used")
@@ -4013,6 +4108,70 @@ def upload_session_paths(session_id: str) -> tuple[Path, Path]:
     return transfer_dir / "media.partial", transfer_dir / "transfer.json"
 
 
+# A phone uploads over several connections at once, so chunks arrive out of
+# order and each one is written where it belongs rather than appended. What has
+# actually arrived is therefore a set of byte ranges, held here per session.
+_UPLOAD_LOCK = threading.Lock()
+_UPLOAD_RANGES: dict[str, list[list[int]]] = {}
+_UPLOAD_FLUSHED: dict[str, float] = {}
+
+
+def _merged_ranges(ranges: list[list[int]]) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def _contiguous_received(ranges: list[list[int]]) -> int:
+    """Bytes a transfer can safely resume from: the unbroken run from zero."""
+    return ranges[0][1] if ranges and ranges[0][0] == 0 else 0
+
+
+def _upload_received(session_id: str) -> int:
+    with _UPLOAD_LOCK:
+        return _contiguous_received(_UPLOAD_RANGES.get(session_id, []))
+
+
+def _forget_upload_session(session_id: str) -> None:
+    with _UPLOAD_LOCK:
+        _UPLOAD_RANGES.pop(session_id, None)
+        _UPLOAD_FLUSHED.pop(session_id, None)
+
+
+def _write_chunk_at(path: Path, offset: int, data: bytes) -> None:
+    """Write one chunk where it belongs. Runs off the event loop."""
+    with open(path, "r+b") as handle:
+        handle.seek(offset)
+        handle.write(data)
+
+
+def _record_chunk(session_id: str, start: int, end: int, meta_path: Path,
+                  meta: dict[str, Any]) -> int:
+    """Record an arrived range and return the resumable byte count."""
+    now = time.time()
+    with _UPLOAD_LOCK:
+        ranges = _merged_ranges(_UPLOAD_RANGES.get(session_id, []) + [[start, end]])
+        _UPLOAD_RANGES[session_id] = ranges
+        received = _contiguous_received(ranges)
+        due = now - _UPLOAD_FLUSHED.get(session_id, 0.0) >= UPLOAD_META_FLUSH_S
+        if due:
+            _UPLOAD_FLUSHED[session_id] = now
+    if due:
+        meta["received"] = received
+        meta["updated_at"] = utc_now()
+        try:
+            atomic_write_json(meta_path, meta)
+        except OSError:
+            pass
+        log.info("phone transfer progress: session=%s %d/%d bytes",
+                 session_id, received, int(meta["size"]))
+    return received
+
+
 @app.post("/upload/start")
 def start_upload(payload: dict = Body(...)) -> JSONResponse:
     name = Path(str(payload.get("name") or "media.bin")).name
@@ -4022,21 +4181,39 @@ def start_upload(payload: dict = Body(...)) -> JSONResponse:
         return JSONResponse({"error": "the selected file is empty"}, status_code=400)
     session_id = hashlib.sha256(f"{name}|{size}|{fingerprint}".encode()).hexdigest()[:24]
     partial, meta_path = upload_session_paths(session_id)
+    meta: Optional[dict[str, Any]] = None
     if meta_path.exists():
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if meta.get("name") == name and int(meta.get("size", -1)) == size:
-                return JSONResponse({"session": session_id, "offset": partial.stat().st_size})
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            if existing.get("name") == name and int(existing.get("size", -1)) == size:
+                meta = existing
         except Exception:
-            pass
+            meta = None
+    received = 0
+    if meta is not None:
+        # Whatever this process still remembers beats the figure on disk, which
+        # is written only every couple of seconds so that a fast link is not
+        # paying for a JSON rewrite between chunks.
+        received = min(max(int(meta.get("received") or 0), _upload_received(session_id)), size)
+    else:
+        meta = {"name": name, "size": size, "fingerprint": fingerprint,
+                "created_at": utc_now()}
+        _forget_upload_session(session_id)
+        log.info("phone transfer started: %s (%d bytes) session=%s", name, size, session_id)
     meta_path.parent.mkdir(parents=True, exist_ok=True)
-    partial.touch(exist_ok=True)
-    atomic_write_json(meta_path, {
-        "name": name, "size": size, "fingerprint": fingerprint,
-        "created_at": utc_now(), "updated_at": utc_now(),
+    # Lay the file out at full length up front: chunks are written into their
+    # own place, so the space has to exist before they land.
+    with open(partial, "r+b" if partial.exists() else "wb") as handle:
+        handle.truncate(size)
+    with _UPLOAD_LOCK:
+        _UPLOAD_RANGES[session_id] = [[0, received]] if received else []
+    meta["received"] = received
+    meta["updated_at"] = utc_now()
+    atomic_write_json(meta_path, meta)
+    return JSONResponse({
+        "session": session_id, "offset": received,
+        "chunk_max": UPLOAD_CHUNK_MAX_BYTES,
     })
-    log.info("phone transfer started: %s (%d bytes) session=%s", name, size, session_id)
-    return JSONResponse({"session": session_id, "offset": partial.stat().st_size})
 
 
 @app.post("/upload/chunk/{session_id}")
@@ -4044,28 +4221,24 @@ async def upload_chunk(session_id: str, request: Request) -> JSONResponse:
     try:
         partial, meta_path = upload_session_paths(session_id)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        confirmed = partial.stat().st_size
+        size = int(meta["size"])
         offset = int(request.headers.get("x-upload-offset", "-1"))
-        if offset != confirmed:
+        if offset < 0 or offset > size:
             return JSONResponse(
-                {"error": "upload offset changed", "offset": confirmed}, status_code=409
+                {"error": "upload offset is outside the file",
+                 "offset": _upload_received(session_id)}, status_code=409,
             )
         data = bytearray()
         async for piece in request.stream():
             data.extend(piece)
             if len(data) > UPLOAD_CHUNK_MAX_BYTES:
                 return JSONResponse({"error": "upload chunk is too large"}, status_code=413)
-        if confirmed + len(data) > int(meta["size"]):
+        if offset + len(data) > size:
             return JSONResponse({"error": "upload exceeds declared file size"}, status_code=400)
-        with open(partial, "ab") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        meta["updated_at"] = utc_now()
-        atomic_write_json(meta_path, meta)
-        log.info("phone transfer progress: session=%s offset=%d/%d",
-                 session_id, confirmed + len(data), int(meta["size"]))
-        return JSONResponse({"offset": confirmed + len(data)})
+        if data:
+            await asyncio.to_thread(_write_chunk_at, partial, offset, bytes(data))
+        received = _record_chunk(session_id, offset, offset + len(data), meta_path, meta)
+        return JSONResponse({"offset": received, "end": offset + len(data)})
     except FileNotFoundError:
         return JSONResponse({"error": "upload session expired"}, status_code=404)
     except Exception as exc:
@@ -4079,17 +4252,22 @@ def finish_upload(payload: dict = Body(...)) -> JSONResponse:
         session_id = str(payload.get("session", ""))
         partial, meta_path = upload_session_paths(session_id)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        received = partial.stat().st_size
+        received = max(_upload_received(session_id), int(meta.get("received") or 0))
         if received != int(meta["size"]):
             return JSONResponse(
                 {"error": "upload is incomplete", "offset": received}, status_code=409
             )
+        # One flush to disk for the whole transfer instead of one per chunk.
+        with open(partial, "rb+") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
         name = Path(meta["name"]).name
         project_dir = next_project_directory()
         extension = Path(name).suffix
         dest = project_dir / "media" / f"original{extension}"
         os.replace(partial, dest)
-        shutil.rmtree(meta_path.parent)
+        shutil.rmtree(meta_path.parent, ignore_errors=True)
+        _forget_upload_session(session_id)
         log.info("phone transfer finalized: session=%s -> %s", session_id, dest)
         return JSONResponse({"path": str(dest), "project": project_dir.name, "source_filename": name})
     except FileNotFoundError:
@@ -4101,11 +4279,13 @@ def finish_upload(payload: dict = Body(...)) -> JSONResponse:
 @app.post("/upload/cancel")
 def cancel_upload(payload: dict = Body(...)) -> JSONResponse:
     try:
-        partial, meta_path = upload_session_paths(str(payload.get("session", "")))
+        session_id = str(payload.get("session", ""))
+        partial, meta_path = upload_session_paths(session_id)
         transfer_dir = meta_path.parent.resolve()
         transfer_dir.relative_to(INCOMING_DIR.resolve())
         if transfer_dir.exists():
-            shutil.rmtree(transfer_dir)
+            shutil.rmtree(transfer_dir, ignore_errors=True)
+        _forget_upload_session(session_id)
         log.info("phone transfer cancelled: %s", transfer_dir.name)
         return JSONResponse({"ok": True})
     except ValueError as exc:
@@ -5052,6 +5232,9 @@ def main() -> None:
     print()
     log.info("RETAKE listening on %s", local_url)
 
+    # Measured at ~540 MB/s of request body against ~440 for the proactor loop,
+    # so the selector loop is both the faster and the disconnect-safe choice; a
+    # slow transfer is never this loop's fault.
     if os.name == "nt" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
