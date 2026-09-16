@@ -1069,7 +1069,7 @@ def test_transfer_waits_for_the_tab_instead_of_burning_retries() -> None:
     # ...and only after a chunk has already failed. A working link is never
     # made to wait for the tab to become visible.
     assert html.count("await whenRunnable();") == 1
-    assert "resuming automatically" in html
+    assert "· retrying (" in html
     # The old dead ends are gone.
     assert "Transfer paused safely on the laptop" not in html
     assert "connection kept dropping after" not in html
@@ -1115,6 +1115,81 @@ def test_transfer_fills_the_link_with_several_connections() -> None:
     # Lanes must stay under the browser's six-connections-per-host limit, or
     # status polling starves behind the transfer.
     assert retake.UPLOAD_CHUNK_MAX_BYTES >= 8 * 1024 * 1024
+
+
+def test_no_step_of_a_transfer_can_wait_forever() -> None:
+    """A transfer stalled at zero bytes with no error was the whole failure.
+
+    fetch settles when the reply arrives and reports nothing before then, so a
+    request whose body stopped moving never resolves and never rejects. Every
+    recovery path -- the retry ladder, the five-minute limit, the eviction
+    probe -- lives in a `catch`, so none of them could run for the one failure
+    that actually happened. Both halves of a chunk now carry a deadline.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function readSlice(file, offset, end)" in html
+    assert "function sendChunk(session, offset, body, signal, onProgress)" in html
+    # Reading is given a long leash: a phone exporting a gigabyte out of its
+    # photo library is not a fault. Sending is not, because once bytes are
+    # moving, half a minute of silence means they have stopped.
+    assert "const UPLOAD_READ_LIMIT_MS = 3 * 60 * 1000;" in html
+    assert "const UPLOAD_SILENCE_LIMIT_MS = 30 * 1000;" in html
+    # Each deadline must actually abandon its operation, not just complain.
+    assert "reader.abort();" in html
+    assert "xhr.abort();" in html
+
+
+def test_a_chunk_is_read_before_it_is_sent_not_during() -> None:
+    """Handing fetch a lazy Blob put the file read inside the request.
+
+    It is the better shape on paper -- the chunk never exists twice and the
+    send starts on the first block rather than the last -- but a read that
+    never finishes then becomes a request that never settles. Reading first
+    keeps a phone that cannot produce its own bytes distinguishable from a
+    network that has gone away, and gives each its own message.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "readAsArrayBuffer(file.slice(offset, end))" in html
+    # The Blob body that made the read part of the request is gone.
+    assert "const body = file.slice(offset, end);" not in html
+    assert "body," in html
+    # A file the phone has released is diagnosed at the read, where the failure
+    # actually is, rather than inferred from a network error afterwards.
+    assert "stale.needsReselect = true;" in html
+
+
+def test_a_transfer_reports_bytes_that_are_still_on_the_wire() -> None:
+    """Counting only acknowledged chunks makes a slow start look like a dead one.
+
+    The first chunk of a large photo-library video can take tens of seconds, and
+    for all of them the progress line read zero of 1.6 GB -- identical to a
+    transfer that had stopped. XMLHttpRequest reports what has left the phone,
+    which both feeds that figure and is what the stall watchdog measures.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "xhr.upload.onprogress" in html
+    assert "const inFlight = new Map();" in html
+    assert "for (const bytes of inFlight.values()) moving += bytes;" in html
+    # And the one stretch where nothing can move says why.
+    assert "Preparing the video on your phone" in html
+
+
+def test_lanes_open_only_after_the_first_chunk_lands() -> None:
+    """Four readers on a file the phone has not finished preparing is the stall.
+
+    Until one chunk has arrived, nothing is known about the link or about
+    whether this phone can read this file at all, and opening every lane into
+    that question multiplies the wait rather than the throughput.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "const primed = new Promise((resolve) => { openTheRest = resolve; });" in html
+    assert "if (index > 0) await primed;" in html
+    # A lane 0 that fails must still release the others, or the transfer hangs
+    # in a new place instead of the old one.
+    assert html.count("if (index === 0) openTheRest();") == 2
+    # The first chunk is small, because its cost is paid before anything moves.
+    assert "const UPLOAD_FIRST_CHUNK = 512 * 1024;" in html
+    assert "chunkSize = Math.min(ceiling, UPLOAD_FIRST_CHUNK);" in html
 
 
 def test_a_locked_screen_does_not_pause_between_chunks() -> None:
@@ -2480,6 +2555,8 @@ def test_chunk_size_tracks_throughput_rather_than_wall_time() -> None:
     # The old wall-clock band is gone.
     assert "if (seconds < 1) return" not in html
     assert "if (seconds > 3) return" not in html
-    # A chunk is streamed off storage, not copied into the JS heap first.
-    assert "const body = file.slice(offset, end);" in html
+    # The send is timed on its own. Folding the read into the measurement makes
+    # a phone that is slow to hand over its own file look like a slow link.
+    assert "const startedChunk = performance.now();" in html
+    assert "const {status, data} = await sendChunk(" in html
     assert "body = await file.slice(offset, end).arrayBuffer();" not in html
