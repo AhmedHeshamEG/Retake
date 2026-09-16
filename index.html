@@ -241,6 +241,14 @@ header{
 .toggle-button{display:inline-flex;align-items:center;gap:7px}.toggle-button i{width:8px;height:8px;border-radius:50%;background:#59616d}.toggle-button[aria-pressed="true"]{border-color:#536c61;background:#17241e}.toggle-button[aria-pressed="true"] i{background:var(--ok);box-shadow:0 0 8px #42cf8288}
 #gapSettingsPanel{position:absolute;z-index:65;top:42px;left:0;width:286px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
 #gapSettingsPanel label{display:grid;grid-template-columns:1fr 76px 24px;align-items:center;gap:6px;margin:8px 0;color:var(--dim);font-size:12px}
+#gapBulkPanel{position:absolute;z-index:65;top:42px;left:0;width:300px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
+#gapBulkPanel .gap-threshold{display:grid;grid-template-columns:1fr 70px 16px;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+#gapBulkPanel .gap-threshold input{width:70px;padding:6px 7px;font-variant-numeric:tabular-nums}
+#gapLongerHint{display:block;margin:7px 0 2px;color:#747d89;font-size:11px;line-height:1.45}
+.gap-scope-actions{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid #2d3239}
+.gap-scope-actions button{display:flex;justify-content:space-between;align-items:center;width:100%;text-align:left}
+.gap-scope-actions button em{font-style:normal;color:#8d96a2;font-variant-numeric:tabular-nums}
+.gap-scope-actions button:disabled em{color:#5c636d}
 #gapSettingsPanel input{width:76px;padding:6px 7px;font-variant-numeric:tabular-nums}.gap-settings-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:11px}
 .toolbar-count{color:var(--accent);font-weight:700;white-space:nowrap}
 .find-wrap{display:flex;align-items:center;gap:8px;margin-left:auto}
@@ -370,9 +378,20 @@ header{
         <div class="group gap-tools">
           <button id="gapToggle" class="small toggle-button" aria-pressed="false"><i></i> Show gaps</button>
           <button id="gapSettingsBtn" class="small" title="Gap detection settings" disabled>⚙</button>
-          <button id="gapApply" class="small" disabled>Remove all gaps</button>
-          <button id="gapScoped" class="small" title="Prepare gaps only around speech that will remain" hidden disabled>Remove gaps in kept sentences</button>
+          <button id="gapApply" class="small" disabled>Remove gaps…</button>
           <button id="gapCancel" class="small" hidden>Cancel</button>
+          <div id="gapBulkPanel" hidden>
+            <label class="gap-threshold">Only silences longer than
+              <input id="gapLonger" type="number" min="0" max="60" step="0.1" value="0">
+              <span>s</span>
+            </label>
+            <small id="gapLongerHint">Counts every detected silence.</small>
+            <div class="gap-scope-actions">
+              <button id="gapScopeAll" class="small">Everywhere<em></em></button>
+              <button id="gapScoped" class="small" title="Silences inside sentences that still have words you are keeping">In kept sentences<em></em></button>
+              <button id="gapScopeRemoved" class="small" title="Silences inside sentences you have cut entirely">In removed sentences<em></em></button>
+            </div>
+          </div>
           <button id="gapPreview" class="small" title="Play the exact edited cut before exporting">▶ Play final cut</button>
           <span id="gapCount" class="toolbar-count">Off</span>
           <div id="gapSettingsPanel" hidden>
@@ -592,6 +611,7 @@ const S = {
   gapDetecting: false,
   gapSuggestions: new Map(),
   scopedGapIds: new Set(),
+  removedGapIds: new Set(),
   gapEditor: null,
   voiceEnhancement: {enabled:true,profile:"great",output_loudness:80,voice_leveling:25,noise_cleanup:25,original_detail:90},
   markers: [],
@@ -853,6 +873,7 @@ const saveCuts = debounce(async () => {
     S.proj.transcript_cut_intervals = result.transcript_cut_intervals || [];
     S.proj.cut_intervals = result.cut_intervals || [];
     S.scopedGapIds = new Set(result.scoped_gap_candidate_ids || []);
+    S.removedGapIds = new Set(result.removed_gap_candidate_ids || []);
     S.cutsSynced = true;
     recompute();
   } catch (e) { toast("autosave failed: " + e.message, "error"); }
@@ -932,12 +953,22 @@ function updateGapControls() {
   $("gapToggle").setAttribute("aria-pressed", String(S.showGaps));
   $("gapToggle").innerHTML = `<i></i> ${S.showGaps ? "Hide" : "Show"} gaps`;
   const analyzed = !!S.proj?.audio_gaps_analyzed;
-  const hasScopedGaps = S.audioGaps.some((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
   $("gapSettingsBtn").disabled = !S.showGaps || S.gapDetecting;
   $("gapApply").disabled = !S.showGaps || !analyzed || !S.audioGaps.length || S.gapDetecting;
-  $("gapScoped").hidden = !S.showGaps;
-  $("gapScoped").disabled = !analyzed || !hasScopedGaps || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
-  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove all gaps";
+  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove gaps…";
+  if (!S.showGaps || S.gapSuggestions.size) $("gapBulkPanel").hidden = true;
+  /* Each scope shows how many silences it would actually offer, so an empty
+     one reads as "there are none" rather than as a button that does nothing. */
+  for (const [id, scope] of [["gapScopeAll","all"],["gapScoped","kept"],["gapScopeRemoved","removed"]]) {
+    const count = analyzed ? gapsInScope(scope).length : 0;
+    const blocked = !analyzed || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
+    $(id).disabled = blocked || !count;
+    $(id).querySelector("em").textContent = count ? String(count) : "none";
+  }
+  const minimum = gapLongerThan();
+  $("gapLongerHint").textContent = minimum
+    ? `Ignores anything shorter. Detection is unchanged — the gear sets what counts as silence.`
+    : "Counts every detected silence. The gear sets what counts as silence at all.";
   $("gapCancel").hidden = !S.gapSuggestions.size;
   $("gapPreview").disabled = !S.proj || S.gapDetecting;
   $("gapCount").textContent = S.gapDetecting ? "Detecting…" : !S.showGaps ? "Off" : `${S.audioGaps.length} gap${S.audioGaps.length === 1 ? "" : "s"}`;
@@ -966,6 +997,7 @@ async function refreshGapResults() {
   S.audioGaps = S.proj.audio_gaps.map((gap) => ({...gap}));
   S.gapSettings = {...S.proj.audio_gap_settings};
   S.scopedGapIds = new Set(project.scoped_gap_candidate_ids || []);
+  S.removedGapIds = new Set(project.removed_gap_candidate_ids || []);
   if (S.cutsSynced)
     S.transcriptCutIvs = (project.transcript_cut_intervals || []).map((iv) => [...iv]);
   S.gapSuggestions.clear();
@@ -975,6 +1007,7 @@ $("gapToggle").addEventListener("click", async () => {
   S.showGaps = !S.showGaps;
   if (!S.showGaps) {
     $("gapSettingsPanel").hidden = true;
+    $("gapBulkPanel").hidden = true;
     closeGapEditor();
     clearGapSuggestions(false);
   }
@@ -984,6 +1017,15 @@ $("gapToggle").addEventListener("click", async () => {
 });
 $("gapSettingsBtn").addEventListener("click", () => {
   $("gapSettingsPanel").hidden = !$("gapSettingsPanel").hidden;
+  /* The two panels occupy the same corner, so only one is ever open. */
+  if (!$("gapSettingsPanel").hidden) $("gapBulkPanel").hidden = true;
+});
+/* Clicking away closes whichever panel is open, the way the rest of the
+   toolbar behaves. */
+document.addEventListener("click", (event) => {
+  if (event.target.closest(".gap-tools")) return;
+  $("gapBulkPanel").hidden = true;
+  $("gapSettingsPanel").hidden = true;
 });
 $("gapSettingsClose").addEventListener("click", () => {
   $("gapSettingsPanel").hidden = true;
@@ -1034,23 +1076,57 @@ $("gapApply").addEventListener("click", () => {
     toast(`Applied ${count} export gap cuts · Ctrl+Z to undo`);
     return;
   }
-  const eligible = S.audioGaps.filter((gap) => bulkBounds(gap));
+  /* No pending suggestions: open the panel and let the scope be chosen. */
+  const panel = $("gapBulkPanel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) { $("gapSettingsPanel").hidden = true; updateGapControls(); }
+});
+
+/* The length filter is deliberately separate from the detection settings in
+   the gear panel. Those decide what counts as a silence at all and re-run the
+   analysis; this one only narrows what has already been found, so it can be
+   changed freely without losing the gaps that were detected, or the manual
+   boundary edits made to them. */
+function gapLongerThan() {
+  const value = Number($("gapLonger").value);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+function gapsInScope(scope) {
+  const minimum = gapLongerThan();
+  return S.audioGaps.filter((gap) => {
+    if (!bulkBounds(gap)) return false;
+    if (gap.detected_end - gap.detected_start < minimum - .0005) return false;
+    if (scope === "kept") return S.scopedGapIds.has(gap.id);
+    if (scope === "removed") return S.removedGapIds.has(gap.id);
+    return true;
+  });
+}
+const GAP_SCOPE_LABEL = {
+  all: "anywhere in the recording",
+  kept: "in sentences that still have kept words",
+  removed: "in sentences you have cut entirely",
+};
+function reviewGapScope(scope) {
+  const eligible = gapsInScope(scope);
   if (!eligible.length) {
-    toast("No gaps are longer than the natural pause you chose"); return;
+    const minimum = gapLongerThan();
+    toast(minimum
+      ? `No silences longer than ${minimum.toFixed(2)}s ${GAP_SCOPE_LABEL[scope]}`
+      : `No removable silences ${GAP_SCOPE_LABEL[scope]}`, "warn");
+    return;
   }
   S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  $("gapBulkPanel").hidden = true;
   renderTranscript(); updateGapControls();
-  toast(`Reviewing ${eligible.length} suggested gap cuts with ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s natural pause`);
-});
-$("gapScoped").addEventListener("click", () => {
-  const eligible = S.audioGaps.filter((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
-  if (!eligible.length) {
-    toast("No removable gaps belong to sentences with kept words"); return;
-  }
-  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
-  renderTranscript(); updateGapControls();
-  toast(`Reviewing ${eligible.length} gaps from sentences that still contain kept words`);
-});
+  const minimum = gapLongerThan();
+  toast(`Reviewing ${eligible.length} silence${eligible.length === 1 ? "" : "s"}`
+    + (minimum ? ` longer than ${minimum.toFixed(2)}s` : "")
+    + ` ${GAP_SCOPE_LABEL[scope]} · ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s pause kept`);
+}
+$("gapScopeAll").addEventListener("click", () => reviewGapScope("all"));
+$("gapScoped").addEventListener("click", () => reviewGapScope("kept"));
+$("gapScopeRemoved").addEventListener("click", () => reviewGapScope("removed"));
+$("gapLonger").addEventListener("input", updateGapControls);
 function clearGapSuggestions(render = true) {
   S.gapSuggestions.clear();
   if (render && S.proj) renderTranscript();
@@ -1900,11 +1976,28 @@ const UPLOAD_LANES = 4;
 const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
 
 /* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
-   Aim for a second or two per chunk and let the link decide the size. */
+   Size each chunk so it spends about UPLOAD_TARGET_S on the wire.
+
+   The previous version compared one chunk's wall time against a fixed one-to-
+   three second band, which is the wrong measurement once there are several
+   lanes: four chunks in flight share the link, so each one takes roughly four
+   times as long as it would alone, and every chunk looked "too slow". The size
+   was then halved, and halved again, down to the 256 KB floor -- so the slower
+   the link, the smaller the chunks, and the more of the transfer went on
+   per-chunk overhead instead of data. Measuring observed throughput and
+   sizing from that is stable under any number of lanes. */
+const UPLOAD_TARGET_S = 2;
 function nextChunkSize(current, seconds) {
-  if (seconds < 1) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
-  if (seconds > 3) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
-  return current;
+  if (!(seconds > 0)) return current;
+  /* What this lane actually achieved. Because it is this lane's own share of
+     the link, it already accounts for however many lanes are running. */
+  const laneBytesPerSecond = current / seconds;
+  const ideal = laneBytesPerSecond * UPLOAD_TARGET_S;
+  /* Move a third of the way toward the estimate so one unlucky chunk cannot
+     swing the size, and never more than double or half in one step. */
+  const eased = current + (ideal - current) / 3;
+  const bounded = Math.max(current / 2, Math.min(current * 2, eased));
+  return Math.max(UPLOAD_MIN_CHUNK, Math.min(UPLOAD_MAX_CHUNK, Math.round(bounded)));
 }
 
 /* Sends one file over several connections at once. Each chunk carries the
@@ -1941,21 +2034,34 @@ async function runTransfer(file, descriptor) {
       while (!sent && !failure) {
         try {
           const startedChunk = performance.now();
-          /* Read before sending. A phone that evicted the tab can hand back a
-             File whose bytes are gone, and reading it here says so plainly
-             instead of looking like ten minutes of network trouble. */
-          let body;
+          /* Hand fetch the Blob slice rather than an ArrayBuffer of it. The
+             browser streams it off the phone's storage as it sends, so a chunk
+             never has to exist twice -- once in the JS heap and once in the
+             request. On a phone sending 8 MB chunks over four lanes that is
+             32 MB of heap that simply is not allocated any more, and the send
+             starts on the first block read instead of after the last one. */
+          const body = file.slice(offset, end);
+          let response;
           try {
-            body = await file.slice(offset, end).arrayBuffer();
-          } catch {
-            const stale = new Error("the phone released this file while the screen was off");
-            stale.needsReselect = true;
-            throw stale;
+            response = await fetch(`/upload/chunk/${S.uploadSession}`, {
+              method:"POST", headers:{"X-Upload-Offset":String(offset)}, body,
+              signal:S.uploadAbort.signal,
+            });
+          } catch (sendError) {
+            /* A phone that evicted the tab hands back a File whose bytes are
+               gone. Reading one byte says which of the two this is, so a dead
+               file does not look like ten minutes of network trouble. */
+            if (sendError.name !== "AbortError") {
+              try {
+                await file.slice(offset, Math.min(end, offset + 1)).arrayBuffer();
+              } catch {
+                const stale = new Error("the phone released this file while the screen was off");
+                stale.needsReselect = true;
+                throw stale;
+              }
+            }
+            throw sendError;
           }
-          const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
-            method:"POST", headers:{"X-Upload-Offset":String(offset)}, body,
-            signal:S.uploadAbort.signal,
-          });
           let data = {};
           try { data = await response.json(); } catch (_) {}
           if (response.status === 404) {
@@ -1966,7 +2072,10 @@ async function runTransfer(file, descriptor) {
             throw gone;
           }
           if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-          chunkSize = Math.min(ceiling, nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000));
+          chunkSize = Math.min(
+            ceiling,
+            nextChunkSize(end - offset, (performance.now() - startedChunk) / 1000),
+          );
           acked += end - offset; sent = true;
           report();
         } catch (error) {
@@ -2103,6 +2212,7 @@ async function loadProject() {
   S.cut = new Set(P.tokens.filter((t) => t.cut).map((t) => t.id));
   S.transcriptCutIvs = (P.transcript_cut_intervals || []).map((iv) => [...iv]);
   S.scopedGapIds = new Set(P.scoped_gap_candidate_ids || []);
+  S.removedGapIds = new Set(P.removed_gap_candidate_ids || []);
   S.cutsSynced = true; S.cutRevision = 0;
   S.showGaps = false;
   S.audioGaps = (P.audio_gaps || []).map((gap) => ({...gap}));

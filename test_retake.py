@@ -1726,10 +1726,27 @@ def test_alignment_job_backs_up_and_publishes_without_changing_edits() -> None:
             retake.run_forced_alignment = old_runner
 
 
-def test_future_transcription_enables_vad_and_forced_alignment_contract() -> None:
+def test_transcription_is_configured_for_completeness_not_speed() -> None:
+    """Nothing may be dropped before the transcript exists.
+
+    The VAD used to run ahead of Whisper and delete what it judged non-speech,
+    so a softly begun sentence never reached the model; the turbo model and
+    int8 quantization then cost accuracy on what did. Each of these is what
+    keeps whole sentences from going missing, so each is pinned here.
+    """
     source = Path(retake.__file__).read_text(encoding="utf-8")
-    assert "vad_filter=True" in source
-    assert 'vad_parameters={"min_silence_duration_ms": 200}' in source
+    assert "vad_filter=False" in source, "pre-Whisper VAD drops whole sentences"
+    assert "vad_filter=True" not in source
+    assert '("large-v3", "cuda", "float16")' in source
+    # The comment above the list still names turbo, to say why it is gone.
+    assert '("large-v3-turbo"' not in source
+    # Whisper's own discard thresholds, loosened so a doubtful window is
+    # transcribed and left for the editor rather than silently dropped.
+    assert "no_speech_threshold=0.92" in source
+    assert "log_prob_threshold=-2.0" in source
+    assert "beam_size=10" in source
+    # Still decoded window by window, so a long take cannot inherit a
+    # neighbour's mistake and loop on it.
     assert "condition_on_previous_text=False" in source
     assert "run_forced_alignment(" in source
 
@@ -2248,3 +2265,221 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {fn.__name__}")
     print(f"\n{len(fns)} tests passed.")
+
+
+# ---------------------------------------------------------------------------
+# Display orientation
+# ---------------------------------------------------------------------------
+
+def test_every_display_matrix_orientation_maps_to_one_filter_chain() -> None:
+    """All eight orientations, including the four that carry a reflection.
+
+    The filter chains below were each verified against FFmpeg's own autorotate
+    output on a generated file carrying that exact matrix.
+    """
+    assert len(retake._DISPLAY_MATRIX_ORIENTATION) == 8
+    assert set(retake._DISPLAY_MATRIX_ORIENTATION.values()) == {
+        (rotation, mirrored)
+        for rotation in (0, 90, 180, 270)
+        for mirrored in (False, True)
+    }
+    assert set(retake._ORIENTATION_FILTERS) == set(
+        retake._DISPLAY_MATRIX_ORIENTATION.values()
+    )
+    assert retake._ORIENTATION_FILTERS[(0, False)] == []
+    assert retake._ORIENTATION_FILTERS[(0, True)] == ["hflip"]
+    assert retake._ORIENTATION_FILTERS[(180, False)] == ["hflip", "vflip"]
+    assert retake._ORIENTATION_FILTERS[(180, True)] == ["vflip"]
+    assert retake._ORIENTATION_FILTERS[(90, True)] == ["transpose=clock_flip"]
+    assert retake._ORIENTATION_FILTERS[(270, True)] == ["transpose=cclock_flip"]
+
+
+def _matrix(a: int, b: int, c: int, d: int) -> dict[str, str]:
+    unit = 65536
+    return {
+        "displaymatrix":
+            f"\n00000000: {a * unit} {b * unit} 0"
+            f"\n00000001: {c * unit} {d * unit} 0"
+            f"\n00000002: 0 0 1073741824\n"
+    }
+
+
+def test_a_mirror_is_never_mistaken_for_a_half_turn() -> None:
+    """The bug that left phone footage mirrored, or upside down.
+
+    ffprobe derives its scalar `rotation` with atan2, which is undefined under
+    reflection: a pure horizontal mirror and a true 180 rotation both report
+    -180, and a vertical flip reports 0. Reading that number alone applied a
+    half turn to a mirrored clip, and nothing at all to a flipped one.
+    """
+    half_turn = _matrix(-1, 0, 0, -1)
+    mirror = _matrix(-1, 0, 0, 1)
+    vertical = _matrix(1, 0, 0, -1)
+    # The two the scalar cannot tell apart.
+    half_turn["rotation"] = mirror["rotation"] = -180
+    vertical["rotation"] = 0
+
+    assert retake.parse_display_matrix(half_turn) == (180, False)
+    assert retake.parse_display_matrix(mirror) == (0, True)
+    assert retake.parse_display_matrix(vertical) == (180, True)
+
+    def filters(side_data: dict[str, str]) -> list[str]:
+        rotation, mirrored = retake.stream_orientation({"side_data_list": [side_data]})
+        return retake._orientation_normalization_filters(
+            {"rotation": rotation, "mirrored": mirrored}
+        )
+
+    assert filters(half_turn) == ["hflip", "vflip"]
+    assert filters(mirror) == ["hflip"]
+    # Reported as rotation 0, so the old code emitted no filter and the export
+    # came out upside down.
+    assert filters(vertical) == ["vflip"]
+
+
+def test_display_matrix_beats_the_legacy_rotate_tag() -> None:
+    """Only the matrix can describe a mirror, so it wins where both exist."""
+    stream = {"tags": {"rotate": "90"}, "side_data_list": [_matrix(-1, 0, 0, 1)]}
+    assert retake.stream_orientation(stream) == (0, True)
+    # With no matrix the tag is all there is, and it can never mean a mirror.
+    assert retake.stream_orientation({"tags": {"rotate": "270"}}) == (270, False)
+    assert retake.stream_orientation({}) == (0, False)
+    # A malformed matrix must not silently become "upright".
+    assert retake.parse_display_matrix({"displaymatrix": "nonsense"}) is None
+
+
+def test_a_mirror_does_not_change_display_dimensions() -> None:
+    portrait = {"width": 1920, "height": 1080, "rotation": 270, "mirrored": True}
+    assert retake.display_dimensions(portrait) == (1080, 1920)
+    upright = {"width": 1920, "height": 1080, "rotation": 180, "mirrored": True}
+    assert retake.display_dimensions(upright) == (1920, 1080)
+
+
+def test_proxy_integrity_rejects_a_surviving_mirror() -> None:
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    assert "proxy display matrix still carries a mirror" in source
+
+
+# ---------------------------------------------------------------------------
+# Gap scopes and the length filter
+# ---------------------------------------------------------------------------
+
+def _gap_project() -> dict[str, Any]:
+    """Two sentences: the first kept, the second cut away entirely."""
+    return {
+        "duration_s": 30.0,
+        "tokens": [
+            {"id": 0, "kind": "word", "text": "one", "start": 1.0, "end": 2.0,
+             "seg": 0, "cut": False},
+            {"id": 1, "kind": "word", "text": "two", "start": 6.0, "end": 7.0,
+             "seg": 0, "cut": False},
+            {"id": 2, "kind": "word", "text": "three", "start": 15.0, "end": 16.0,
+             "seg": 1, "cut": True},
+            {"id": 3, "kind": "word", "text": "four", "start": 20.0, "end": 21.0,
+             "seg": 1, "cut": True},
+        ],
+        "segments": [
+            {"id": 0, "start": 1.0, "end": 7.0, "text": "one two"},
+            {"id": 1, "start": 15.0, "end": 21.0, "text": "three four"},
+        ],
+        "audio_gaps": [
+            # Inside the kept sentence: removing it really does shorten the cut.
+            {"id": "agap-1", "detected_start": 2.0, "detected_end": 6.0,
+             "start": 2.0, "end": 6.0, "cut": False, "manual": False},
+            # Inside the sentence that is cut away: already inside the cut.
+            {"id": "agap-2", "detected_start": 16.0, "detected_end": 20.0,
+             "start": 16.0, "end": 20.0, "cut": False, "manual": False},
+        ],
+    }
+
+
+def test_gap_scopes_separate_kept_speech_from_removed_speech() -> None:
+    partition = retake.partition_gap_candidates(_gap_project())
+    assert partition["kept"] == ["agap-1"]
+    assert partition["removed"] == ["agap-2"]
+    # Every detected gap lands in exactly one scope.
+    assert sorted(partition["kept"] + partition["removed"]) == ["agap-1", "agap-2"]
+    # The old single-scope helper still answers for the existing UI contract.
+    assert retake.scoped_gap_candidate_ids(_gap_project()) == ["agap-1"]
+
+
+def test_both_gap_scopes_reach_the_browser() -> None:
+    payload = retake.project_response_payload(_gap_project())
+    assert payload["scoped_gap_candidate_ids"] == ["agap-1"]
+    assert payload["removed_gap_candidate_ids"] == ["agap-2"]
+    # The payload must not mutate the project it describes.
+    assert "removed_gap_candidate_ids" not in _gap_project()
+
+
+def test_gap_length_filter_is_separate_from_detection_settings() -> None:
+    """Narrowing what is offered must not re-run detection.
+
+    The gear panel decides what counts as a silence at all and re-analyses the
+    audio; the length filter only narrows what has already been found, so it
+    cannot discard detected gaps or the manual boundary edits made to them.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert 'id="gapLonger"' in html
+    assert "function gapLongerThan()" in html
+    assert "function gapsInScope(scope)" in html
+    # It filters on the detector's own evidence, never on the edited bounds.
+    assert "gap.detected_end - gap.detected_start < minimum" in html
+    # All three scopes are offered, and each reports its own count.
+    for control in ("gapScopeAll", "gapScoped", "gapScopeRemoved"):
+        assert f'id="{control}"' in html
+    assert "removed_gap_candidate_ids" in html
+    # Changing the filter must not call the detection endpoint.
+    assert '$("gapLonger").addEventListener("input", updateGapControls)' in html
+
+
+# ---------------------------------------------------------------------------
+# Phone transfer
+# ---------------------------------------------------------------------------
+
+def test_a_transfer_opens_its_file_and_reads_its_descriptor_once() -> None:
+    """Per-chunk disk work is what a lane actually spends its time on.
+
+    Re-reading the session JSON and reopening the partial file on every chunk
+    put two synchronous disk operations on the event loop per chunk, which
+    every lane then queued behind.
+    """
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    chunk = source[source.index('@app.post("/upload/chunk/{session_id}")'):]
+    chunk = chunk[:chunk.index("@app.post(\"/upload/finish\")")]
+    assert "_UPLOAD_META" in chunk, "the descriptor should be served from memory"
+    assert "meta_path.read_text" in chunk  # only as the cold-start fallback
+    assert chunk.count("meta_path.read_text") == 1
+    assert "open(partial" not in chunk, "the session's file stays open"
+    # The shared handle is positional, so lanes never reorder one another.
+    assert "def _write_chunk_at(session_id: str, path: Path" in source
+    assert "handle.seek(offset)" in source
+
+
+def test_a_transfer_releases_its_handle_before_the_file_moves() -> None:
+    """Windows will not rename or unlink a file that is still open."""
+    source = Path(retake.__file__).read_text(encoding="utf-8")
+    finish = source[source.index('@app.post("/upload/finish")'):]
+    finish = finish[:finish.index('@app.post("/upload/cancel")')]
+    assert finish.index("_close_upload_handle") < finish.index("os.replace")
+    cancel = source[source.index('@app.post("/upload/cancel")'):]
+    cancel = cancel[:cancel.index('@app.api_route("/media"')]
+    assert cancel.index("_forget_upload_session") < cancel.index("shutil.rmtree")
+    assert "_close_upload_handle(session_id)" in source
+
+
+def test_chunk_size_tracks_throughput_rather_than_wall_time() -> None:
+    """The sizer must not shrink just because lanes share the link.
+
+    Comparing one chunk's wall time against a fixed band meant that with four
+    lanes in flight every chunk looked too slow, so the size was halved to the
+    floor -- the slower the link, the more of it went on per-chunk overhead.
+    """
+    html = Path(retake.INDEX_HTML).read_text(encoding="utf-8")
+    assert "function nextChunkSize(current, seconds)" in html
+    assert "const laneBytesPerSecond = current / seconds;" in html
+    assert "UPLOAD_TARGET_S" in html
+    # The old wall-clock band is gone.
+    assert "if (seconds < 1) return" not in html
+    assert "if (seconds > 3) return" not in html
+    # A chunk is streamed off storage, not copied into the JS heap first.
+    assert "const body = file.slice(offset, end);" in html
+    assert "body = await file.slice(offset, end).arrayBuffer();" not in html

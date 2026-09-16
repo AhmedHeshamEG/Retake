@@ -271,10 +271,10 @@ word always splits the cut, and kept speech is never entered.
 - **Word click vs. seek**: the spec binds plain click to both "toggle strike" and "seek there". Plain click toggles the cut (the core editing loop); **Alt+click or double-click seeks**. Listed in the `?` shortcut overlay.
 - **ffprobe fallback**: `imageio-ffmpeg` ships only ffmpeg. If ffprobe isn't on PATH (or next to ffmpeg), probing falls back to parsing `ffmpeg -i` output instead of failing at startup — strictly more robust, same results.
 - **llama-cpp-python** is commented out in `requirements.txt` (it may need a compiler to build). This keeps `pip install -r requirements.txt` failure-proof; the AI feature documents its own one-line install above.
-- **Legacy gap data**: Whisper-derived gap tokens remain compatible with old
-  projects and AI instructions. The removed manual real-audio gap editor's saved
-  records are left untouched for compatibility but are intentionally inert, so
-  an invisible cut can never affect preview or export.
+- **Gap data**: Whisper-derived gap tokens remain compatible with old projects
+  and AI instructions. Measured real-audio silences are stored separately in
+  `audio_gaps`, each keeping the detector's own boundaries beside any manual
+  adjustment, so filtering or re-detecting always judges against the evidence.
 
 ## Licence
 

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "retake": {
+      "type": "stdio",
+      "command": ".venv/Scripts/python.exe",
+      "args": ["retake_mcp.py"],
+      "env": {
+        "RETAKE_URL": "http://127.0.0.1:8710"
+      }
+    }
+  }
+}

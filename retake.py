@@ -180,6 +180,89 @@ def _run(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess:
     )
 
 
+# A display matrix is a signed permutation of the frame's axes, so the eight
+# orientations a camera can record are eight exact integer sign patterns. Each
+# maps to the filter chain that bakes it into the pixels, verified against
+# FFmpeg's own autorotate output for all eight.
+#
+# ffprobe's scalar `rotation` cannot be used on its own: it is derived with
+# atan2, which is undefined under reflection, so it reports the same -180 for a
+# pure mirror and for a true 180 rotation, and reports 0 for a vertical flip.
+# Reading it alone is what left mirrored phone footage flipped or upside down.
+_DISPLAY_MATRIX_ORIENTATION: dict[tuple[int, int, int, int], tuple[int, bool]] = {
+    (1, 0, 0, 1): (0, False),
+    (-1, 0, 0, 1): (0, True),
+    (0, -1, 1, 0): (90, False),
+    (0, -1, -1, 0): (90, True),
+    (-1, 0, 0, -1): (180, False),
+    (1, 0, 0, -1): (180, True),
+    (0, 1, -1, 0): (270, False),
+    (0, 1, 1, 0): (270, True),
+}
+
+# The filters that turn each orientation into upright, un-mirrored pixels.
+_ORIENTATION_FILTERS: dict[tuple[int, bool], list[str]] = {
+    (0, False): [],
+    (0, True): ["hflip"],
+    (90, False): ["transpose=cclock"],
+    (90, True): ["transpose=clock_flip"],
+    (180, False): ["hflip", "vflip"],
+    (180, True): ["vflip"],
+    (270, False): ["transpose=clock"],
+    (270, True): ["transpose=cclock_flip"],
+}
+
+
+def parse_display_matrix(side_data: dict[str, Any]) -> Optional[tuple[int, bool]]:
+    """Decode one display matrix into ``(rotation, mirrored)``, or None.
+
+    The matrix is printed by ffprobe as three rows of three fixed-point
+    integers. Only the signs of the top-left 2x2 block matter: together they
+    identify which of the eight orientations the stream carries, including
+    whether it contains a reflection, which the scalar `rotation` field loses.
+    """
+    text = side_data.get("displaymatrix")
+    if not isinstance(text, str):
+        return None
+    rows: list[list[int]] = []
+    for line in text.strip().splitlines():
+        _, _, values = line.partition(":")
+        try:
+            rows.append([int(value) for value in values.split()])
+        except ValueError:
+            return None
+    if len(rows) < 2 or len(rows[0]) < 2 or len(rows[1]) < 2:
+        return None
+    signs = tuple(
+        (value > 0) - (value < 0)
+        for value in (rows[0][0], rows[0][1], rows[1][0], rows[1][1])
+    )
+    return _DISPLAY_MATRIX_ORIENTATION.get(signs)
+
+
+def stream_orientation(stream: dict[str, Any]) -> tuple[int, bool]:
+    """``(rotation, mirrored)`` for one ffprobe video stream.
+
+    The display matrix is authoritative because it is the only source that
+    records a reflection. The legacy `rotate` tag is consulted only when no
+    matrix is present, and can never describe a mirror.
+    """
+    for side_data in stream.get("side_data_list", []) or []:
+        orientation = parse_display_matrix(side_data)
+        if orientation is not None:
+            return orientation
+    for side_data in stream.get("side_data_list", []) or []:
+        if side_data.get("rotation") is not None:
+            try:
+                return int(float(side_data["rotation"])) % 360, False
+            except (TypeError, ValueError):
+                return 0, False
+    try:
+        return int(float(stream.get("tags", {}).get("rotate") or 0)) % 360, False
+    except (TypeError, ValueError):
+        return 0, False
+
+
 def probe_media(path: str) -> dict[str, Any]:
     """Return media properties needed by preview and export verification.
 
@@ -200,7 +283,7 @@ def probe_media(path: str) -> dict[str, Any]:
         duration = float(data.get("format", {}).get("duration") or 0.0)
         vcodec = acodec = None
         width = height = sample_rate = channels = None
-        rotation = 0
+        rotation, mirrored = 0, False
         video_streams = audio_streams = 0
         fps = 25.0
         for s in data.get("streams", []):
@@ -213,14 +296,7 @@ def probe_media(path: str) -> dict[str, Any]:
                     vcodec = s.get("codec_name")
                     width = s.get("width")
                     height = s.get("height")
-                    try:
-                        rotation = int(s.get("tags", {}).get("rotate") or 0)
-                        for side_data in s.get("side_data_list", []):
-                            if side_data.get("rotation") is not None:
-                                rotation = int(side_data["rotation"])
-                                break
-                    except (TypeError, ValueError):
-                        rotation = 0
+                    rotation, mirrored = stream_orientation(s)
                     rate = s.get("r_frame_rate") or "25/1"
                     try:
                         fps = float(Fraction(rate)) or 25.0
@@ -241,7 +317,7 @@ def probe_media(path: str) -> dict[str, Any]:
             "duration_s": duration, "container": container, "vcodec": vcodec,
             "acodec": acodec, "has_video": vcodec is not None, "fps": fps,
             "width": width, "height": height, "sample_rate": sample_rate,
-            "channels": channels, "rotation": rotation,
+            "channels": channels, "rotation": rotation, "mirrored": mirrored,
             "video_streams": video_streams,
             "audio_streams": audio_streams,
         }
@@ -264,7 +340,7 @@ def probe_media(path: str) -> dict[str, Any]:
         "has_video": vm is not None,
         "fps": float(fm.group(1)) if fm else 25.0,
         "width": None, "height": None, "sample_rate": None, "channels": None,
-        "rotation": 0,
+        "rotation": 0, "mirrored": False,
         "video_streams": 1 if vm else 0, "audio_streams": 1 if am else 0,
     }
 
@@ -687,8 +763,17 @@ def cut_intervals_from_tokens(proj: dict[str, Any]) -> list[tuple[float, float]]
     return merge_intervals(transcript_cuts + gap_cuts)
 
 
-def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
-    """Return gaps near kept speech, without changing transcript timestamps."""
+def partition_gap_candidates(proj: dict[str, Any]) -> dict[str, list[str]]:
+    """Split every detected gap by the speech it belongs to.
+
+    ``kept`` holds gaps inside a sentence that still has at least one kept word,
+    plus the gaps between sentences that no cut already covers -- the ones whose
+    removal actually shortens the edit. ``removed`` holds the rest: gaps inside
+    sentences whose every word is cut, and gaps already swallowed by a cut.
+    Cutting those changes nothing on its own, because the surrounding cut has
+    claimed them already, so the two sets are reported separately rather than
+    letting one button silently stand for both.
+    """
     segment_words: dict[Any, list[tuple[float, float, bool]]] = {}
     for token in proj.get("tokens", []):
         if token.get("kind") != "word" or "seg" not in token:
@@ -735,10 +820,18 @@ def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
                 for cut_start, cut_end in word_cuts
             )
         gap_id = str(gap.get("id", ""))
-        if eligible and gap_id:
-            candidates.append((start, gap_id))
+        if gap_id:
+            candidates.append((start, gap_id, eligible))
     candidates.sort(key=lambda item: (item[0], item[1]))
-    return [gap_id for _start, gap_id in candidates]
+    return {
+        "kept": [gap_id for _start, gap_id, ok in candidates if ok],
+        "removed": [gap_id for _start, gap_id, ok in candidates if not ok],
+    }
+
+
+def scoped_gap_candidate_ids(proj: dict[str, Any]) -> list[str]:
+    """Gaps whose removal shortens the edit. Kept for the existing UI contract."""
+    return partition_gap_candidates(proj)["kept"]
 
 
 def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
@@ -752,7 +845,9 @@ def project_response_payload(proj: dict[str, Any]) -> dict[str, Any]:
         proj.get("tokens", []), **params
     )
     payload["cut_intervals"] = cut_intervals_from_tokens(proj)
-    payload["scoped_gap_candidate_ids"] = scoped_gap_candidate_ids(proj)
+    partition = partition_gap_candidates(proj)
+    payload["scoped_gap_candidate_ids"] = partition["kept"]
+    payload["removed_gap_candidate_ids"] = partition["removed"]
     payload["voice_enhancement"] = validate_voice_enhancement(
         proj.get("voice_enhancement")
     )
@@ -1804,7 +1899,7 @@ def find_clusters(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 def transcribe_job(media_path: str, requested_language: Optional[str] = None) -> None:
-    """Probe → whisper (GPU turbo → CPU small fallback) → tokens → colors → save."""
+    """Probe → whisper (large-v3, GPU then CPU) → tokens → colors → save."""
     try:
         set_status("probe", 2, "probing media")
         probe = probe_media(media_path)
@@ -1814,9 +1909,16 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
 
         from faster_whisper import WhisperModel  # heavy: import inside the job
 
+        # Accuracy first, deliberately. `large-v3-turbo` keeps four decoder
+        # layers where `large-v3` has thirty-two, and it is the layers that
+        # recover a quiet or slurred phrase; int8_float16 then quantized what
+        # was left. Between them they were dropping whole sentences. The full
+        # model in float16 needs about 3.1 GB, which fits the card with room
+        # for the aligner that runs after it, and the CPU fallback keeps the
+        # same weights rather than trading them for speed.
         attempts = [
-            ("large-v3-turbo", "cuda", "int8_float16"),
-            ("large-v3-turbo", "cpu", "int8"),
+            ("large-v3", "cuda", "float16"),
+            ("large-v3", "cpu", "int8"),
         ]
         fw_segments: list[dict[str, Any]] = []
         language = "en"
@@ -1833,8 +1935,28 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                 )
                 set_status("transcribe", 4, f"transcribing with {model_name} ({device})")
                 seg_iter, info = model.transcribe(
-                    media_path, word_timestamps=True, vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 200},
+                    media_path, word_timestamps=True,
+                    # The VAD used to run *before* Whisper and delete anything
+                    # it judged non-speech, so a sentence begun softly or
+                    # trailing off never reached the model at all and could
+                    # not appear in the transcript. Whisper does its own
+                    # 30-second windowing over the whole file, so nothing is
+                    # gained by pre-trimming it and a whole sentence is what
+                    # is risked. Dead air is found later, by measurement.
+                    vad_filter=False,
+                    # Whisper's own two ways of discarding a window. The
+                    # defaults (0.6 / -1.0) throw away quiet or hesitant
+                    # speech along with true silence; loosened, a doubtful
+                    # window is transcribed and left for the editor to judge
+                    # rather than silently dropped.
+                    no_speech_threshold=0.92,
+                    log_prob_threshold=-2.0,
+                    # A wider beam is the one decoding knob that buys accuracy
+                    # outright. It costs time, which this pass is allowed.
+                    beam_size=10,
+                    # Each window is decoded on its own. This is what keeps a
+                    # long improvised take from inheriting a neighbour's
+                    # mistake and looping on it.
                     condition_on_previous_text=False,
                     language=requested_language or None,
                 )
@@ -2855,26 +2977,32 @@ AUDIO_CODEC_MAP: dict[str, list[str]] = {
     "vorbis": ["-c:a", "libvorbis", "-q:a", "5"],
     "flac": ["-c:a", "flac"],
 }
+def _normalized_orientation(properties: dict[str, Any]) -> tuple[int, bool]:
+    """``(rotation, mirrored)`` from stored properties, snapped to a quarter turn."""
+    try:
+        rotation = int(round(float(properties.get("rotation") or 0) / 90.0)) * 90 % 360
+    except (TypeError, ValueError):
+        rotation = 0
+    return rotation, bool(properties.get("mirrored"))
+
+
 def display_dimensions(properties: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
     """Dimensions as a player displays them after applying rotation metadata."""
     width, height = properties.get("width"), properties.get("height")
-    rotation = int(properties.get("rotation") or 0) % 360
+    rotation, _mirrored = _normalized_orientation(properties)
     if rotation in (90, 270):
         return height, width
     return width, height
 
 
 def _orientation_normalization_filters(properties: dict[str, Any]) -> list[str]:
-    """Bake source display rotation into pixels, leaving no rotation metadata."""
-    rotation = int(properties.get("rotation") or 0) % 360
-    if rotation == 90:
-        # FFprobe's display-matrix sign is opposite FFmpeg's transpose filter.
-        return ["transpose=cclock"]
-    if rotation == 270:
-        return ["transpose=clock"]
-    if rotation == 180:
-        return ["hflip", "vflip"]
-    return []
+    """Bake the source's display orientation into pixels, leaving no metadata.
+
+    A mirror is part of that orientation. Handling only the rotation turned a
+    mirrored recording into an upside-down one, because the pure reflection a
+    phone writes reports the same scalar rotation as a true half turn.
+    """
+    return list(_ORIENTATION_FILTERS.get(_normalized_orientation(properties), []))
 
 
 def _audio_codec_args(acodec: Optional[str]) -> list[str]:
@@ -3365,7 +3493,7 @@ def _preview_video_filter(
     device: str = "gpu",
 ) -> str:
     """Scale in stored orientation, then normalize FFmpeg display rotation."""
-    rotation = int(properties.get("rotation") or 0) % 360
+    rotation, _mirrored = _normalized_orientation(properties)
     stored_width, stored_height = (
         (target_height, target_width) if rotation in (90, 270)
         else (target_width, target_height)
@@ -3471,6 +3599,8 @@ def preview_proxy_integrity_errors(
         )
     if int(output.get("rotation") or 0) % 360:
         errors.append("proxy rotation metadata was not normalized")
+    if output.get("mirrored"):
+        errors.append("proxy display matrix still carries a mirror")
     actual_duration = float(output.get("duration_s") or 0.0)
     if abs(actual_duration - expected_duration) > max(0.5, 3.0 / expected_fps):
         errors.append(
@@ -4261,6 +4391,36 @@ def upload_session_paths(session_id: str) -> tuple[Path, Path]:
 _UPLOAD_LOCK = threading.Lock()
 _UPLOAD_RANGES: dict[str, list[list[int]]] = {}
 _UPLOAD_FLUSHED: dict[str, float] = {}
+# The session descriptor and the open file, held for as long as the transfer
+# lasts. Re-reading the JSON and reopening the file once per chunk put two
+# synchronous disk operations on the event loop for every chunk that arrived,
+# which every lane then queued behind; on a link with any latency that fixed
+# cost, not the bandwidth, was what each lane spent its time on.
+_UPLOAD_META: dict[str, dict[str, Any]] = {}
+_UPLOAD_FILES: dict[str, Any] = {}
+_UPLOAD_WRITE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _upload_handle(session_id: str, path: Path) -> tuple[Any, threading.Lock]:
+    """The session's open file and its write lock, opened once per transfer."""
+    with _UPLOAD_LOCK:
+        handle = _UPLOAD_FILES.get(session_id)
+        if handle is None or handle.closed:
+            handle = open(path, "r+b", buffering=0)
+            _UPLOAD_FILES[session_id] = handle
+            _UPLOAD_WRITE_LOCKS[session_id] = threading.Lock()
+        return handle, _UPLOAD_WRITE_LOCKS[session_id]
+
+
+def _close_upload_handle(session_id: str) -> None:
+    with _UPLOAD_LOCK:
+        handle = _UPLOAD_FILES.pop(session_id, None)
+        _UPLOAD_WRITE_LOCKS.pop(session_id, None)
+    if handle is not None and not handle.closed:
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def _merged_ranges(ranges: list[list[int]]) -> list[list[int]]:
@@ -4284,14 +4444,22 @@ def _upload_received(session_id: str) -> int:
 
 
 def _forget_upload_session(session_id: str) -> None:
+    _close_upload_handle(session_id)
     with _UPLOAD_LOCK:
         _UPLOAD_RANGES.pop(session_id, None)
         _UPLOAD_FLUSHED.pop(session_id, None)
+        _UPLOAD_META.pop(session_id, None)
 
 
-def _write_chunk_at(path: Path, offset: int, data: bytes) -> None:
-    """Write one chunk where it belongs. Runs off the event loop."""
-    with open(path, "r+b") as handle:
+def _write_chunk_at(session_id: str, path: Path, offset: int, data: bytes) -> None:
+    """Write one chunk where it belongs. Runs off the event loop.
+
+    Seek and write are one critical section because the lanes share the handle;
+    the lock is held only for the write itself, which is a memory-to-page-cache
+    copy, so lanes are never waiting on the disk behind one another.
+    """
+    handle, write_lock = _upload_handle(session_id, path)
+    with write_lock:
         handle.seek(offset)
         handle.write(data)
 
@@ -4352,10 +4520,11 @@ def start_upload(payload: dict = Body(...)) -> JSONResponse:
     # own place, so the space has to exist before they land.
     with open(partial, "r+b" if partial.exists() else "wb") as handle:
         handle.truncate(size)
-    with _UPLOAD_LOCK:
-        _UPLOAD_RANGES[session_id] = [[0, received]] if received else []
     meta["received"] = received
     meta["updated_at"] = utc_now()
+    with _UPLOAD_LOCK:
+        _UPLOAD_RANGES[session_id] = [[0, received]] if received else []
+        _UPLOAD_META[session_id] = meta
     atomic_write_json(meta_path, meta)
     return JSONResponse({
         "session": session_id, "offset": received,
@@ -4367,7 +4536,14 @@ def start_upload(payload: dict = Body(...)) -> JSONResponse:
 async def upload_chunk(session_id: str, request: Request) -> JSONResponse:
     try:
         partial, meta_path = upload_session_paths(session_id)
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        with _UPLOAD_LOCK:
+            meta = _UPLOAD_META.get(session_id)
+        if meta is None:
+            # Only on the first chunk after a restart; afterwards the
+            # descriptor is served from memory.
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            with _UPLOAD_LOCK:
+                _UPLOAD_META[session_id] = meta
         size = int(meta["size"])
         offset = int(request.headers.get("x-upload-offset", "-1"))
         if offset < 0 or offset > size:
@@ -4383,7 +4559,9 @@ async def upload_chunk(session_id: str, request: Request) -> JSONResponse:
         if offset + len(data) > size:
             return JSONResponse({"error": "upload exceeds declared file size"}, status_code=400)
         if data:
-            await asyncio.to_thread(_write_chunk_at, partial, offset, bytes(data))
+            await asyncio.to_thread(
+                _write_chunk_at, session_id, partial, offset, bytes(data)
+            )
         received = _record_chunk(session_id, offset, offset + len(data), meta_path, meta)
         return JSONResponse({"offset": received, "end": offset + len(data)})
     except FileNotFoundError:
@@ -4405,6 +4583,9 @@ def finish_upload(payload: dict = Body(...)) -> JSONResponse:
                 {"error": "upload is incomplete", "offset": received}, status_code=409
             )
         # One flush to disk for the whole transfer instead of one per chunk.
+        # The shared handle has to go first: Windows will not rename a file
+        # that is still open.
+        _close_upload_handle(session_id)
         with open(partial, "rb+") as handle:
             handle.flush()
             os.fsync(handle.fileno())
@@ -4430,9 +4611,11 @@ def cancel_upload(payload: dict = Body(...)) -> JSONResponse:
         partial, meta_path = upload_session_paths(session_id)
         transfer_dir = meta_path.parent.resolve()
         transfer_dir.relative_to(INCOMING_DIR.resolve())
+        # The shared handle has to be released before the directory can go:
+        # Windows refuses to unlink a file that is still open.
+        _forget_upload_session(session_id)
         if transfer_dir.exists():
             shutil.rmtree(transfer_dir, ignore_errors=True)
-        _forget_upload_session(session_id)
         log.info("phone transfer cancelled: %s", transfer_dir.name)
         return JSONResponse({"ok": True})
     except ValueError as exc:
@@ -4575,6 +4758,7 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
         if isinstance(gt, (int, float)) and 0.05 <= gt <= 30:
             proj["gap_threshold_s"] = float(gt)
         params = cut_composition_params(proj)
+        partition = partition_gap_candidates(proj)
         response = {
             "ok": True,
             "word_cut_intervals": consecutive_word_cut_intervals(
@@ -4584,7 +4768,8 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
                 proj["tokens"], **params
             ),
             "cut_intervals": cut_intervals_from_tokens(proj),
-            "scoped_gap_candidate_ids": scoped_gap_candidate_ids(proj),
+            "scoped_gap_candidate_ids": partition["kept"],
+            "removed_gap_candidate_ids": partition["removed"],
         }
     save_current_project()
     return JSONResponse(response)
