@@ -120,6 +120,10 @@ EXPORT_SILENCE_DB_DEFAULT = -45.0
 # speech) only ever discards material ffmpeg measured as silence, so it is
 # allowed a generous budget. Moving an edge outward restores audio that cut
 # composition excluded, so it stays tightly capped.
+# The shortest dip between two words that still counts as a place to cut.
+# Edge refinement is walled in by the neighbouring words' own timings, so it
+# can look for troughs far finer than the standalone silence detector dares.
+EXPORT_TROUGH_MIN_S = 0.03
 EXPORT_EDGE_MAX_SHIFT_S = 0.40
 EXPORT_EDGE_TRIM_MAX_S = 2.00
 # Dead air *inside* a kept stretch belongs to no cut, so nothing above removes
@@ -514,6 +518,84 @@ def _timed_interval(item: dict[str, Any]) -> Optional[tuple[float, float]]:
     return start, end
 
 
+def _composed_word_runs(
+    tokens: list[dict[str, Any]],
+    safety_handle: float = 0.0,
+    absorb_pauses: bool = False,
+    duration: Optional[float] = None,
+) -> list[dict[str, Any]]:
+    """Every consecutive run of cut spoken words, with the speech around it.
+
+    Each record carries the composed ``start``/``end`` plus the four timings that
+    say what the run is allowed to touch: ``prev_kept_end`` and
+    ``first_deleted_start`` are the two speech walls of the pause the cut opens
+    in, and ``last_deleted_end`` and ``next_kept_start`` are the walls of the
+    pause it closes in. Export refinement moves a boundary inside those walls and
+    nowhere else, which is what makes it impossible for it to leave a piece of a
+    deleted word behind or to clip a kept one. A run at the head or the tail of
+    the recording reports ``None`` for the neighbour it does not have.
+    """
+    words: list[tuple[float, float, str, bool]] = []
+    for token in tokens:
+        if token.get("kind") != "word":
+            continue
+        interval = _timed_interval(token)
+        if interval is None:
+            continue
+        start, end = interval
+        words.append((start, end, str(token.get("id", "")), bool(token.get("cut"))))
+    words.sort(key=lambda word: (word[0], word[1], word[2]))
+
+    runs: list[dict[str, Any]] = []
+    run: Optional[dict[str, Any]] = None
+    previous_kept_end: Optional[float] = None
+    for start, end, _token_id, is_cut in words:
+        if is_cut:
+            if run is not None:
+                run["end"] = max(run["end"], end)
+                run["last_deleted_end"] = max(run["last_deleted_end"], end)
+            else:
+                protected_start = start
+                if absorb_pauses:
+                    protected_start = (
+                        max(0.0, previous_kept_end + safety_handle)
+                        if previous_kept_end is not None
+                        else 0.0
+                    )
+                elif safety_handle > 0 and previous_kept_end is not None:
+                    protected_start = max(
+                        protected_start, previous_kept_end + safety_handle
+                    )
+                run = {
+                    "start": protected_start,
+                    "end": max(end, protected_start),
+                    "prev_kept_end": previous_kept_end,
+                    "first_deleted_start": start,
+                    "last_deleted_end": end,
+                    "next_kept_start": None,
+                }
+        elif run is not None:
+            protected_end = start - safety_handle if absorb_pauses else run["end"]
+            if safety_handle > 0:
+                protected_end = min(protected_end, start - safety_handle)
+            if protected_end > run["start"] + MERGE_EPS:
+                run["end"] = protected_end
+                run["next_kept_start"] = start
+                runs.append(run)
+            run = None
+            previous_kept_end = end
+        else:
+            previous_kept_end = end
+    if run is not None:
+        run_end = run["end"]
+        if absorb_pauses and duration is not None and math.isfinite(duration):
+            run_end = max(run_end, float(duration))
+        if run_end > run["start"] + MERGE_EPS:
+            run["end"] = run_end
+            runs.append(run)
+    return runs
+
+
 def consecutive_word_cut_intervals(
     tokens: list[dict[str, Any]],
     safety_handle: float = 0.0,
@@ -535,54 +617,12 @@ def consecutive_word_cut_intervals(
     and ``duration`` respectively. Kept speech is never entered: the handle is
     applied against the neighboring kept word, not the deleted one.
     """
-    words: list[tuple[float, float, str, bool]] = []
-    for token in tokens:
-        if token.get("kind") != "word":
-            continue
-        interval = _timed_interval(token)
-        if interval is None:
-            continue
-        start, end = interval
-        words.append((start, end, str(token.get("id", "")), bool(token.get("cut"))))
-    words.sort(key=lambda word: (word[0], word[1], word[2]))
-
-    intervals: list[tuple[float, float]] = []
-    run: Optional[tuple[float, float]] = None
-    previous_kept_end: Optional[float] = None
-    for start, end, _token_id, is_cut in words:
-        if is_cut:
-            if run is not None:
-                run = (run[0], max(run[1], end))
-            else:
-                protected_start = start
-                if absorb_pauses:
-                    protected_start = (
-                        max(0.0, previous_kept_end + safety_handle)
-                        if previous_kept_end is not None
-                        else 0.0
-                    )
-                elif safety_handle > 0 and previous_kept_end is not None:
-                    protected_start = max(
-                        protected_start, previous_kept_end + safety_handle
-                    )
-                run = (protected_start, max(end, protected_start))
-        elif run is not None:
-            protected_end = start - safety_handle if absorb_pauses else run[1]
-            if safety_handle > 0:
-                protected_end = min(protected_end, start - safety_handle)
-            if protected_end > run[0] + MERGE_EPS:
-                intervals.append((run[0], protected_end))
-            run = None
-            previous_kept_end = end
-        else:
-            previous_kept_end = end
-    if run is not None:
-        run_end = run[1]
-        if absorb_pauses and duration is not None and math.isfinite(duration):
-            run_end = max(run_end, float(duration))
-        if run_end > run[0] + MERGE_EPS:
-            intervals.append((run[0], run_end))
-    return intervals
+    return [
+        (run["start"], run["end"])
+        for run in _composed_word_runs(
+            tokens, safety_handle, absorb_pauses=absorb_pauses, duration=duration
+        )
+    ]
 
 
 def transcript_cut_intervals(
@@ -890,81 +930,175 @@ def detect_silence_intervals(
     return parse_silencedetect_output(result.stderr, duration)
 
 
+def export_edge_bounds(proj: dict[str, Any]) -> list[tuple[float, float, float]]:
+    """``(boundary, earliest, latest)`` for every composed word-cut edge.
+
+    A cut boundary is only ever allowed to travel inside the pause that separates
+    the deleted speech from the speech kept beside it. ``earliest`` and
+    ``latest`` are that pause's two speech walls, taken from the words' own
+    aligned timings, so nothing the silence detector reports can restore a
+    deleted word or clip a kept one. Edges with no such walls -- gap cuts, the
+    head and the tail of the recording -- are simply absent from this list and
+    fall back to the conservative unanchored rule.
+    """
+    params = cut_composition_params(proj)
+    try:
+        duration = float(proj.get("duration_s") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    bounds: list[tuple[float, float, float]] = []
+    for run in _composed_word_runs(proj.get("tokens", []), **params):
+        previous_kept = run["prev_kept_end"]
+        next_kept = run["next_kept_start"]
+        edges = (
+            # The cut's opening edge is a keep's end: it lives in the pause
+            # between the last kept word and the first deleted one.
+            (run["start"], 0.0 if previous_kept is None else float(previous_kept),
+             float(run["first_deleted_start"])),
+            # Its closing edge is the next keep's start, in the pause between the
+            # last deleted word and the next kept one.
+            (run["end"], float(run["last_deleted_end"]),
+             duration if next_kept is None else float(next_kept)),
+        )
+        for boundary, low, high in edges:
+            if math.isfinite(low) and math.isfinite(high) and high > low + MERGE_EPS:
+                bounds.append((float(boundary), low, high))
+    return bounds
+
+
+def export_trough_threshold_db(profile: dict[str, float | bool]) -> float:
+    """The level below which a dip between two words counts as a place to cut.
+
+    The standalone silence threshold is tuned to find real pauses anywhere in the
+    recording, so it is deliberately shy. Inside a bounded pause there is nothing
+    to be shy about, and the dip between two words rarely falls all the way to
+    the noise floor -- it sits some way below the speaker's own level. Taking
+    whichever of those two references is more permissive finds the trough on a
+    quiet recording and on a noisy one alike.
+    """
+    try:
+        noise_floor = float(profile.get("noise_floor_db", -60.0))
+        speech_level = float(profile.get("speech_level_db", -20.0))
+    except (TypeError, ValueError):
+        return EXPORT_SILENCE_DB_DEFAULT
+    if not math.isfinite(noise_floor) or not math.isfinite(speech_level):
+        return EXPORT_SILENCE_DB_DEFAULT
+    return max(-60.0, min(-24.0, max(noise_floor + 6.0, speech_level - 25.0)))
+
+
 def refine_export_keep_edges(
     keeps: list[tuple[float, float]],
     silences: list[tuple[float, float]],
     duration: float,
     max_shift: float = EXPORT_EDGE_MAX_SHIFT_S,
     max_trim: float = EXPORT_EDGE_TRIM_MAX_S,
+    edge_bounds: Optional[list[tuple[float, float, float]]] = None,
+    troughs: Optional[list[tuple[float, float]]] = None,
+    handle: float = WORD_CUT_SAFETY_S,
 ) -> list[tuple[float, float]]:
-    """Snap established keep edges to nearby real silence, or change nothing.
+    """Put each export join in the real trough beside it, or leave it alone.
 
-    This pure export-only operation intentionally runs after cut composition and
-    keep-list construction. A kept start maps to the speech-side silence end; a
-    kept end maps to the speech-side silence start. Distant/invalid candidates
-    are rejected rather than guessed.
+    This pure export-only operation runs after cut composition and keep-list
+    construction, and is the step that turns an estimated boundary into the one a
+    person would pick after zooming into the waveform.
 
-    The two directions carry different risk, so they carry different budgets.
-    Moving an edge *inward*, toward the speech the keep exists for, only ever
-    drops audio ffmpeg measured as silence, so it gets ``max_trim``. Moving an
-    edge *outward* restores audio that cut composition deliberately excluded and
-    is capped at the much smaller ``max_shift``, which exists only to recover a
-    quiet word attack or release.
+    An edge listed in ``edge_bounds`` is anchored: the two words on either side
+    of it are known, so the pause between them is known, and the edge is placed
+    at the speech end of that pause -- a keep ends ``handle`` into the pause that
+    follows its last word, and the next keep starts ``handle`` before the end of
+    the pause that precedes its first word. Because the search window is the
+    pause itself, an anchored edge physically cannot reach a deleted word or a
+    kept one, however fine ``troughs`` is.
+
+    An edge with no anchors -- a gap cut, or the head or tail of the recording --
+    keeps the older conservative rule, with one correction: a candidate on the
+    wrong side of the boundary is refused instead of being taken because it
+    happened to be nearest. A keep start only snaps to a silence it is already
+    inside or one that ends just before it; a keep end only to one it is inside
+    or one that begins just after it. Trimming toward the speech the keep exists
+    for costs only measured silence and gets ``max_trim``; restoring audio the
+    cut deliberately excluded is capped at the much smaller ``max_shift``.
     """
     original = [(float(start), float(end)) for start, end in keeps]
-    window = max(float(max_shift), float(max_trim))
-    if not original or not silences or window <= 0:
+    if not original or not silences:
         return original
-    cleaned_silences: list[tuple[float, float]] = []
-    for raw_start, raw_end in silences:
-        try:
-            silence_start, silence_end = float(raw_start), float(raw_end)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(silence_start) or not math.isfinite(silence_end):
-            continue
-        silence_start = max(0.0, silence_start)
-        silence_end = min(float(duration), silence_end)
-        if silence_end - silence_start >= EXPORT_SILENCE_MIN_S - MERGE_EPS:
-            cleaned_silences.append((silence_start, silence_end))
-    valid_silences = merge_intervals(cleaned_silences)
+
+    def clean(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for raw_start, raw_end in spans:
+            try:
+                span_start, span_end = float(raw_start), float(raw_end)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(span_start) or not math.isfinite(span_end):
+                continue
+            span_start = max(0.0, span_start)
+            span_end = min(float(duration), span_end)
+            if span_end > span_start:
+                out.append((span_start, span_end))
+        return merge_intervals(out)
+
+    valid_silences = clean(silences)
     if not valid_silences:
         return original
+    valid_troughs = clean(troughs) if troughs else valid_silences
+    anchors = list(edge_bounds or [])
 
-    def nearest_target(boundary: float, edge: str) -> float:
-        candidates: list[tuple[float, float, float]] = []
-        for silence_start, silence_end in valid_silences:
-            if silence_end < boundary - window or silence_start > boundary + window:
-                continue
-            inside = silence_start <= boundary <= silence_end
-            distance = 0.0 if inside else min(
-                abs(boundary - silence_start), abs(boundary - silence_end)
-            )
-            target = silence_end if edge == "start" else silence_start
-            shift = abs(target - boundary)
-            # Inward for a keep start is later; inward for a keep end is earlier.
-            trimming = target > boundary if edge == "start" else target < boundary
-            budget = max_trim if trimming else max_shift
-            if shift > budget + MERGE_EPS:
-                # An edge sitting inside a silence longer than the budget used
-                # to be refused outright, so the longest dead air -- the kind
-                # most worth removing -- was the only kind left untouched.
-                # Every one of those seconds is measured silence, so spend the
-                # whole budget and stop there.
-                if not (inside and trimming):
-                    continue
-                target = boundary + budget if edge == "start" else boundary - budget
-                shift = budget
-            candidates.append((distance, shift, target))
-        if not candidates:
+    def bounds_for(boundary: float) -> Optional[tuple[float, float]]:
+        for time, low, high in anchors:
+            if abs(time - boundary) <= MERGE_EPS:
+                return low, high
+        return None
+
+    def anchored_target(boundary: float, edge: str, low: float, high: float) -> float:
+        """Place the edge in the pause between the two words that wall it in."""
+        window = [
+            (max(span_start, low), min(span_end, high))
+            for span_start, span_end in valid_troughs
+            if min(span_end, high) - max(span_start, low)
+            >= EXPORT_TROUGH_MIN_S - MERGE_EPS
+        ]
+        if not window:
             return boundary
-        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-        return candidates[0][2]
+        if edge == "start":
+            trough_start, trough_end = window[-1]
+            return max(trough_start, trough_end - handle)
+        trough_start, trough_end = window[0]
+        return min(trough_end, trough_start + handle)
+
+    def unanchored_target(boundary: float, edge: str) -> float:
+        qualifying = [
+            span for span in valid_silences
+            if span[1] - span[0] >= EXPORT_SILENCE_MIN_S - MERGE_EPS
+        ]
+        inside = next(
+            (span for span in qualifying if span[0] <= boundary <= span[1]), None
+        )
+        if inside is not None:
+            silence_start, silence_end = inside
+            if edge == "start":
+                return min(silence_end, boundary + max_trim)
+            return max(silence_start, boundary - max_trim)
+        if edge == "start":
+            behind = [span[1] for span in qualifying if span[1] <= boundary]
+            nearest = max(behind) if behind else None
+        else:
+            ahead = [span[0] for span in qualifying if span[0] >= boundary]
+            nearest = min(ahead) if ahead else None
+        if nearest is None or abs(nearest - boundary) > max_shift + MERGE_EPS:
+            return boundary
+        return nearest
+
+    def target(boundary: float, edge: str) -> float:
+        limits = bounds_for(boundary)
+        if limits is None:
+            return unanchored_target(boundary, edge)
+        return anchored_target(boundary, edge, limits[0], limits[1])
 
     refined: list[tuple[float, float]] = []
-    for index, (start, end) in enumerate(original):
-        new_start = start if start <= MERGE_EPS else nearest_target(start, "start")
-        new_end = end if duration - end <= MERGE_EPS else nearest_target(end, "end")
+    for start, end in original:
+        new_start = start if start <= MERGE_EPS else target(start, "start")
+        new_end = end if duration - end <= MERGE_EPS else target(end, "end")
         new_start = max(0.0, min(float(duration), new_start))
         new_end = max(0.0, min(float(duration), new_end))
         # A restored edge must never reach back across the keep that precedes it.
@@ -3726,8 +3860,21 @@ def export_job(mode: str, enhancement: Optional[dict[str, Any]] = None) -> None:
                     proj["source_path"], float(proj["duration_s"]),
                     silence_db=float(level_profile["silence_db"]),
                 )
+                # A second, finer pass. On its own this threshold would call
+                # parts of quiet speech silent, so it is only ever consulted
+                # inside a pause already walled in by the two words either side
+                # of the join -- where it is what finds the dip between two
+                # words that the shy pass misses entirely.
+                troughs = detect_silence_intervals(
+                    proj["source_path"], float(proj["duration_s"]),
+                    min_duration=EXPORT_TROUGH_MIN_S,
+                    silence_db=export_trough_threshold_db(level_profile),
+                )
                 keeps = refine_export_keep_edges(
-                    keeps, silences, float(proj["duration_s"])
+                    keeps, silences, float(proj["duration_s"]),
+                    edge_bounds=export_edge_bounds(proj),
+                    troughs=troughs,
+                    handle=float(cut_composition_params(proj)["safety_handle"]),
                 )
                 before_interior = sum(b - a for a, b in keeps)
                 keeps = trim_interior_silence(

@@ -31,6 +31,8 @@ from retake import (
     merge_intervals,
     parse_silencedetect_output,
     refine_export_keep_edges,
+    export_edge_bounds,
+    export_trough_threshold_db,
     trim_interior_silence,
     retake_text_match,
     sanitize_clusters,
@@ -382,6 +384,144 @@ def test_export_keep_edge_restore_never_reaches_across_the_previous_keep() -> No
         assert end > start
         if index:
             assert start >= refined[index - 1][1]
+
+
+def test_export_keep_edges_refuse_a_candidate_across_retained_speech() -> None:
+    """The defect behind every leftover fragment and every clipped word.
+
+    Candidates used to be ranked by raw distance with no regard for which side
+    of the boundary they sat on, so the nearest silence won even when reaching
+    it meant crossing speech. A keep start would jump forward over a retained
+    word to a later silence, a keep end would jump backward over one, and -- the
+    complaint that is easiest to hear -- a keep start would reach *back* past
+    the trough that separates it from the deleted word, to a slightly nearer
+    silence on the far side of it, restoring the tail of the word just deleted.
+    """
+    # A keep start with retained speech at 10.0-10.5 and silence only after it.
+    assert refine_export_keep_edges(
+        [(0.0, 5.0), (10.0, 15.0)], [(10.5, 11.0)], 20.0
+    ) == [(0.0, 5.0), (10.0, 15.0)]
+    # A keep end with retained speech at 9.2-10.0 and silence only before it.
+    assert refine_export_keep_edges(
+        [(5.0, 10.0), (15.0, 20.0)], [(9.0, 9.2)], 20.0
+    ) == [(5.0, 10.0), (15.0, 20.0)]
+
+
+def test_export_edge_bounds_wall_each_join_between_its_two_words() -> None:
+    """Every join is confined to the pause its two neighbouring words define."""
+    proj = {
+        "duration_s": 20.0,
+        "tokens": [_word(1, 9.0, 9.6), _word(2, 9.75, 9.95, cut=True),
+                   _word(3, 10.2, 10.8)],
+    }
+    handle = cut_composition_params(proj)["safety_handle"]
+    want = [(9.6 + handle, 9.6, 9.75), (10.2 - handle, 9.95, 10.2)]
+    got = export_edge_bounds(proj)
+    assert len(got) == len(want)
+    for values, expected in zip(got, want):
+        assert all(abs(a - b) <= 1e-6 for a, b in zip(values, expected))
+
+
+def test_export_edge_bounds_fall_back_at_the_head_and_the_tail() -> None:
+    """A run with no neighbour on one side is walled by the recording instead."""
+    proj = {
+        "duration_s": 20.0,
+        "tokens": [_word(1, 0.5, 1.0, cut=True), _word(2, 2.0, 3.0),
+                   _word(3, 4.0, 5.0, cut=True)],
+    }
+    bounds = export_edge_bounds(proj)
+    assert bounds[0][1] == 0.0          # nothing kept before the first run
+    assert bounds[-1][2] == 20.0        # nothing kept after the last one
+
+
+def test_anchored_join_lands_in_the_trough_between_the_two_words() -> None:
+    """The whole point: the cut a person would make after zooming in.
+
+    A deleted filler sits between two kept words. The waveform has a real dip
+    after the first kept word and another before the next one, plus a decoy dip
+    *inside* the deleted filler. The join has to land in the two real troughs,
+    keep a breath of each, and never be tempted by the decoy.
+    """
+    proj = {
+        "duration_s": 20.0,
+        "alignment": {"status": "aligned", "version": retake.ALIGNMENT_VERSION,
+                      "coverage": 1.0},
+        "tokens": [_word(1, 9.0, 9.6), _word(2, 9.75, 9.95, cut=True),
+                   _word(3, 10.2, 10.8)],
+    }
+    troughs = [(9.62, 9.73), (9.80, 9.86), (9.97, 10.18)]
+    keeps = keep_list(cut_intervals_from_tokens(proj), 20.0)
+    handle = cut_composition_params(proj)["safety_handle"]
+    refined = refine_export_keep_edges(
+        keeps, troughs, 20.0, edge_bounds=export_edge_bounds(proj),
+        troughs=troughs, handle=handle,
+    )
+    kept_end, next_start = refined[0][1], refined[1][0]
+    # No part of the deleted word survives, and neither kept word is clipped.
+    assert 9.6 <= kept_end <= 9.75
+    assert 9.95 <= next_start <= 10.2
+    # Both joins sit in measured silence rather than mid-word.
+    assert any(start <= kept_end <= end for start, end in troughs)
+    assert any(start <= next_start <= end for start, end in troughs)
+    # The dip inside the deleted filler is never chosen.
+    assert not 9.80 <= kept_end <= 9.86
+    assert not 9.80 <= next_start <= 9.86
+    # A breath of each real trough is retained, so the join is not robotic.
+    assert kept_end > 9.62 and next_start < 10.18
+
+
+def test_anchored_join_keeps_its_estimate_when_there_is_no_trough() -> None:
+    """Two words running straight into each other: guessing would be worse."""
+    proj = {
+        "duration_s": 20.0,
+        "tokens": [_word(1, 9.0, 9.6), _word(2, 9.6, 9.95, cut=True),
+                   _word(3, 9.95, 10.8)],
+    }
+    keeps = keep_list(cut_intervals_from_tokens(proj), 20.0)
+    assert refine_export_keep_edges(
+        keeps, [(2.0, 4.0)], 20.0, edge_bounds=export_edge_bounds(proj),
+        troughs=[(2.0, 4.0)],
+    ) == [(round(start, 6), round(end, 6)) for start, end in keeps]
+
+
+def test_anchored_join_cannot_be_moved_by_a_reckless_trough_threshold() -> None:
+    """The walls, not the detector, are what make refinement safe.
+
+    A threshold permissive enough to call whole words silent is handed in on
+    purpose. The join still cannot leave deleted audio behind or clip either
+    kept word, because it was never free to leave the pause between them.
+    """
+    proj = {
+        "duration_s": 20.0,
+        "tokens": [_word(1, 9.0, 9.6), _word(2, 9.75, 9.95, cut=True),
+                   _word(3, 10.2, 10.8)],
+    }
+    keeps = keep_list(cut_intervals_from_tokens(proj), 20.0)
+    refined = refine_export_keep_edges(
+        keeps, [(0.0, 20.0)], 20.0, edge_bounds=export_edge_bounds(proj),
+        troughs=[(0.0, 20.0)],
+    )
+    assert 9.6 <= refined[0][1] <= 9.75
+    assert 9.95 <= refined[1][0] <= 10.2
+
+
+def test_trough_threshold_follows_the_quieter_of_two_references() -> None:
+    # A clean recording: the noise floor is far below anything audible, so the
+    # speaker's own level is what says where a dip between words is.
+    assert export_trough_threshold_db(
+        {"noise_floor_db": -70.0, "speech_level_db": -18.0}
+    ) == -43.0
+    # A noisy one: the floor is high, and reaching below it would find nothing.
+    assert export_trough_threshold_db(
+        {"noise_floor_db": -38.0, "speech_level_db": -20.0}
+    ) == -32.0
+    # Clamped at both ends, and unusable input falls back to the shy default.
+    assert export_trough_threshold_db(
+        {"noise_floor_db": -10.0, "speech_level_db": -3.0}
+    ) == -24.0
+    assert export_trough_threshold_db(
+        {"noise_floor_db": float("nan"), "speech_level_db": -20.0}
+    ) == retake.EXPORT_SILENCE_DB_DEFAULT
 
 
 @contextmanager
