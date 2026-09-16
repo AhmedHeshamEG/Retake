@@ -1963,101 +1963,34 @@ function whenRunnable() {
   });
 }
 
-const UPLOAD_MIN_CHUNK = 256 * 1024;
-/* A chunk interrupted mid-flight is re-sent in full, so the client stays under
-   the server's ceiling rather than at it. */
-const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;
-/* The first chunk is deliberately small. Until one has arrived, nothing is
-   known about either the link or whether this phone can read this file at all,
-   and the cost of guessing wrong is paid in full before anything moves. */
-const UPLOAD_FIRST_CHUNK = 512 * 1024;
-/* One chunk at a time leaves the link idle for a whole round trip after every
-   chunk, which is what held phone transfers down to a few hundred KB/s. Four
-   connections keep bytes on the wire while the laptop is answering, and stay
-   inside the six-per-host limit the browser enforces, so polling still gets
-   through. They open only after the first chunk has landed: four readers on a
-   file the phone has not finished preparing is how a transfer stalls at zero. */
-const UPLOAD_LANES = 4;
-const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
+/* One request carries the whole file. That is the entire transport.
 
-/* Two watchdogs, because a transfer has two places it can die and they need
-   different answers.
+   Every earlier version read the file in slices and sent one request each. On
+   an iPhone that is the one shape that cannot work: WebKit invalidates the
+   handle behind a file picked out of the photo library about a minute after it
+   is opened (bugs.webkit.org 228683), so the first slices arrive, the rest come
+   back empty or never come back at all, and a large video stops dead with no
+   error to report. Four of those at once stops it four times faster.
 
-   Reading. A video picked out of an iOS photo library is not a file yet. The
-   phone reports its size immediately but has to export it -- transcode it,
-   pull it back from iCloud, or both -- before a single byte can be read, and
-   for a gigabyte that takes a while. So a read is given a long leash, and its
-   own message, because "still preparing" is not a network fault and must not
-   be reported as one.
+   Handing the whole File to one request moves the reading into the browser,
+   which streams it off the phone over a single handle it opened itself. It is
+   also what tus, the resumable-upload standard, does by default -- chunking is
+   its opt-in, not its normal mode -- and it is less code by a wide margin.
 
-   Sending. Once bytes are moving, a pause of half a minute means they have
-   stopped; the link does not recover on its own while the request sits there.
-   This one is short because retrying is cheap and waiting is not. */
-const UPLOAD_READ_LIMIT_MS = 3 * 60 * 1000;
-const UPLOAD_SILENCE_LIMIT_MS = 30 * 1000;
+   Resuming survives because the laptop writes wherever it is told: if the
+   request dies, ask how much landed and send the rest as one more request. */
+const UPLOAD_SILENCE_LIMIT_MS = 60 * 1000;
+const UPLOAD_RETRIES = 4;
 
-/* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
-   Size each chunk so it spends about UPLOAD_TARGET_S on the wire.
-
-   The measurement is the send alone, never the read. Mixing the two makes a
-   phone that is slow to hand over its own file look like a slow network, and
-   shrinks the chunks in response -- which does not make the phone any quicker
-   and costs a round trip more often. */
-const UPLOAD_TARGET_S = 2;
-function nextChunkSize(current, seconds) {
-  if (!(seconds > 0)) return current;
-  /* What this lane actually achieved. Because it is this lane's own share of
-     the link, it already accounts for however many lanes are running. */
-  const laneBytesPerSecond = current / seconds;
-  const ideal = laneBytesPerSecond * UPLOAD_TARGET_S;
-  /* Move a third of the way toward the estimate so one unlucky chunk cannot
-     swing the size, and never more than double or half in one step. */
-  const eased = current + (ideal - current) / 3;
-  const bounded = Math.max(current / 2, Math.min(current * 2, eased));
-  return Math.max(UPLOAD_MIN_CHUNK, Math.min(UPLOAD_MAX_CHUNK, Math.round(bounded)));
-}
-
-/* Reads one slice off the phone's storage, with a deadline.
-
-   The bytes are pulled into memory before the request opens rather than handed
-   to it as a Blob to stream. Streaming looks strictly better -- the chunk never
-   exists twice, and the send starts on the first block instead of the last --
-   but it puts the read inside the request, where a read that never finishes is
-   a request that never settles: no result, no error, nothing to retry. That is
-   a transfer stopped dead with no way to notice. Reading first keeps the two
-   failures apart, and FileReader, unlike Blob.arrayBuffer, can be abandoned. */
-function readSlice(file, offset, end) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    const timer = setTimeout(() => {
-      try { reader.abort(); } catch (_) {}
-      reject(new Error("the phone is taking a long time to prepare this video"));
-    }, UPLOAD_READ_LIMIT_MS);
-    reader.onload = () => { clearTimeout(timer); resolve(reader.result); };
-    reader.onerror = () => {
-      clearTimeout(timer);
-      /* The bytes behind this File are gone -- the phone reclaimed them while
-         the screen was off, or the picker handed back a reference it can no
-         longer honour. Only the person can fix that, by picking it again. */
-      const stale = new Error("the phone released this file while the screen was off");
-      stale.needsReselect = true;
-      reject(stale);
-    };
-    reader.onabort = () => clearTimeout(timer);
-    reader.readAsArrayBuffer(file.slice(offset, end));
-  });
-}
-
-/* Sends one chunk, and refuses to wait forever for it.
+/* Sends bytes to the laptop and refuses to wait forever for them.
 
    XMLHttpRequest rather than fetch, for one reason: it reports how much of the
    body has actually gone. fetch resolves when the reply arrives and says
    nothing before then, so a request whose bytes have stopped moving is
-   indistinguishable from one still in flight, and both look exactly like a
-   transfer that is simply slow. Upload progress is what separates them, and it
-   is also what the progress line reports, so a chunk still on the wire counts
-   toward the figure on screen instead of the phone appearing to sit at zero. */
-function sendChunk(session, offset, body, signal, onProgress) {
+   indistinguishable from one still in flight -- which is how a transfer used to
+   hang with no error and a bar on zero. Upload progress separates them, and it
+   is also what the progress line shows. */
+function sendBody(session, offset, body, signal, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     let lastMoved = Date.now(), settled = false;
@@ -2076,9 +2009,11 @@ function sendChunk(session, offset, body, signal, onProgress) {
       cancelled.name = "AbortError";
       stop(cancelled);
     }
+    /* A minute of silence, because the first stretch of it is the phone
+       exporting the video out of its photo library before a byte can move. */
     const watchdog = setInterval(() => {
       if (Date.now() - lastMoved > UPLOAD_SILENCE_LIMIT_MS) {
-        stop(new Error("the phone stopped sending, nothing moved for 30 seconds"));
+        stop(new Error("the phone stopped sending, nothing moved for a minute"));
       }
     }, 2000);
     if (signal.aborted) { onAbort(); return; }
@@ -2099,28 +2034,19 @@ function sendChunk(session, offset, body, signal, onProgress) {
   });
 }
 
-/* Sends one file over several connections at once. Each chunk carries the
-   offset it belongs at, so the laptop writes them wherever they land and the
-   lanes never have to wait for one another. */
+/* Sends one file, from wherever the laptop already got to. */
 async function runTransfer(file, descriptor) {
-  const start = await api("/upload/start", descriptor);
+  let start = await api("/upload/start", descriptor);
   S.uploadSession = start.session;
   localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
   S.uploadAbort = new AbortController();
 
-  const ceiling = Math.min(UPLOAD_MAX_CHUNK, Number(start.chunk_max) || UPLOAD_MAX_CHUNK);
   const base = Math.min(file.size, Number(start.offset) || 0);
-  let cursor = base, acked = base, chunkSize = Math.min(ceiling, UPLOAD_FIRST_CHUNK);
-  let failure = null;
+  let offset = base;
   const startedAt = performance.now();
-  /* Bytes each lane has on the wire but not yet acknowledged, so the figure on
-     screen moves during a chunk instead of jumping once per round trip. */
-  const inFlight = new Map();
 
-  const report = (note) => {
-    let moving = 0;
-    for (const bytes of inFlight.values()) moving += bytes;
-    const shown = Math.min(file.size, acked + moving);
+  const report = (sent, note) => {
+    const shown = Math.min(file.size, offset + sent);
     const pct = file.size ? shown / file.size * 100 : 0;
     const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
     $("progressFill").style.width = `${pct}%`;
@@ -2129,87 +2055,51 @@ async function runTransfer(file, descriptor) {
     );
   };
   /* Says what is happening during the one stretch where nothing can: the phone
-     exporting a photo-library video before the first byte can be read. */
-  report("Preparing the video on your phone…");
+     exporting a photo-library video before the first byte exists. */
+  report(0, "Preparing the video on your phone…");
 
-  /* Lane 0 goes alone until its first chunk lands. That one chunk answers the
-     only questions worth answering before committing: can this phone read this
-     file, and is the laptop there. Opening four lanes into an unanswered
-     question multiplies the wait rather than the throughput. */
-  let openTheRest;
-  const primed = new Promise((resolve) => { openTheRest = resolve; });
-
-  async function lane(index) {
-    if (index > 0) await primed;
+  for (let attempt = 0; offset < file.size; ) {
     try {
-      while (!failure && cursor < file.size) {
-        /* Claiming the range before any await is safe: nothing else runs in
-           between, so two lanes can never claim the same bytes. */
-        const offset = cursor, end = Math.min(file.size, cursor + chunkSize);
-        cursor = end;
-        let sent = false, attempt = 0, stalledSince = 0;
-        while (!sent && !failure) {
-          try {
-            const body = await readSlice(file, offset, end);
-            if (failure) return;
-            const startedChunk = performance.now();
-            const {status, data} = await sendChunk(
-              S.uploadSession, offset, body, S.uploadAbort.signal,
-              (loaded) => { inFlight.set(index, loaded); report(); },
-            );
-            inFlight.delete(index);
-            if (status === 404) {
-              /* The laptop forgot this transfer; start it again from whatever
-                 it still has, rather than pushing bytes into nothing. */
-              const gone = new Error("upload session expired");
-              gone.needsRestart = true;
-              throw gone;
-            }
-            if (status < 200 || status >= 300) throw new Error(data.error || `HTTP ${status}`);
-            chunkSize = Math.min(
-              ceiling,
-              nextChunkSize(end - offset, (performance.now() - startedChunk) / 1000),
-            );
-            acked += end - offset; sent = true;
-            report();
-          } catch (error) {
-            inFlight.delete(index);
-            if (error.name === "AbortError" || error.needsReselect || error.needsRestart) {
-              failure = failure || error;
-              throw error;
-            }
-            if (!stalledSince) stalledSince = Date.now();
-            if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
-              failure = failure || error;
-              throw new Error(`the connection has been down for five minutes: ${error.message}`);
-            }
-            /* A drop often means the chunks were too ambitious for this link,
-               so every lane after this one carries less. */
-            chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
-            const waited = Math.round((Date.now() - stalledSince) / 1000);
-            report(`${error.message} · retrying (${waited}s)…`);
-            const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
-            await new Promise((resolve) => setTimeout(resolve, delay));
-            /* Only now is it worth asking whether the tab is running at all.
-               Asking before every chunk stalled a hidden window for nothing. */
-            await whenRunnable();
-          }
-        }
-        /* Whether it succeeded or gave up, the question lane 0 was sent to
-           answer has been answered, and the others must not wait on it again. */
-        if (index === 0) openTheRest();
+      const from = offset;
+      const {status, data} = await sendBody(
+        S.uploadSession, from, file.slice(from), S.uploadAbort.signal,
+        (loaded) => report(loaded),
+      );
+      if (status === 404) {
+        /* The laptop forgot this transfer; start it again from whatever it
+           still has, rather than pushing bytes into nothing. */
+        const gone = new Error("upload session expired");
+        gone.needsRestart = true;
+        throw gone;
       }
-    } finally {
-      inFlight.delete(index);
-      if (index === 0) openTheRest();
+      if (status < 200 || status >= 300) throw new Error(data.error || `HTTP ${status}`);
+      offset = Math.min(file.size, Math.max(offset, Number(data.end) || file.size));
+      attempt = 0;
+      report(0);
+    } catch (error) {
+      if (error.name === "AbortError" || error.needsRestart) throw error;
+      if (++attempt > UPLOAD_RETRIES) throw error;
+      report(0, `${error.message} · retrying…`);
+      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
+      /* Only now is it worth asking whether the tab is running at all. Asking
+         before every request stalled a hidden window for nothing. */
+      await whenRunnable();
+      /* Ask the laptop what it actually has rather than trusting the count
+         here: a request can die after the bytes landed. */
+      start = await api("/upload/start", descriptor);
+      S.uploadSession = start.session;
+      const landed = Math.min(file.size, Number(start.offset) || 0);
+      if (landed <= offset && attempt >= 2) {
+        /* Two goes, nothing moved. On iOS this is the picked file going stale,
+           and only the person can fix it, by picking it again. */
+        const stale = new Error("the phone released this file");
+        stale.needsReselect = true;
+        throw stale;
+      }
+      offset = Math.max(offset, landed);
     }
   }
-
-  const wanted = Math.max(1, Math.min(UPLOAD_LANES, Math.ceil((file.size - base) / UPLOAD_MIN_CHUNK)));
-  const results = await Promise.allSettled(Array.from({length:wanted}, (_, i) => lane(i)));
-  const broke = results.find((r) => r.status === "rejected");
-  if (broke) throw broke.reason;
-  return await api("/upload/finish", {session:start.session});
+  return await api("/upload/finish", {session:S.uploadSession});
 }
 
 async function uploadSelectedFile(file) {

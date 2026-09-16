@@ -41,6 +41,7 @@ from typing import Any, Iterator, Optional
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
+from starlette.requests import ClientDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 # The application ships with its model weights. Never contact a model hub.
@@ -4551,19 +4552,32 @@ async def upload_chunk(session_id: str, request: Request) -> JSONResponse:
                 {"error": "upload offset is outside the file",
                  "offset": _upload_received(session_id)}, status_code=409,
             )
-        data = bytearray()
+        # The body is written to disk as it arrives rather than collected
+        # first. A phone sends its whole video in one request, so there is no
+        # size at which it would be reasonable to hold it in memory, and
+        # writing through means a transfer that dies halfway keeps everything
+        # that already landed.
+        written = 0
         async for piece in request.stream():
-            data.extend(piece)
-            if len(data) > UPLOAD_CHUNK_MAX_BYTES:
-                return JSONResponse({"error": "upload chunk is too large"}, status_code=413)
-        if offset + len(data) > size:
-            return JSONResponse({"error": "upload exceeds declared file size"}, status_code=400)
-        if data:
+            if not piece:
+                continue
+            if offset + written + len(piece) > size:
+                return JSONResponse(
+                    {"error": "upload exceeds declared file size"}, status_code=400
+                )
             await asyncio.to_thread(
-                _write_chunk_at, session_id, partial, offset, bytes(data)
+                _write_chunk_at, session_id, partial, offset + written, bytes(piece)
             )
-        received = _record_chunk(session_id, offset, offset + len(data), meta_path, meta)
-        return JSONResponse({"offset": received, "end": offset + len(data)})
+            written += len(piece)
+            _record_chunk(session_id, offset, offset + written, meta_path, meta)
+        received = _record_chunk(session_id, offset, offset + written, meta_path, meta)
+        return JSONResponse({"offset": received, "end": offset + written})
+    except ClientDisconnect:
+        # The phone went away mid-request. Everything written before that is
+        # already recorded, so this is a pause, not a failure.
+        return JSONResponse(
+            {"offset": _upload_received(session_id)}, status_code=499
+        )
     except FileNotFoundError:
         return JSONResponse({"error": "upload session expired"}, status_code=404)
     except Exception as exc:
