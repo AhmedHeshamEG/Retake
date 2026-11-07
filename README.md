@@ -1,6 +1,6 @@
 # RETAKE (Simple Edition)
 
-Transcript-based rough-cut tool. 100% local. One Python file, one HTML file.
+Transcript-based rough-cut tool. 100% local. A small Python backend and one HTML file.
 
 ## Run
 
@@ -85,6 +85,37 @@ docker compose -f compose.yaml -f compose.gpu.yaml up --build
 
 The backend still retries on CPU if an accelerated job fails after startup.
 
+## How a recording is transcribed
+
+Whisper is not handed the whole file. An improvised recording is mostly
+retakes, and a window holding the same line twice is written down once: the
+other take gets no words at all, and Whisper hides the hole by drawing one word
+of the take it kept across the one it dropped. So `transcription.py` does three
+things instead:
+
+1. **Measures the recording.** Every stretch above the recording's own noise
+   floor is an island of sound. Islands are packed into windows that end on
+   real pauses, and pauses of two seconds or more are left out, which is what
+   stops words being invented for dead air.
+2. **Decodes each window on its own**, with the same `large-v3` model.
+   With the language on Auto-detect, several windows spread across the
+   recording are asked rather than the first thirty seconds, so an accented
+   opening cannot have the whole thing written out in another language.
+3. **Checks the words against the measurement.** Audible sound with no word
+   over it, or with one word lasting far longer than it could take to say, is
+   decoded again, alone, where there is no neighbouring take to confuse it
+   with. What it finds is added in place.
+
+Whatever is still wordless after that is not speech. It appears in the
+transcript as a **sound** chip (`♪ 0.31s`): a breath, a click, a hum. A sound is
+not a word and not a silence, so removing gaps leaves it in; click a chip to
+cut that one, or use **Cut sounds** in the toolbar for all of them. Both are
+ordinary cuts, so undo, preview and export treat them like any other.
+
+`retake.log` records every stretch that was re-heard and what came of it.
+Projects transcribed before this keep their old transcript; open the recording
+again as a new project to get a new one.
+
 ## Accurate word timing
 
 Whisper's normal word timestamps can drift or end before the audible word.
@@ -93,6 +124,15 @@ then protects the retained side of every transcript cut. It runs once per
 project and is cached; normal preview and export stay fast. Existing word IDs,
 text, cut selections, markers, and source media are preserved, and a timestamped
 project backup is written before publication.
+
+Alignment runs in two passes. The first aligns the whole transcript; about one
+word in twenty comes back without a confident time, and those words cluster in
+retakes and false starts, which is exactly where cuts go. The second pass
+re-aligns each run of them on its own, inside the gap between its aligned
+neighbours, and keeps a time only if it is in order and inside that gap. On real
+recordings it places roughly half of the missed words. Projects aligned before
+the second pass existed still count as aligned and offer `Recalibrate Timing`
+again.
 
 On Windows, prepare the isolated GPU-first runtime with Python 3.11:
 
@@ -222,16 +262,37 @@ models\enhancement-runtime\Scripts\python.exe -m pip install -r requirements-enh
 
 The runtime and checkpoints remain under the Git-ignored `models/` folder.
 
-During media export, Retake first builds the existing authoritative consecutive
-cut/keep intervals. It then inspects only each kept interval's edge and snaps a
-nearby trustworthy join to real waveform silence. The two directions carry
-different budgets because they carry different risk: moving an edge inward,
-toward the speech the interval exists for, only discards audio measured as
-silence and may travel up to 2.0 s, while moving an edge outward restores
-excluded audio and stays capped at 0.4 s so it can recover a quiet word
-attack/release and nothing more. Neither changes saved word timestamps, edit
-selections, text exports, or preview. If no safe nearby silence exists, the
-established speech-safe boundary is used unchanged.
+## Where a cut actually goes
+
+Word timestamps are estimates, so they never decide where a cut lands. They
+only decide *which* pause it belongs in: between this kept word and that deleted
+one. Inside that pause, `splice.py` reads the waveform the way you would after
+zooming in:
+
+- a keep that ends stops a short handle after its last word has died away;
+- a keep that starts begins a short handle before its first word, at the end of
+  the last quiet stretch, so a breath is never cut in half;
+- in a very short dip the join sits in the middle of it, away from both words;
+- when two words were said in one breath and there is no quiet at all, the join
+  goes to the quietest instant between them.
+
+Pause trims get the same treatment, walled in by the words either side of the
+silence; a pause whose measured quiet is too short to trim is left alone, and a
+pause whose edges you dragged by hand is used exactly as drawn. A word whose
+timing alignment could not confirm is trusted as a wall but searched past, by up
+to 150 ms, when its pause holds no quiet.
+
+Preview, media export and text exports (EDL, SRT, CSV) all play this one plan,
+so what you hear while editing is what you get. Every join fades out and back in
+over 6 ms, which is inaudible in silence and removes the click from a join
+between words said in one breath.
+
+The plan checks itself: every join is measured, and one that still sits on sound
+is marked amber on the edit strip under the player. `Check next join` plays from
+just before it. On the recordings this was tuned against, about 4% of joins are
+like that, and all of them are words run together with no pause to find.
+
+## Export and preview
 
 `Reliable Quality` is the default media export. It creates a high-quality
 H.264/AAC MP4 with continuous frame timing and uses NVIDIA hardware encoding
@@ -247,7 +308,12 @@ shows a prompt to export first when no media export exists. Text exports such
 as EDL, CSV, TXT, and SRT are not selected.
 
 Edited preview uses native range-aware file delivery and seeks across cuts
-without pausing first. For high-bitrate 4K phone media, `Smooth Preview` can
+without pausing first. For audio it checks for a cut every animation frame and
+one frame ahead, so a deleted word is skipped before it is heard. An iPhone
+voice memo saved as lossless is Apple Lossless (ALAC) in an `.m4a`, which only
+Safari plays, so Retake makes a FLAC copy once, in the background when the
+project opens, and serves that instead. FLAC is also lossless and has no encoder
+delay, so preview stays sample-aligned with the transcript. For high-bitrate 4K phone media, `Smooth Preview` can
 prepare a reusable 720p H.264/AAC proxy with NVIDIA decoding, scaling, and
 encoding, with a speed-oriented CPU fallback. This is an explicit one-time job,
 remains valid when edits change, and
@@ -271,6 +337,8 @@ word always splits the cut, and kept speech is never entered.
 - **Word click vs. seek**: the spec binds plain click to both "toggle strike" and "seek there". Plain click toggles the cut (the core editing loop); **Alt+click or double-click seeks**. Listed in the `?` shortcut overlay.
 - **ffprobe fallback**: `imageio-ffmpeg` ships only ffmpeg. If ffprobe isn't on PATH (or next to ffmpeg), probing falls back to parsing `ffmpeg -i` output instead of failing at startup — strictly more robust, same results.
 - **llama-cpp-python** is commented out in `requirements.txt` (it may need a compiler to build). This keeps `pip install -r requirements.txt` failure-proof; the AI feature documents its own one-line install above.
+- **Sound tokens**: a `sound` token sits in `tokens` beside `word` and `gap`.
+  It is measured from the audio, so re-running alignment never moves it.
 - **Gap data**: Whisper-derived gap tokens remain compatible with old projects
   and AI instructions. Measured real-audio silences are stored separately in
   `audio_gaps`, each keeping the detector's own boundaries beside any manual

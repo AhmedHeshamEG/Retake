@@ -74,6 +74,15 @@ main{display:flex; flex:1; min-height:0}
   color:var(--amber); background:rgba(17,17,19,.92);
 }
 #codecNotice.on{display:block}
+/* The edit strip: the whole recording, what is cut, and any join worth a listen. */
+#editStrip{padding:8px 12px 2px}
+#editStrip[hidden]{display:none}
+#stripCanvas{display:block; width:100%; height:44px; border-radius:6px; background:#090c10; cursor:pointer; touch-action:none}
+#stripMeta{display:flex; align-items:center; gap:8px; min-height:26px; font-size:12.5px; color:var(--dim)}
+#stripMeta .spacer{flex:1}
+#stripInfo{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+#nextFlag{border-color:var(--amber); color:var(--amber); background:transparent; white-space:nowrap; flex:none}
+#nextFlag:hover{background:rgba(255,178,36,.12)}
 
 #transcript{
   flex:1; overflow-y:auto; padding:26px 34px 46vh;
@@ -244,6 +253,15 @@ header{
 #gapBulkPanel{position:absolute;z-index:65;top:42px;left:0;width:300px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
 #gapBulkPanel .gap-threshold{display:grid;grid-template-columns:1fr 70px 16px;align-items:center;gap:6px;color:var(--dim);font-size:12px}
 #gapBulkPanel .gap-threshold input{width:70px;padding:6px 7px;font-variant-numeric:tabular-nums}
+#gapBulkPanel .gap-threshold+.gap-threshold{margin-top:5px}
+/* The bars are the detected silences themselves, shortest to longest, so the
+   range is chosen against the recording rather than guessed at. */
+#gapHisto{display:flex;align-items:flex-end;gap:2px;height:40px;margin:9px 0 2px}
+#gapHisto:empty{display:none}
+#gapHisto button{flex:1;min-width:0;padding:0;height:100%;display:flex;align-items:flex-end;background:none;border:0;border-radius:2px;cursor:pointer}
+#gapHisto button:hover{background:#ffffff0d}
+#gapHisto b{display:block;width:100%;min-height:2px;border-radius:2px 2px 0 0;background:#39414c}
+#gapHisto button.in b{background:var(--accent,#4c8cf5)}
 #gapLongerHint{display:block;margin:7px 0 2px;color:#747d89;font-size:11px;line-height:1.45}
 .gap-scope-actions{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid #2d3239}
 .gap-scope-actions button{display:flex;justify-content:space-between;align-items:center;width:100%;text-align:left}
@@ -264,6 +282,12 @@ header{
 #transcript .w.prop{box-shadow:inset 0 -3px 0 var(--amber);border-bottom-color:var(--amber)}
 #transcript .g{display:none;padding:0 11px;line-height:27px;margin:3px 5px;background:#1b2027}
 #transcript.show-legacy-gaps .g{display:inline-block}
+/* A sound is audible but has no words: a breath, a click, a hum. It is always
+   shown, because unlike a silence it is something the listener will hear. */
+#transcript .snd{display:inline-block;padding:0 8px;line-height:23px;margin:3px 3px;border:1px dashed #4a4436;border-radius:999px;background:#1d1a14;color:#b9a577;font:11px ui-monospace,Consolas,monospace;cursor:pointer;white-space:nowrap;vertical-align:middle}
+#transcript .snd:hover,#transcript .snd:focus{border-color:#8a7a52;color:#ead9a8;outline:none}
+#transcript .snd.maybe{border-style:solid;border-color:#c99a3a;color:#f0c46a}
+#transcript .snd.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}
 #transcript .ag{display:inline-flex;align-items:center;gap:6px;padding:0 9px;line-height:25px;margin:3px 5px;border:1px solid #3d4652;border-radius:999px;background:#1a2027;color:#aab2be;font:11px ui-monospace,Consolas,monospace;cursor:pointer;vertical-align:middle}
 #transcript .ag:hover{border-color:#748091;color:#eef0f2}.ag .gap-edit{border:0;background:transparent;padding:0;color:#9299a5}.ag.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}.ag.manual::after{content:"•";color:var(--amber)}
 #transcript .ag.suggest{border-color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber);color:#f1c46d}
@@ -380,11 +404,17 @@ header{
           <button id="gapSettingsBtn" class="small" title="Gap detection settings" disabled>⚙</button>
           <button id="gapApply" class="small" disabled>Remove gaps…</button>
           <button id="gapCancel" class="small" hidden>Cancel</button>
+          <button id="soundCut" class="small" hidden title="Breaths, clicks and other sounds that have no words. They are not silences, so removing gaps leaves them in."></button>
           <div id="gapBulkPanel" hidden>
-            <label class="gap-threshold">Only silences longer than
+            <label class="gap-threshold">Silences from
               <input id="gapLonger" type="number" min="0" max="60" step="0.1" value="0">
               <span>s</span>
             </label>
+            <label class="gap-threshold">up to
+              <input id="gapShorter" type="number" min="0" max="60" step="0.1" placeholder="any">
+              <span>s</span>
+            </label>
+            <div id="gapHisto" role="group" aria-label="Detected silences by length; click a bar to filter to it"></div>
             <small id="gapLongerHint">Counts every detected silence.</small>
             <div class="gap-scope-actions">
               <button id="gapScopeAll" class="small">Everywhere<em></em></button>
@@ -424,6 +454,14 @@ header{
         <div id="playerWrap">
           <video id="player" preload="metadata" controls></video>
           <div id="codecNotice">Preview unavailable for this codec — editing and export still work.</div>
+        </div>
+        <div id="editStrip" hidden>
+          <canvas id="stripCanvas" height="88" aria-label="Whole recording: cut parts shaded, joins to check marked amber. Click to seek."></canvas>
+          <div id="stripMeta">
+            <span id="stripInfo">Placing joins…</span>
+            <span class="spacer"></span>
+            <button id="nextFlag" class="small" hidden title="Play from just before the next join that falls between words said in one breath">Check next join ▸</button>
+          </div>
         </div>
         <div class="playerMeta">
           <div id="playerTime">00:00:00.000 / 00:00:00.000</div>
@@ -600,11 +638,16 @@ const S = {
   },
   autoscroll: true,
   cutIvs: [], keeps: [],    // derived intervals
+  planned: null,            // {sig, keeps, joins}: where the server put every join
+  planPending: null,        // signature of the edit a /joins request is out for
+  stripPeaks: null,         // whole-recording waveform for the edit strip
+  flagIndex: -1,
   transcriptCutIvs: [],     // authoritative backend-composed transcript cuts
   cutsSynced: true,
   cutRevision: 0,
   segTokens: new Map(),     // seg id -> [word token ids]
   gapIds: [],               // gap token ids
+  soundIds: [],             // wordless-sound token ids
   showGaps: false,
   audioGaps: [],
   gapSettings: {min_duration_s:.35,silence_db:-40,keep_pause_s:.12},
@@ -713,10 +756,114 @@ function keepList(cuts, dur, eps = 0.001) {
   return keeps;
 }
 
+
+/* ============================================================ planned joins */
+function editSignature() {
+  const gaps = S.audioGaps.filter((gap) => gap.cut)
+    .map((gap) => `${gap.id}:${gap.start}:${gap.end}:${gap.manual ? 1 : 0}`).join(",");
+  return [...S.cut].sort((a, b) => a - b).join(",") + "|" + gaps;
+}
+function cutsFromKeeps(keeps, dur) {
+  const cuts = []; let cur = 0;
+  for (const [a, b] of keeps) { if (a - cur > 0.001) cuts.push([cur, a]); cur = b; }
+  if (dur - cur > 0.001) cuts.push([cur, dur]);
+  return cuts;
+}
+const requestJoins = debounce(async () => {
+  const P = S.proj; if (!P) return;
+  const sig = editSignature();
+  S.planPending = sig;
+  try {
+    const plan = await api("/joins", {
+      cut_ids: [...S.cut],
+      audio_gaps: S.audioGaps.map((gap) => ({id:gap.id, start:gap.start, end:gap.end, cut:!!gap.cut, manual:!!gap.manual})),
+    });
+    if (S.proj !== P || S.planPending !== sig) return;
+    S.planPending = null;
+    if (!plan.available) { S.planned = null; renderStripInfo(); return; }
+    S.planned = {sig, keeps: plan.keeps, joins: plan.joins || []};
+    S.flagIndex = -1;
+    if (editSignature() === sig) recompute();
+  } catch (error) {
+    if (S.planPending === sig) S.planPending = null;
+    $("stripInfo").textContent = "Joins could not be placed: " + error.message;
+  }
+}, 250);
+function flaggedJoins() {
+  return (S.planned?.joins || []).filter((join) => join.on_sound);
+}
+function renderStripInfo() {
+  const info = $("stripInfo"), button = $("nextFlag");
+  if (!S.planned) { info.textContent = S.proj?.probe?.acodec ? "Placing joins…" : ""; button.hidden = true; return; }
+  const joins = S.planned.joins.length, flagged = flaggedJoins().length;
+  info.textContent = !joins ? "No cuts yet"
+    : flagged ? `${joins} joins · ${flagged} between words said in one breath`
+    : `${joins} joins · all in silence`;
+  button.hidden = !flagged;
+}
+async function loadStripPeaks() {
+  const P = S.proj; if (!P || !P.probe?.acodec) return;
+  try {
+    const data = await api(`/overview?points=1200`);
+    if (S.proj === P) { S.stripPeaks = data.peaks || []; drawStrip(); }
+  } catch { /* the strip still shows cuts without a waveform */ }
+}
+function drawStrip() {
+  const P = S.proj, canvas = $("stripCanvas");
+  $("editStrip").hidden = !P;
+  if (!P) return;
+  const width = Math.max(200, Math.round(canvas.clientWidth * devicePixelRatio || 600));
+  if (canvas.width !== width) canvas.width = width;
+  const ctx = canvas.getContext("2d"), w = canvas.width, h = canvas.height, dur = P.duration_s || 1;
+  const x = (t) => t / dur * w;
+  ctx.clearRect(0, 0, w, h);
+  // Kept audio is drawn light and cut audio dim red, so even a heavily cut
+  // take still reads as a waveform rather than a red bar.
+  const peaks = S.stripPeaks;
+  if (peaks?.length) {
+    const step = w / peaks.length;
+    for (let i = 0; i < peaks.length; i++) {
+      const v = Math.max(1, peaks[i] * (h * .44));
+      ctx.fillStyle = insideCut((i + .5) / peaks.length * dur) ? "#6e3436" : "#a9b8c9";
+      ctx.fillRect(i * step, h / 2 - v, Math.max(1, step - .3), v * 2);
+    }
+  } else {
+    ctx.fillStyle = "rgba(229,72,77,.38)";
+    for (const [a, b] of S.cutIvs) ctx.fillRect(x(a), 0, Math.max(1, x(b) - x(a)), h);
+  }
+  ctx.fillStyle = "#FFB224";
+  for (const join of flaggedJoins()) ctx.fillRect(x(join.time) - 2 * devicePixelRatio, 0, 4 * devicePixelRatio, h);
+  const playhead = x(player.currentTime || 0);
+  ctx.fillStyle = "#EDEDEF";
+  ctx.fillRect(playhead - devicePixelRatio / 2, 0, devicePixelRatio, h);
+  renderStripInfo();
+}
+$("stripCanvas").addEventListener("pointerdown", (event) => {
+  const P = S.proj; if (!P) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const t = Math.max(0, Math.min(P.duration_s, (event.clientX - rect.left) / rect.width * P.duration_s));
+  // A click near an amber mark plays into that join, which is what it is for.
+  const near = flaggedJoins().find((join) => Math.abs(join.time - t) / P.duration_s * rect.width < 6);
+  player.currentTime = near ? Math.max(0, near.time - 1.5) : t;
+  if (near) player.play().catch(() => {});
+  drawStrip();
+});
+$("nextFlag").addEventListener("click", () => {
+  const flagged = flaggedJoins(); if (!flagged.length) return;
+  const now = player.currentTime || 0;
+  let next = flagged.findIndex((join) => join.time - 1.5 > now + .05);
+  if (next < 0) next = 0;
+  S.flagIndex = next;
+  player.currentTime = Math.max(0, flagged[next].time - 1.5);
+  player.play().catch(() => {});
+  toast(`Join ${next + 1} of ${flagged.length} at ${fmtTime(flagged[next].time)} — the words either side run together, so it was cut at the quietest instant and faded.`);
+});
+addEventListener("resize", debounce(drawStrip, 120));
+
 /* ================================================================ transcript */
 function renderTranscript() {
   const P = S.proj, T = $("transcript");
-  S.segTokens = new Map(); S.gapIds = [];
+  S.segTokens = new Map(); S.gapIds = []; S.soundIds = [];
   const seg2cl = new Map(), clOrd = new Map();   // seg id -> [cluster idx, pos, size]
   P.clusters.forEach((c, ci) =>
     c.members.forEach((sid, k) => { seg2cl.set(sid, ci); clOrd.set(sid, [k + 1, c.members.length]); }));
@@ -739,6 +886,14 @@ function renderTranscript() {
       S.gapIds.push(t.id);
       const secs = (t.end - t.start).toFixed(1);
       html.push(`<span class="g" data-id="${t.id}" title="silence ${fmtTime(t.start)} – ${fmtTime(t.end)}">⋯ ${secs}s ⋯</span> `);
+      continue;
+    }
+    if (t.kind === "sound") {
+      // Listed with the gaps so striking a sentence takes its inner sounds too.
+      S.gapIds.push(t.id); S.soundIds.push(t.id);
+      const secs = (t.end - t.start).toFixed(2);
+      const maybe = t.maybe_speech ? ` May be speech: Whisper heard “${escHtml(t.maybe_speech)}” but it did not line up with the wave — listen.` : "";
+      html.push(`<span class="snd${t.maybe_speech ? " maybe" : ""}" tabindex="0" role="button" data-id="${t.id}" title="Sound with no words, ${fmtTime(t.start)} – ${fmtTime(t.end)}.${maybe} Click to cut, Alt-click to hear it.">♪ ${secs}s${t.maybe_speech ? " ?" : ""}</span> `);
       continue;
     }
     if (t.seg !== lastSeg) {
@@ -852,6 +1007,16 @@ function recompute() {
   for (const gap of S.audioGaps) if (gap.cut && gap.end > gap.start) ivs.push([gap.start, gap.end]);
   S.cutIvs = mergeIntervals(ivs);
   S.keeps = keepList(S.cutIvs, P.duration_s);
+  // Once the server has placed this exact edit on the waveform, preview plays
+  // its joins -- the same ones the export will use.
+  const sig = editSignature();
+  if (S.planned && S.planned.sig === sig) {
+    S.keeps = S.planned.keeps.map((keep) => [...keep]);
+    S.cutIvs = cutsFromKeeps(S.keeps, P.duration_s);
+  } else if (S.planPending !== sig) {
+    requestJoins();
+  }
+  drawStrip();
   const edited = S.keeps.reduce((a,[x,y]) => a + (y - x), 0);
   $("durOrig").textContent = fmtDur(P.duration_s);
   $("durEdit").textContent = fmtDur(edited);
@@ -861,7 +1026,22 @@ function recompute() {
   $("gapStat").textContent = S.audioGaps.length || P.tokens.filter((t) => t.kind === "gap").length;
   $("repeatStat").textContent = P.word_repeats.length;
   updateGapControls();
+  updateSoundControl();
 }
+/* One button for every wordless sound: it cuts the ones still in, and once
+   they are all out it offers to put them back. It goes through toggleTokens,
+   so it is one undo step and saves like any other cut. */
+function updateSoundControl() {
+  const ids = S.soundIds, kept = ids.filter((id) => !S.cut.has(id)).length;
+  $("soundCut").hidden = !ids.length;
+  $("soundCut").textContent = kept
+    ? `Cut ${kept} sound${kept === 1 ? "" : "s"}`
+    : `Restore ${ids.length} sound${ids.length === 1 ? "" : "s"}`;
+}
+$("soundCut").addEventListener("click", () => {
+  if (!S.soundIds.length) return;
+  toggleTokens(S.soundIds, S.soundIds.some((id) => !S.cut.has(id)));
+});
 const saveCuts = debounce(async () => {
   if (!S.proj) return;
   const revision = S.cutRevision;
@@ -965,10 +1145,11 @@ function updateGapControls() {
     $(id).disabled = blocked || !count;
     $(id).querySelector("em").textContent = count ? String(count) : "none";
   }
-  const minimum = gapLongerThan();
-  $("gapLongerHint").textContent = minimum
-    ? `Ignores anything shorter. Detection is unchanged — the gear sets what counts as silence.`
+  const range = gapRangeLabel();
+  $("gapLongerHint").textContent = range
+    ? `Offers only silences ${range}. Detection is unchanged — the gear sets what counts as silence.`
     : "Counts every detected silence. The gear sets what counts as silence at all.";
+  renderGapHistogram();
   $("gapCancel").hidden = !S.gapSuggestions.size;
   $("gapPreview").disabled = !S.proj || S.gapDetecting;
   $("gapCount").textContent = S.gapDetecting ? "Detecting…" : !S.showGaps ? "Off" : `${S.audioGaps.length} gap${S.audioGaps.length === 1 ? "" : "s"}`;
@@ -1091,11 +1272,80 @@ function gapLongerThan() {
   const value = Number($("gapLonger").value);
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
+/* The upper bound is optional and empty by default, so the control still reads
+   as "longer than X" until a ceiling is actually wanted. A blank, zero or
+   nonsensical box means no ceiling rather than a range that matches nothing. */
+function gapShorterThan() {
+  const raw = $("gapShorter").value.trim();
+  if (!raw) return Infinity;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : Infinity;
+}
+function gapRangeLabel() {
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
+  if (minimum && Number.isFinite(maximum)) return `between ${minimum.toFixed(2)}s and ${maximum.toFixed(2)}s`;
+  if (minimum) return `longer than ${minimum.toFixed(2)}s`;
+  if (Number.isFinite(maximum)) return `shorter than ${maximum.toFixed(2)}s`;
+  return "";
+}
+/* A length filter with two boxes is only intuitive if the recording says which
+   numbers are worth typing. The strip is a histogram of every detected silence
+   by length, shortest on the left; the bars inside the range are lit, and
+   clicking one sets the range to that bucket (clicking the lit bucket again
+   clears it). It reads the same gaps the scope buttons count, so it never
+   triggers detection. */
+const GAP_HISTO_BUCKETS = 14;
+function gapHistogramBuckets() {
+  const lengths = S.audioGaps
+    .filter((gap) => bulkBounds(gap))
+    .map((gap) => gap.detected_end - gap.detected_start)
+    .sort((a, b) => a - b);
+  if (lengths.length < 2) return [];
+  const lo = lengths[0], hi = lengths[lengths.length - 1];
+  const span = hi - lo;
+  if (span < .01) return [];
+  const width = span / GAP_HISTO_BUCKETS;
+  const buckets = Array.from({length: GAP_HISTO_BUCKETS}, (_unused, index) => ({
+    start: lo + index * width, end: lo + (index + 1) * width, count: 0,
+  }));
+  for (const length of lengths) {
+    const index = Math.min(GAP_HISTO_BUCKETS - 1, Math.floor((length - lo) / width));
+    buckets[index].count += 1;
+  }
+  return buckets;
+}
+function renderGapHistogram() {
+  const strip = $("gapHisto");
+  const buckets = $("gapBulkPanel").hidden ? [] : gapHistogramBuckets();
+  if (!buckets.length) { strip.innerHTML = ""; return; }
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
+  const tallest = Math.max(...buckets.map((bucket) => bucket.count));
+  strip.innerHTML = buckets.map((bucket, index) => {
+    const lit = bucket.end >= minimum - .0005 && bucket.start <= maximum + .0005;
+    const height = Math.round((bucket.count / tallest) * 100);
+    return `<button type="button" class="${lit ? "in" : ""}" data-bucket="${index}" `
+      + `title="${bucket.count} silence${bucket.count === 1 ? "" : "s"} `
+      + `${bucket.start.toFixed(2)}–${bucket.end.toFixed(2)}s"><b style="height:${height}%"></b></button>`;
+  }).join("");
+}
+$("gapHisto").addEventListener("click", (event) => {
+  const bar = event.target.closest("button[data-bucket]"); if (!bar) return;
+  const bucket = gapHistogramBuckets()[Number(bar.dataset.bucket)]; if (!bucket) return;
+  /* Widen a touch at both ends so a gap sitting exactly on a bucket edge is
+     not lost to the two decimal places the boxes show. */
+  const lower = Math.max(0, Math.floor(bucket.start * 100) / 100);
+  const upper = Math.ceil(bucket.end * 100) / 100;
+  const already = gapLongerThan() === lower && gapShorterThan() === upper;
+  $("gapLonger").value = already ? 0 : lower.toFixed(2);
+  $("gapShorter").value = already ? "" : upper.toFixed(2);
+  updateGapControls();
+});
 function gapsInScope(scope) {
-  const minimum = gapLongerThan();
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
   return S.audioGaps.filter((gap) => {
     if (!bulkBounds(gap)) return false;
     if (gap.detected_end - gap.detected_start < minimum - .0005) return false;
+    if (gap.detected_end - gap.detected_start > maximum + .0005) return false;
     if (scope === "kept") return S.scopedGapIds.has(gap.id);
     if (scope === "removed") return S.removedGapIds.has(gap.id);
     return true;
@@ -1109,24 +1359,25 @@ const GAP_SCOPE_LABEL = {
 function reviewGapScope(scope) {
   const eligible = gapsInScope(scope);
   if (!eligible.length) {
-    const minimum = gapLongerThan();
-    toast(minimum
-      ? `No silences longer than ${minimum.toFixed(2)}s ${GAP_SCOPE_LABEL[scope]}`
+    const range = gapRangeLabel();
+    toast(range
+      ? `No silences ${range} ${GAP_SCOPE_LABEL[scope]}`
       : `No removable silences ${GAP_SCOPE_LABEL[scope]}`, "warn");
     return;
   }
   S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
   $("gapBulkPanel").hidden = true;
   renderTranscript(); updateGapControls();
-  const minimum = gapLongerThan();
+  const range = gapRangeLabel();
   toast(`Reviewing ${eligible.length} silence${eligible.length === 1 ? "" : "s"}`
-    + (minimum ? ` longer than ${minimum.toFixed(2)}s` : "")
+    + (range ? ` ${range}` : "")
     + ` ${GAP_SCOPE_LABEL[scope]} · ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s pause kept`);
 }
 $("gapScopeAll").addEventListener("click", () => reviewGapScope("all"));
 $("gapScoped").addEventListener("click", () => reviewGapScope("kept"));
 $("gapScopeRemoved").addEventListener("click", () => reviewGapScope("removed"));
 $("gapLonger").addEventListener("input", updateGapControls);
+$("gapShorter").addEventListener("input", updateGapControls);
 function clearGapSuggestions(render = true) {
   S.gapSuggestions.clear();
   if (render && S.proj) renderTranscript();
@@ -1438,12 +1689,17 @@ function armCutSeekRecovery() {
 }
 function skipTick() {
   if (!S.proj || !S.edited || player.paused || player.seeking || skipState.pending) return;
-  const iv = insideCut(player.currentTime);
+  // Audio has no frames to wake this up, so it is polled every animation frame;
+  // looking one frame ahead jumps before the cut is heard, not after.
+  const ahead = S.proj.probe?.has_video ? 0 : 0.017;
+  const iv = insideCut(player.currentTime) || insideCut(player.currentTime + ahead);
   if (!iv) return;
   if (iv[1] >= S.proj.duration_s - 0.05) {
     player.pause(); player.currentTime = S.proj.duration_s; clearSkipState(); return;
   }
-  const target = Math.min(S.proj.duration_s, iv[1] + 0.04);
+  // Video seeks land on a frame, so they need a margin past the cut; audio
+  // seeks are sample-exact and a margin would only clip the next word.
+  const target = Math.min(S.proj.duration_s, iv[1] + (S.proj.probe?.has_video ? 0.04 : 0.002));
   if (skipState.target !== null && Math.abs(skipState.target - target) < 0.02) return;
   skipState.pending = true; skipState.target = target;
   skipState.wasPlaying = !player.paused; skipState.retries = 0;
@@ -1453,7 +1709,7 @@ function skipTick() {
 function updatePlayerTime() {
   $("playerTime").textContent = `${fmtTime(player.currentTime)} / ${fmtTime(S.proj?.duration_s || player.duration || 0)}`;
 }
-player.addEventListener("timeupdate", () => { skipTick(); highlightWord(); updatePlayerTime(); });
+player.addEventListener("timeupdate", () => { skipTick(); highlightWord(); updatePlayerTime(); if (player.paused) drawStrip(); });
 player.addEventListener("seeked", finishCutSeek);
 player.addEventListener("canplay", () => {
   if (skipState.pending && skipState.target !== null &&
@@ -1477,6 +1733,12 @@ if (player.requestVideoFrameCallback) {
   const onVideoFrame = () => { skipTick(); player.requestVideoFrameCallback(onVideoFrame); };
   player.requestVideoFrameCallback(onVideoFrame);
 }
+// timeupdate fires about four times a second, which let up to a quarter of a
+// second of a cut play before the jump. A frame-rate check closes that.
+(function frameTick() {
+  if (S.proj && !player.paused) { skipTick(); if (!$("editStrip").hidden) drawStrip(); }
+  requestAnimationFrame(frameTick);
+})();
 player.addEventListener("error", () => {
   clearSkipState();
   if (S.smoothPreview.active && !S.smoothPreview.fallingBack) {
@@ -2206,6 +2468,8 @@ async function loadProject() {
   S.scopedGapIds = new Set(P.scoped_gap_candidate_ids || []);
   S.removedGapIds = new Set(P.removed_gap_candidate_ids || []);
   S.cutsSynced = true; S.cutRevision = 0;
+  S.planned = null; S.planPending = null; S.stripPeaks = null; S.flagIndex = -1;
+  loadStripPeaks();
   S.showGaps = false;
   S.audioGaps = (P.audio_gaps || []).map((gap) => ({...gap}));
   S.gapSuggestions.clear();

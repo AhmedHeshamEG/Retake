@@ -39,10 +39,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import numpy as np
 import uvicorn
 from fastapi import Body, FastAPI, Request
 from starlette.requests import ClientDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
+
+import splice
 
 # The application ships with its model weights. Never contact a model hub.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -99,7 +102,15 @@ UPLOAD_META_FLUSH_S = 2.0
 RETAKE_MAX_SPAN_S = 90.0
 RETAKE_MAX_MEMBERS = 8
 PREVIEW_PROXY_VERSION = 2
-ALIGNMENT_VERSION = 1
+ALIGNMENT_VERSION = 2
+# Version 2 adds a second pass for the words the first could not place. A
+# version 1 project is still aligned; it just offers to recalibrate.
+ALIGNMENT_MIN_COMPATIBLE_VERSION = 1
+# The second pass aligns a few words inside a window walled in by aligned
+# neighbours, so it can accept a lower score than a word aligned blind.
+ALIGNMENT_RESCUE_MIN_SCORE = 0.30
+ALIGNMENT_RESCUE_MAX_WINDOW_S = 20.0
+ALIGNMENT_RESCUE_MIN_WINDOW_S = 0.05
 ALIGNMENT_MIN_COVERAGE = 0.85
 ALIGNMENT_MIN_SCORE = 0.45
 ALIGNMENT_MAX_WORD_SECONDS = 2.5
@@ -595,6 +606,15 @@ def _timed_interval(item: dict[str, Any]) -> Optional[tuple[float, float]]:
     return start, end
 
 
+def word_timing_is_rough(token: dict[str, Any]) -> bool:
+    """True when a word's timing is Whisper's estimate rather than aligned audio.
+
+    A word laid onto the measured waveform between two aligned neighbours is
+    timed from the audio too.
+    """
+    return "alignment_score" not in token and not token.get("waveform_timed")
+
+
 def _composed_word_runs(
     tokens: list[dict[str, Any]],
     safety_handle: float = 0.0,
@@ -612,7 +632,7 @@ def _composed_word_runs(
     deleted word behind or to clip a kept one. A run at the head or the tail of
     the recording reports ``None`` for the neighbour it does not have.
     """
-    words: list[tuple[float, float, str, bool]] = []
+    words: list[tuple[float, float, str, bool, bool]] = []
     for token in tokens:
         if token.get("kind") != "word":
             continue
@@ -620,16 +640,22 @@ def _composed_word_runs(
         if interval is None:
             continue
         start, end = interval
-        words.append((start, end, str(token.get("id", "")), bool(token.get("cut"))))
+        words.append((
+            start, end, str(token.get("id", "")), bool(token.get("cut")),
+            word_timing_is_rough(token),
+        ))
     words.sort(key=lambda word: (word[0], word[1], word[2]))
 
     runs: list[dict[str, Any]] = []
     run: Optional[dict[str, Any]] = None
     previous_kept_end: Optional[float] = None
-    for start, end, _token_id, is_cut in words:
+    previous_kept_rough = True
+    for start, end, _token_id, is_cut, rough in words:
         if is_cut:
             if run is not None:
                 run["end"] = max(run["end"], end)
+                if end >= run["last_deleted_end"]:
+                    run["last_deleted_rough"] = rough
                 run["last_deleted_end"] = max(run["last_deleted_end"], end)
             else:
                 protected_start = start
@@ -650,6 +676,10 @@ def _composed_word_runs(
                     "first_deleted_start": start,
                     "last_deleted_end": end,
                     "next_kept_start": None,
+                    "prev_kept_rough": previous_kept_rough,
+                    "first_deleted_rough": rough,
+                    "last_deleted_rough": rough,
+                    "next_kept_rough": True,
                 }
         elif run is not None:
             protected_end = start - safety_handle if absorb_pauses else run["end"]
@@ -658,11 +688,14 @@ def _composed_word_runs(
             if protected_end > run["start"] + MERGE_EPS:
                 run["end"] = protected_end
                 run["next_kept_start"] = start
+                run["next_kept_rough"] = rough
                 runs.append(run)
             run = None
             previous_kept_end = end
+            previous_kept_rough = rough
         else:
             previous_kept_end = end
+            previous_kept_rough = rough
     if run is not None:
         run_end = run["end"]
         if absorb_pauses and duration is not None and math.isfinite(duration):
@@ -728,7 +761,7 @@ def project_uses_aligned_timing(proj: dict[str, Any]) -> bool:
     return (
         isinstance(alignment, dict)
         and alignment.get("status") == "aligned"
-        and alignment.get("version") == ALIGNMENT_VERSION
+        and int(alignment.get("version") or 0) >= ALIGNMENT_MIN_COMPATIBLE_VERSION
         and float(alignment.get("coverage") or 0.0) >= ALIGNMENT_MIN_COVERAGE
     )
 
@@ -1026,190 +1059,236 @@ def detect_silence_intervals(
     return parse_silencedetect_output(result.stderr, duration)
 
 
-def export_edge_bounds(proj: dict[str, Any]) -> list[tuple[float, float, float]]:
-    """``(boundary, earliest, latest)`` for every composed word-cut edge.
+# Each join keeps this much of the pause beside the speech it belongs to.
+JOIN_HANDLE_S = WORD_CUT_SAFETY_S
+# A pause cut may move its edges this far outside the silence it was detected
+# as, to reach the quiet the detector's threshold missed -- never further.
+GAP_JOIN_REACH_S = 0.25
+# A word whose timing straddles a join by more than this is "under" it.
+WORD_COVER_TOLERANCE_S = 0.02
 
-    A cut boundary is only ever allowed to travel inside the pause that separates
-    the deleted speech from the speech kept beside it. ``earliest`` and
-    ``latest`` are that pause's two speech walls, taken from the words' own
-    aligned timings, so nothing the silence detector reports can restore a
-    deleted word or clip a kept one. Edges with no such walls -- gap cuts, the
-    head and the tail of the recording -- are simply absent from this list and
-    fall back to the conservative unanchored rule.
+
+def _join_words(tokens: list[dict[str, Any]]) -> list[tuple[float, float, bool]]:
+    words: list[tuple[float, float, bool]] = []
+    for token in tokens:
+        if token.get("kind") != "word":
+            continue
+        interval = _timed_interval(token)
+        if interval is not None:
+            words.append((interval[0], interval[1], word_timing_is_rough(token)))
+    words.sort()
+    return words
+
+
+def _walls_around(
+    words: list[tuple[float, float, bool]], boundary: float, duration: float,
+) -> tuple[float, float, bool, bool]:
+    """The pause a boundary sits in: the end of the word before, the start of the one after.
+
+    A boundary that falls inside a word's reported timing -- a pause cut laid
+    over a word Whisper stretched across silence -- is given that word's own
+    span, narrowed to the rough reach, and treated as rough on both sides.
     """
+    tolerance = WORD_COVER_TOLERANCE_S
+    for start, end, _rough in words:
+        if start + tolerance < boundary < end - tolerance:
+            return (
+                max(start, boundary - splice.ROUGH_REACH_S),
+                min(end, boundary + splice.ROUGH_REACH_S),
+                True, True,
+            )
+    low, rough_low = 0.0, False
+    high, rough_high = duration, False
+    for start, end, rough in words:
+        if end <= boundary + tolerance and end >= low:
+            low, rough_low = end, rough
+        if start >= boundary - tolerance and start < high:
+            high, rough_high = start, rough
+    return min(low, boundary), max(high, boundary), rough_low, rough_high
+
+
+def _reach(rough: bool) -> float:
+    return splice.ROUGH_REACH_S if rough else splice.PRECISE_REACH_S
+
+
+def plan_joins(proj: dict[str, Any], track: "splice.Track") -> dict[str, Any]:
+    """Every cut, placed on the waveform, plus a check of every join it makes.
+
+    This is the single place a cut becomes a pair of sample positions. Preview
+    and export both play what it returns, and the self-check it reports is
+    measured on the same levels that placed the joins.
+
+    The transcript decides which pause each edge belongs in; the audio decides
+    where in that pause it goes (see ``splice``). Pause cuts get the same
+    treatment, walled in by the words either side of the silence, and a pause
+    whose measured quiet turns out too short to trim is left alone. A pause cut
+    whose edges were dragged by hand is used exactly as drawn.
+    """
+    duration = float(proj.get("duration_s") or 0.0)
     params = cut_composition_params(proj)
-    try:
-        duration = float(proj.get("duration_s") or 0.0)
-    except (TypeError, ValueError):
-        duration = 0.0
-    bounds: list[tuple[float, float, float]] = []
-    for run in _composed_word_runs(proj.get("tokens", []), **params):
-        previous_kept = run["prev_kept_end"]
-        next_kept = run["next_kept_start"]
-        edges = (
-            # The cut's opening edge is a keep's end: it lives in the pause
-            # between the last kept word and the first deleted one.
-            (run["start"], 0.0 if previous_kept is None else float(previous_kept),
-             float(run["first_deleted_start"])),
-            # Its closing edge is the next keep's start, in the pause between the
-            # last deleted word and the next kept one.
-            (run["end"], float(run["last_deleted_end"]),
-             duration if next_kept is None else float(next_kept)),
-        )
-        for boundary, low, high in edges:
-            if math.isfinite(low) and math.isfinite(high) and high > low + MERGE_EPS:
-                bounds.append((float(boundary), low, high))
-    return bounds
+    tokens = proj.get("tokens", [])
+    words = _join_words(tokens)
+    handle = JOIN_HANDLE_S
+    cuts: list[tuple[float, float]] = []
+    how: dict[float, str] = {}
 
+    def at_edge(boundary: float) -> bool:
+        return boundary <= MERGE_EPS or boundary >= duration - MERGE_EPS
 
-def export_trough_threshold_db(profile: dict[str, float | bool]) -> float:
-    """The level below which a dip between two words counts as a place to cut.
-
-    The standalone silence threshold is tuned to find real pauses anywhere in the
-    recording, so it is deliberately shy. Inside a bounded pause there is nothing
-    to be shy about, and the dip between two words rarely falls all the way to
-    the noise floor -- it sits some way below the speaker's own level. Taking
-    whichever of those two references is more permissive finds the trough on a
-    quiet recording and on a noisy one alike.
-    """
-    try:
-        noise_floor = float(profile.get("noise_floor_db", -60.0))
-        speech_level = float(profile.get("speech_level_db", -20.0))
-    except (TypeError, ValueError):
-        return EXPORT_SILENCE_DB_DEFAULT
-    if not math.isfinite(noise_floor) or not math.isfinite(speech_level):
-        return EXPORT_SILENCE_DB_DEFAULT
-    return max(-60.0, min(-24.0, max(noise_floor + 6.0, speech_level - 25.0)))
-
-
-def refine_export_keep_edges(
-    keeps: list[tuple[float, float]],
-    silences: list[tuple[float, float]],
-    duration: float,
-    max_shift: float = EXPORT_EDGE_MAX_SHIFT_S,
-    max_trim: float = EXPORT_EDGE_TRIM_MAX_S,
-    edge_bounds: Optional[list[tuple[float, float, float]]] = None,
-    troughs: Optional[list[tuple[float, float]]] = None,
-    handle: float = WORD_CUT_SAFETY_S,
-) -> list[tuple[float, float]]:
-    """Put each export join in the real trough beside it, or leave it alone.
-
-    This pure export-only operation runs after cut composition and keep-list
-    construction, and is the step that turns an estimated boundary into the one a
-    person would pick after zooming into the waveform.
-
-    An edge listed in ``edge_bounds`` is anchored: the two words on either side
-    of it are known, so the pause between them is known, and the edge is placed
-    at the speech end of that pause -- a keep ends ``handle`` into the pause that
-    follows its last word, and the next keep starts ``handle`` before the end of
-    the pause that precedes its first word. Because the search window is the
-    pause itself, an anchored edge physically cannot reach a deleted word or a
-    kept one, however fine ``troughs`` is.
-
-    An edge with no anchors -- a gap cut, or the head or tail of the recording --
-    keeps the older conservative rule, with one correction: a candidate on the
-    wrong side of the boundary is refused instead of being taken because it
-    happened to be nearest. A keep start only snaps to a silence it is already
-    inside or one that ends just before it; a keep end only to one it is inside
-    or one that begins just after it. Trimming toward the speech the keep exists
-    for costs only measured silence and gets ``max_trim``; restoring audio the
-    cut deliberately excluded is capped at the much smaller ``max_shift``.
-    """
-    original = [(float(start), float(end)) for start, end in keeps]
-    if not original or not silences:
-        return original
-
-    def clean(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        out: list[tuple[float, float]] = []
-        for raw_start, raw_end in spans:
-            try:
-                span_start, span_end = float(raw_start), float(raw_end)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(span_start) or not math.isfinite(span_end):
-                continue
-            span_start = max(0.0, span_start)
-            span_end = min(float(duration), span_end)
-            if span_end > span_start:
-                out.append((span_start, span_end))
-        return merge_intervals(out)
-
-    valid_silences = clean(silences)
-    if not valid_silences:
-        return original
-    valid_troughs = clean(troughs) if troughs else valid_silences
-    anchors = list(edge_bounds or [])
-
-    def bounds_for(boundary: float) -> Optional[tuple[float, float]]:
-        for time, low, high in anchors:
-            if abs(time - boundary) <= MERGE_EPS:
-                return low, high
-        return None
-
-    def anchored_target(boundary: float, edge: str, low: float, high: float) -> float:
-        """Place the edge in the pause between the two words that wall it in."""
-        window = [
-            (max(span_start, low), min(span_end, high))
-            for span_start, span_end in valid_troughs
-            if min(span_end, high) - max(span_start, low)
-            >= EXPORT_TROUGH_MIN_S - MERGE_EPS
-        ]
-        if not window:
+    def place(
+        boundary: float, edge: str, low: float, high: float, edge_handle: float,
+        rough_low: bool, rough_high: bool,
+    ) -> float:
+        if at_edge(boundary):
             return boundary
-        if edge == "start":
-            trough_start, trough_end = window[-1]
-            return max(trough_start, trough_end - handle)
-        trough_start, trough_end = window[0]
-        return min(trough_end, trough_start + handle)
-
-    def unanchored_target(boundary: float, edge: str) -> float:
-        qualifying = [
-            span for span in valid_silences
-            if span[1] - span[0] >= EXPORT_SILENCE_MIN_S - MERGE_EPS
-        ]
-        inside = next(
-            (span for span in qualifying if span[0] <= boundary <= span[1]), None
+        placed = splice.place_edge(
+            track, edge, low, high, edge_handle,
+            reach_low=_reach(rough_low), reach_high=_reach(rough_high),
         )
-        if inside is not None:
-            silence_start, silence_end = inside
-            if edge == "start":
-                return min(silence_end, boundary + max_trim)
-            return max(silence_start, boundary - max_trim)
-        if edge == "start":
-            behind = [span[1] for span in qualifying if span[1] <= boundary]
-            nearest = max(behind) if behind else None
-        else:
-            ahead = [span[0] for span in qualifying if span[0] >= boundary]
-            nearest = min(ahead) if ahead else None
-        if nearest is None or abs(nearest - boundary) > max_shift + MERGE_EPS:
-            return boundary
-        return nearest
+        how[round(placed.time, 3)] = placed.how
+        return placed.time
 
-    def target(boundary: float, edge: str) -> float:
-        limits = bounds_for(boundary)
-        if limits is None:
-            return unanchored_target(boundary, edge)
-        return anchored_target(boundary, edge, limits[0], limits[1])
-
-    refined: list[tuple[float, float]] = []
-    for start, end in original:
-        new_start = start if start <= MERGE_EPS else target(start, "start")
-        new_end = end if duration - end <= MERGE_EPS else target(end, "end")
-        new_start = max(0.0, min(float(duration), new_start))
-        new_end = max(0.0, min(float(duration), new_end))
-        # A restored edge must never reach back across the keep that precedes it.
-        if refined and new_start < refined[-1][1]:
-            new_start = max(new_start, refined[-1][1], start)
+    for run in _composed_word_runs(tokens, **params):
+        start, end = run["start"], run["end"]
+        new_start, new_end = start, end
+        if run["prev_kept_end"] is not None:
+            new_start = place(
+                start, "end", run["prev_kept_end"], run["first_deleted_start"],
+                handle, run["prev_kept_rough"], run["first_deleted_rough"],
+            )
+        if run["next_kept_start"] is not None:
+            new_end = place(
+                end, "start", run["last_deleted_end"], run["next_kept_start"],
+                handle, run["last_deleted_rough"], run["next_kept_rough"],
+            )
         if new_end <= new_start + MERGE_EPS:
             new_start, new_end = start, end
-        refined.append((new_start, new_end))
+        cuts.append((new_start, new_end))
 
-    for index, (start, end) in enumerate(refined):
-        if end <= start + MERGE_EPS:
-            return original
-        if index and start < refined[index - 1][1] - MERGE_EPS:
-            return original
-    return [(round(start, 6), round(end, 6)) for start, end in refined]
+    settings = proj.get("audio_gap_settings") or {}
+    try:
+        keep_pause = float(settings.get("keep_pause_s", ACTIVE_GAP_KEEP_DEFAULT))
+    except (TypeError, ValueError):
+        keep_pause = ACTIVE_GAP_KEEP_DEFAULT
+    pause_handle = max(0.03, keep_pause / 2.0)
+    for gap in proj.get("audio_gaps", []):
+        interval = _timed_interval(gap) if gap.get("cut") else None
+        if interval is None:
+            continue
+        if gap.get("manual"):
+            cuts.append(interval)
+            continue
+        try:
+            detected = (float(gap["detected_start"]), float(gap["detected_end"]))
+        except (KeyError, TypeError, ValueError):
+            detected = interval
+        middle = (interval[0] + interval[1]) / 2.0
+        low, high, rough_low, rough_high = _walls_around(words, middle, duration)
+        low = max(low, detected[0] - GAP_JOIN_REACH_S)
+        high = min(high, detected[1] + GAP_JOIN_REACH_S)
+        new_start = place(interval[0], "end", low, high, pause_handle, rough_low, rough_high)
+        new_end = place(interval[1], "start", low, high, pause_handle, rough_low, rough_high)
+        if new_end - new_start > 0.02:
+            cuts.append((new_start, new_end))
+
+    for token in tokens:
+        if token.get("kind") == "word" or not token.get("cut"):
+            continue
+        interval = _timed_interval(token)
+        if interval is None:
+            continue
+        new_start, new_end = interval
+        for boundary, edge in ((interval[0], "end"), (interval[1], "start")):
+            low, high, rough_low, rough_high = _walls_around(words, boundary, duration)
+            placed = place(boundary, edge, low, high, handle, rough_low, rough_high)
+            if edge == "end":
+                new_start = placed
+            else:
+                new_end = placed
+        # Like a pause cut: no measured quiet to trim means nothing to cut.
+        if new_end > new_start + 0.02:
+            cuts.append((new_start, new_end))
+
+    keeps = keep_list(cuts, duration)
+    composed = {round(edge, 3) for keep in keeps for edge in keep}
+    keeps = trim_interior_silence(
+        keeps, splice.dead_air(track, EXPORT_INTERIOR_SILENCE_MIN_S), duration
+    )
+
+    joins: list[dict[str, Any]] = []
+    edited = 0.0
+    for start, end in keeps:
+        for time_s, side in ((start, "start"), (end, "end")):
+            if at_edge(time_s):
+                continue
+            level = splice.splice_level(track, time_s)
+            joins.append({
+                "time": round(time_s, 3),
+                "edited_time": round(edited if side == "start" else edited + end - start, 3),
+                "side": side,
+                "level_db": round(level, 1),
+                "on_sound": level > track.quiet_db + splice.LOUD_MARGIN_DB,
+                "how": how.get(round(time_s, 3)) or (
+                    "as-drawn" if round(time_s, 3) in composed else "dead-air"
+                ),
+            })
+        edited += end - start
+    return {
+        "keeps": [(round(start, 6), round(end, 6)) for start, end in keeps],
+        "joins": joins,
+        "quiet_db": round(track.quiet_db, 1),
+        "edited_duration": round(edited, 3),
+    }
+
+
+def planned_joins(proj: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """``plan_joins`` on the project's own audio, or None when it has none."""
+    if proj.get("probe", {}).get("acodec") is None:
+        return None
+    try:
+        return plan_joins(proj, load_track(proj["source_path"]))
+    except Exception as exc:
+        log.warning("join planning unavailable: %s", exc)
+        return None
+
+
+def final_keeps(proj: dict[str, Any]) -> list[tuple[float, float]]:
+    """What every output plays: the planned joins, or word timing without audio."""
+    plan = planned_joins(proj)
+    if plan is not None:
+        return [tuple(keep) for keep in plan["keeps"]]
+    return keep_list(cut_intervals_from_tokens(proj), proj["duration_s"])
+
+
+_TRACK_CACHE: dict[str, Any] = {"key": None, "track": None}
+_TRACK_LOCK = threading.Lock()
+
+
+def load_track(source_path: str) -> "splice.Track":
+    """Decoded levels of a source, kept for the one recording that is open."""
+    source = Path(source_path).resolve()
+    stat = source.stat()
+    key = (str(source), stat.st_size, stat.st_mtime_ns)
+    with _TRACK_LOCK:
+        if _TRACK_CACHE["key"] == key:
+            return _TRACK_CACHE["track"]
+        if not FFMPEG:
+            resolve_ffmpeg()
+        result = subprocess.run(
+            [
+                FFMPEG, "-v", "error", "-nostdin", "-i", str(source), "-vn",
+                "-ac", "1", "-ar", str(splice.SAMPLE_RATE), "-f", "s16le", "pipe:1",
+            ],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"audio level analysis failed: {error[-300:]}")
+        usable = len(result.stdout) - len(result.stdout) % 2
+        samples = np.frombuffer(result.stdout[:usable], dtype="<i2")
+        track = splice.track_from_samples(samples)
+        _TRACK_CACHE.update(key=key, track=track)
+        return track
 
 
 def trim_interior_silence(
@@ -1328,14 +1407,250 @@ def build_tokens(
     return tokens, segments
 
 
+def weave_sound_tokens(
+    tokens: list[dict[str, Any]], sounds: list[tuple[float, float]],
+    duration: float, gap_threshold: float,
+) -> list[dict[str, Any]]:
+    """Rebuild the token list with a ``sound`` token for each wordless noise.
+
+    A sound is audible but is not a word, so it was never a token, and it is
+    not silence, so gap detection cannot find it either: a click or a breath
+    between two kept sentences belonged to nothing and survived every edit.
+    As a token it is cut like a word. Gap tokens are regenerated around the
+    sounds and every token is renumbered in order, because the editor reads a
+    token's ID as its position.
+    """
+    out: list[dict[str, Any]] = []
+    pending = sorted(sounds)
+    at = 0
+    previous_end = 0.0
+
+    def push(token: dict[str, Any]) -> None:
+        token["id"] = len(out)
+        out.append(token)
+
+    def push_gap(start: float, end: float) -> None:
+        if end - start >= gap_threshold:
+            push({"kind": "gap", "start": round(start, 3), "end": round(end, 3), "cut": False})
+
+    def fill(until: float) -> None:
+        nonlocal at, previous_end
+        while at < len(pending) and pending[at][0] < until:
+            start, end = pending[at]
+            at += 1
+            if start < previous_end or end > until:
+                continue  # a word's final timing reaches it after all
+            push_gap(previous_end, start)
+            push({"kind": "sound", "start": round(start, 3), "end": round(end, 3), "cut": False})
+            previous_end = end
+        push_gap(previous_end, until)
+
+    for token in tokens:
+        if token.get("kind") != "word":
+            continue
+        fill(float(token["start"]))
+        push(dict(token))
+        previous_end = max(previous_end, float(token["end"]))
+    fill(duration)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Forced word alignment (isolated WhisperX worker)
 # --------------------------------------------------------------------------
 
+# The aligner matches letters to sound. It has no letters for "37" or "%", so
+# it gives each digit a wildcard that fits anywhere: "37, 73, 7, 77" was
+# squeezed into 0.7 s next to the word before it, and the four seconds where
+# they were really said were left with no word on them at all. So the aligner
+# is handed every word as it is spoken -- "thirty seven" -- and the timing of
+# those spoken words is put back on the word the transcript shows.
+
+_ONES = (
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
+).split()
+_TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+_SCALES = ((10 ** 12, "trillion"), (10 ** 9, "billion"), (10 ** 6, "million"), (1000, "thousand"))
+_ORDINAL_ENDINGS = {
+    "one": "first", "two": "second", "three": "third", "five": "fifth",
+    "eight": "eighth", "nine": "ninth", "twelve": "twelfth",
+}
+_SPOKEN_SYMBOLS = {
+    "%": "percent", "$": "dollars", "€": "euros", "£": "pounds", "&": "and",
+    "+": "plus", "=": "equals", "@": "at", "#": "number", "°": "degrees",
+}
+_SPOKEN_RUN_RE = re.compile(
+    r"(?P<num>\d[\d,]*(?:\.\d+)?)(?P<ord>st|nd|rd|th)?|(?P<thousands>(?:,000)+)"
+    r"|(?P<word>[^\W\d_]+(?:'[^\W\d_]+)*)|(?P<sym>[%$€£&+=@#°])",
+    re.UNICODE,
+)
+
+
+def _number_words(number: int) -> list[str]:
+    if number < 20:
+        return [_ONES[number]]
+    if number < 100:
+        tens, ones = divmod(number, 10)
+        return [_TENS[tens]] + ([_ONES[ones]] if ones else [])
+    if number < 1000:
+        hundreds, rest = divmod(number, 100)
+        return [_ONES[hundreds], "hundred"] + (_number_words(rest) if rest else [])
+    for scale, name in _SCALES:
+        if number >= scale:
+            head, rest = divmod(number, scale)
+            return _number_words(head) + [name] + (_number_words(rest) if rest else [])
+    return [str(number)]
+
+
+def _spoken_number(digits: str, ordinal: bool) -> list[str]:
+    whole, _, fraction = digits.replace(",", "").partition(".")
+    if not whole:
+        return []
+    value = int(whole)
+    if (
+        not ordinal and not fraction and "," not in digits and len(whole) == 4
+        and (1100 <= value <= 1999 or 2010 <= value <= 2099)
+    ):
+        # A year: "1992" is said "nineteen ninety two", "2017" "twenty seventeen".
+        high, low = divmod(value, 100)
+        words = _number_words(high)
+        return words + (["hundred"] if low == 0 else (["oh"] if low < 10 else []) + _number_words(low))
+    words = _number_words(value)
+    if ordinal:
+        last = words[-1]
+        words[-1] = _ORDINAL_ENDINGS.get(
+            last, last[:-1] + "ieth" if last.endswith("y") else last + "th"
+        )
+    if fraction:
+        words += ["point"] + [_ONES[int(digit)] for digit in fraction]
+    return words
+
+
+_LETTER_NAMES = {
+    "a": "ay", "b": "bee", "c": "see", "d": "dee", "e": "ee", "f": "ef", "g": "gee",
+    "h": "aitch", "i": "eye", "j": "jay", "k": "kay", "l": "el", "m": "em", "n": "en",
+    "o": "oh", "p": "pee", "q": "cue", "r": "ar", "s": "es", "t": "tee", "u": "you",
+    "v": "vee", "w": "double you", "x": "ex", "y": "why", "z": "zee",
+}
+
+
+def _spelled(letters: str) -> list[str]:
+    return [part for letter in letters.lower() for part in _LETTER_NAMES[letter].split()]
+
+
+def _said_letter_by_letter(word: str) -> Optional[list[str]]:
+    """ "B", "GPT", "AI", "AIs" are said as letters; "NASA" and "I" are not."""
+    if not word.isascii() or not word.isalpha():
+        return None
+    plural = len(word) > 2 and word.endswith("s") and word[:-1].isupper()
+    core = word[:-1] if plural else word
+    if not core.isupper():
+        return None
+    if len(core) == 1:
+        return None if core in ("A", "I") else _spelled(core)
+    if len(core) == 2 or (len(core) <= 4 and not set(core) & set("AEIOU")):
+        letters = _spelled(core)
+        return letters[:-1] + [letters[-1] + "s"] if plural else letters
+    return None
+
+
+def spoken_forms(text: str, language: Optional[str] = "en") -> list[str]:
+    """The words the aligner should hear for one transcript word.
+
+    English only: elsewhere the word is handed over as it is. A word with
+    nothing speakable in it is kept as it is too, so it still owns a place.
+    """
+    if (language or "en").split("-")[0].lower() != "en":
+        return [text]
+    runs = list(_SPOKEN_RUN_RE.finditer(text))
+    has_number = any(match.group("num") for match in runs)
+    forms: list[str] = []
+    for match in runs:
+        if match.group("num"):
+            forms += _spoken_number(match.group("num"), bool(match.group("ord")))
+        elif match.group("thousands"):
+            forms.append(_SCALES[-min(4, match.group("thousands").count(",000"))][1])
+        elif match.group("word"):
+            word = match.group("word")
+            if has_number and len(word) <= 3 and word.isascii():
+                forms += _spelled(word)        # "r1", "GPT-4o": letters beside a number
+            else:
+                forms += _said_letter_by_letter(word) or [word]
+        elif match.group("sym"):
+            forms.append(_SPOKEN_SYMBOLS[match.group("sym")])
+    return forms or [text]
+
+
+def spoken_text(text: str, language: Optional[str] = "en") -> str:
+    return " ".join(
+        form for word in text.split() for form in spoken_forms(word, language)
+    )
+
+
+def aligned_token_timings(
+    texts: list[str], aligned: list[dict[str, Any]], language: Optional[str],
+) -> list[Optional[dict[str, Any]]]:
+    """Map the aligner's spoken words back onto the transcript's words.
+
+    A transcript word owns every spoken word made from it, and takes its time
+    from the first to the last of them -- only when the aligner placed all of
+    them, so a number is never timed by half of itself.
+    """
+    owners: list[int] = []
+    expanded: list[str] = []
+    pieces_per_word: list[int] = []
+    for index, text in enumerate(texts):
+        forms = spoken_forms(text, language)
+        pieces_per_word.append(len(forms))
+        for form in forms:
+            owners.append(index)
+            expanded.append(norm_word(form))
+    # The aligner's words go through the same spelling, so it does not matter
+    # whether it reports "thirty seven" or "37": either matches both pieces.
+    heard: list[str] = []
+    heard_from: list[dict[str, Any]] = []
+    for word in aligned:
+        for form in spoken_forms(str(word.get("word", "")), language):
+            heard.append(norm_word(form))
+            heard_from.append(word)
+    matcher = difflib.SequenceMatcher(None, expanded, heard, autojunk=False)
+    found: dict[int, list[dict[str, Any]]] = {}
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            found.setdefault(owners[block.a + offset], []).append(heard_from[block.b + offset])
+    out: list[Optional[dict[str, Any]]] = []
+    for index in range(len(texts)):
+        pieces = found.get(index, [])
+        timing: Optional[dict[str, Any]] = None
+        if pieces and len(pieces) == pieces_per_word[index]:
+            try:
+                starts = [float(piece["start"]) for piece in pieces]
+                ends = [float(piece["end"]) for piece in pieces]
+                scores = [float(piece.get("score", 0.0)) for piece in pieces]
+            except (KeyError, TypeError, ValueError):
+                starts = []
+            if starts and all(math.isfinite(value) for value in starts + ends + scores):
+                timing = {
+                    "start": min(starts), "end": max(ends),
+                    "score": sum(scores) / len(scores), "pieces": len(pieces),
+                }
+        out.append(timing)
+    return out
+
+
 def alignment_segments_for_project(
-    proj: dict[str, Any], max_span: float = 30.0, padding: float = 2.5,
+    proj: dict[str, Any], max_span: float = 30.0, padding: float = 0.5,
 ) -> list[dict[str, Any]]:
-    """Group transcript sections into bounded, padded forced-alignment windows."""
+    """One forced-alignment window per transcript section, walled by its neighbours.
+
+    A recording of retakes says the same words many times. Aligned inside one
+    wide window, a phrase can be placed on the audio of its neighbouring take,
+    and the two takes swap timings. So each section is aligned on its own
+    audio: it is padded by at most ``padding`` and never past the middle of
+    the pause before the next section. Only sections that overlap -- which no
+    two takes do -- are aligned together, up to ``max_span``.
+    """
     duration = float(proj.get("duration_s") or 0.0)
     source: list[dict[str, Any]] = []
     for segment in proj.get("segments", []):
@@ -1358,22 +1673,34 @@ def alignment_segments_for_project(
                 "text": " ".join(str(word.get("text", "")) for word in words),
             }]
 
-    grouped: list[dict[str, Any]] = []
-    current: list[dict[str, Any]] = []
+    runs: list[list[dict[str, Any]]] = []
     for segment in source:
-        if current and segment["end"] - current[0]["start"] > max_span:
-            grouped.append({
-                "start": max(0.0, current[0]["start"] - padding),
-                "end": min(duration, current[-1]["end"] + padding),
-                "text": " ".join(item["text"] for item in current),
-            })
-            current = []
-        current.append(segment)
-    if current:
+        current = runs[-1] if runs else None
+        if (
+            current is not None
+            and segment["start"] < max(item["end"] for item in current)
+            and segment["end"] - current[0]["start"] <= max_span
+        ):
+            current.append(segment)
+        else:
+            runs.append([segment])
+
+    bounds = [
+        (run[0]["start"], max(item["end"] for item in run)) for run in runs
+    ]
+    grouped: list[dict[str, Any]] = []
+    for index, run in enumerate(runs):
+        start, end = bounds[index]
+        before = start - bounds[index - 1][1] if index else start
+        after = (bounds[index + 1][0] if index + 1 < len(bounds) else duration) - end
+        left = min(padding, max(0.0, before / 2 if index else before))
+        right = min(padding, max(0.0, after / 2 if index + 1 < len(bounds) else after))
         grouped.append({
-            "start": max(0.0, current[0]["start"] - padding),
-            "end": min(duration, current[-1]["end"] + padding),
-            "text": " ".join(item["text"] for item in current),
+            "start": round(max(0.0, start - left), 3),
+            "end": round(min(duration, end + right), 3),
+            "text": spoken_text(
+                " ".join(item["text"] for item in run), proj.get("language")
+            ),
         })
     return grouped
 
@@ -1390,8 +1717,15 @@ def alignment_python_path() -> Optional[Path]:
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
-def alignment_worker_call(proj: dict[str, Any], device: str) -> dict[str, Any]:
-    """Run one device attempt out of process so failures release all GPU state."""
+def alignment_worker_call(
+    proj: dict[str, Any], device: str,
+    segments: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Run one device attempt out of process so failures release all GPU state.
+
+    With ``segments`` the worker aligns each one on its own and reports their
+    words separately, which is what the second pass needs.
+    """
     python = alignment_python_path()
     if python is None:
         raise RuntimeError(
@@ -1401,7 +1735,10 @@ def alignment_worker_call(proj: dict[str, Any], device: str) -> dict[str, Any]:
         "device": device,
         "source_path": str(Path(proj["source_path"]).resolve()),
         "language": str(proj.get("language") or "en"),
-        "segments": alignment_segments_for_project(proj),
+        "segments": (
+            segments if segments is not None else alignment_segments_for_project(proj)
+        ),
+        "separate": segments is not None,
         "model_dir": str((MODELS_DIR / "alignment").resolve()),
         "ffmpeg": FFMPEG,
     }
@@ -1457,11 +1794,13 @@ def _aligned_word_is_trustworthy(word: dict[str, Any]) -> bool:
         score = float(word.get("score", 0.0))
     except (KeyError, TypeError, ValueError):
         return False
+    # A number said as several words may take as long as they do together.
+    longest = ALIGNMENT_MAX_WORD_SECONDS * max(1, math.ceil(int(word.get("pieces", 1)) / 2))
     return (
         math.isfinite(start) and math.isfinite(end)
         and 0.0 <= start < end
         and score >= ALIGNMENT_MIN_SCORE
-        and end - start <= ALIGNMENT_MAX_WORD_SECONDS
+        and end - start <= longest
     )
 
 
@@ -1481,6 +1820,8 @@ def recalibrate_legacy_gap_timings(
         if token.get("kind") == "word":
             previous = token
             continue
+        if token.get("kind") == "sound":
+            continue  # measured from the audio, not derived from word timing
         following = next_words[index]
         previous_interval = _timed_interval(previous) if previous is not None else None
         following_interval = _timed_interval(following) if following is not None else None
@@ -1513,29 +1854,27 @@ def apply_aligned_word_timings(
         word for word in result.get("words", [])
         if isinstance(word, dict) and str(word.get("word", "")).strip()
     ]
-    original_norm = [norm_word(str(word.get("text", ""))) for word in original_words]
-    aligned_norm = [norm_word(str(word.get("word", ""))) for word in aligned_words]
-    matcher = difflib.SequenceMatcher(
-        None, original_norm, aligned_norm, autojunk=False
+    timings = aligned_token_timings(
+        [str(word.get("text", "")) for word in original_words],
+        aligned_words, proj.get("language"),
     )
     accepted_indices: set[int] = set()
-    for block in matcher.get_matching_blocks():
-        for offset in range(block.size):
-            old_index = block.a + offset
-            aligned = aligned_words[block.b + offset]
-            if not _aligned_word_is_trustworthy(aligned):
-                continue
-            candidate_words[old_index]["start"] = round(float(aligned["start"]), 3)
-            candidate_words[old_index]["end"] = round(float(aligned["end"]), 3)
-            candidate_words[old_index]["alignment_score"] = round(
-                float(aligned.get("score", 0.0)), 4
-            )
-            accepted_indices.add(old_index)
+    for old_index, aligned in enumerate(timings):
+        if aligned is None or not _aligned_word_is_trustworthy(aligned):
+            continue
+        candidate_words[old_index]["start"] = round(float(aligned["start"]), 3)
+        candidate_words[old_index]["end"] = round(float(aligned["end"]), 3)
+        candidate_words[old_index]["alignment_score"] = round(
+            float(aligned.get("score", 0.0)), 4
+        )
+        accepted_indices.add(old_index)
 
     # Independently padded windows can occasionally align a boundary word into
     # the previous window. Revert only the conflicting proposal; never reorder
-    # transcript tokens or guess a replacement time.
-    for _pass in range(2):
+    # transcript tokens or guess a replacement time. Reverting one word can
+    # expose the next, so this runs until nothing conflicts: each pass reverts
+    # at least one accepted word, which bounds it.
+    for _pass in range(len(candidate_words) + 1):
         changed = False
         for index in range(1, len(candidate_words)):
             previous = _timed_interval(candidate_words[index - 1])
@@ -1620,6 +1959,420 @@ def apply_aligned_word_timings(
     }
     candidate["alignment"] = stats
     return candidate, stats
+
+
+def unaligned_word_windows(proj: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every run of words the first pass could not place, walled by its aligned neighbours.
+
+    These are not random words: they cluster in retakes and false starts, the
+    exact places that get cut, which is why they are worth a second look.
+    """
+    duration = float(proj.get("duration_s") or 0.0)
+    words = [token for token in proj.get("tokens", []) if token.get("kind") == "word"]
+    windows: list[dict[str, Any]] = []
+    index = 0
+    while index < len(words):
+        if not word_timing_is_rough(words[index]):
+            index += 1
+            continue
+        first = index
+        while index < len(words) and word_timing_is_rough(words[index]):
+            index += 1
+        run = words[first:index]
+        before = words[first - 1] if first > 0 else None
+        after = words[index] if index < len(words) else None
+        low = float(before["end"]) if before is not None else 0.0
+        high = float(after["start"]) if after is not None else duration
+        if high - low < ALIGNMENT_RESCUE_MIN_WINDOW_S:
+            continue
+        if high - low > ALIGNMENT_RESCUE_MAX_WINDOW_S:
+            continue
+        text = spoken_text(
+            " ".join(str(word.get("text", "")).strip() for word in run), proj.get("language")
+        ).strip()
+        if text:
+            windows.append({
+                "start": round(low, 3), "end": round(high, 3), "text": text,
+                "ids": [word.get("id") for word in run],
+            })
+    return windows
+
+
+def apply_rescued_word_timings(
+    proj: dict[str, Any], windows: list[dict[str, Any]], groups: list[list[dict[str, Any]]],
+) -> int:
+    """Give each rescued word its aligned time, if it is believable. Returns how many."""
+    by_id = {
+        token.get("id"): token for token in proj.get("tokens", [])
+        if token.get("kind") == "word"
+    }
+    rescued = 0
+    for window, group in zip(windows, groups):
+        run = [by_id[token_id] for token_id in window["ids"] if token_id in by_id]
+        aligned = [
+            word for word in group
+            if isinstance(word, dict) and str(word.get("word", "")).strip()
+        ]
+        timings = aligned_token_timings(
+            [str(word.get("text", "")) for word in run], aligned, proj.get("language"),
+        )
+        proposals: list[tuple[dict[str, Any], float, float, float]] = []
+        for word, found in zip(run, timings):
+            if found is None:
+                continue
+            start, end, score = found["start"], found["end"], found["score"]
+            if not start < end:
+                continue
+            if score < ALIGNMENT_RESCUE_MIN_SCORE:
+                continue
+            if end - start > ALIGNMENT_MAX_WORD_SECONDS * max(1, math.ceil(found["pieces"] / 2)):
+                continue
+            if start < window["start"] - 0.02 or end > window["end"] + 0.02:
+                continue
+            proposals.append((word, start, end, score))
+        # Accept only an in-order set; one word out of order rejects the window.
+        times = [(start, end) for _word, start, end, _score in proposals]
+        if any(times[i][0] + MERGE_EPS < times[i - 1][0] for i in range(1, len(times))):
+            continue
+        for word, start, end, score in proposals:
+            word["start"] = round(max(start, window["start"]), 3)
+            word["end"] = round(min(end, window["end"]), 3)
+            word["alignment_score"] = round(score, 4)
+            word["alignment_pass"] = 2
+            rescued += 1
+    return rescued
+
+
+def settle_rough_word_timings(tokens: list[dict[str, Any]]) -> int:
+    """Put every word that is still unaligned between the aligned words around it.
+
+    The second pass can place part of a run and not the rest; the rest keeps
+    Whisper's estimate, which may then sit on the wrong side of a placed
+    neighbour. A run that is out of place is moved just past its aligned
+    neighbour, each word keeping its length -- never longer than saying it
+    could take, so a word is not drawn across the pause that follows it. Only
+    a run with no room for that is squeezed evenly into the room there is.
+    Returns how many words moved.
+    """
+    import transcription
+
+    words = [token for token in tokens if token.get("kind") == "word"]
+    moved = 0
+    index = 0
+    while index < len(words):
+        if not word_timing_is_rough(words[index]):
+            index += 1
+            continue
+        first = index
+        while index < len(words) and word_timing_is_rough(words[index]):
+            index += 1
+        run = words[first:index]
+        low = float(words[first - 1]["end"]) if first > 0 else 0.0
+        high = float(words[index]["start"]) if index < len(words) else max(
+            float(run[-1]["end"]), low
+        )
+        times = [(float(word["start"]), float(word["end"])) for word in run]
+        in_place = all(
+            low - MERGE_EPS <= start and end <= high + MERGE_EPS for start, end in times
+        ) and all(times[i][0] + MERGE_EPS >= times[i - 1][0] for i in range(1, len(times)))
+        if in_place:
+            continue
+        caps = [
+            transcription.plausible_word_seconds(str(word.get("text", ""))) for word in run
+        ]
+        placed: list[tuple[float, float]] = []
+        cursor = low
+        for (start, end), cap in zip(times, caps):
+            begin = max(start, cursor)
+            finish = begin + min(max(end - start, 0.02), cap)
+            placed.append((begin, finish))
+            cursor = finish
+        if placed[-1][1] > high + MERGE_EPS:
+            step = max(high - low, 0.02 * len(run)) / len(run)
+            placed = []
+            cursor = low
+            for cap in caps:
+                placed.append((cursor, cursor + min(step, cap)))
+                cursor += step
+        for word, (begin, finish) in zip(run, placed):
+            word["start"] = round(begin, 3)
+            word["end"] = round(finish, 3)
+            moved += 1
+    return moved
+
+
+def rescue_unaligned_words(proj: dict[str, Any], device: str) -> int:
+    """Second alignment pass, in place. Never raises: the first pass already stands."""
+    windows = unaligned_word_windows(proj)
+    if not windows:
+        return 0
+    try:
+        result = alignment_worker_call(
+            proj, device,
+            segments=[{key: window[key] for key in ("start", "end", "text")} for window in windows],
+        )
+    except Exception as exc:
+        log.warning("second alignment pass skipped: %s", exc)
+        return 0
+    groups = result.get("groups")
+    if not isinstance(groups, list) or len(groups) != len(windows):
+        return 0
+    rescued = apply_rescued_word_timings(proj, windows, groups)
+    if rescued and settle_rough_word_timings(proj.get("tokens", [])):
+        log.info("settled unaligned words between their aligned neighbours")
+    if rescued:
+        words = [token for token in proj.get("tokens", []) if token.get("kind") == "word"]
+        recalibrate_legacy_gap_timings(proj.get("tokens", []), float(proj.get("duration_s") or 0.0))
+        by_segment: dict[Any, list[dict[str, Any]]] = {}
+        for word in words:
+            if "seg" in word:
+                by_segment.setdefault(word["seg"], []).append(word)
+        for segment in proj.get("segments", []):
+            members = by_segment.get(segment.get("id"), [])
+            if members:
+                segment["start"] = round(min(float(word["start"]) for word in members), 3)
+                segment["end"] = round(max(float(word["end"]) for word in members), 3)
+        alignment = proj.get("alignment")
+        if isinstance(alignment, dict) and alignment.get("total_words"):
+            alignment["matched_words"] = int(alignment.get("matched_words") or 0) + rescued
+            alignment["coverage"] = round(
+                alignment["matched_words"] / alignment["total_words"], 6
+            )
+            alignment["rescued_words"] = rescued
+    return rescued
+
+
+# --------------------------------------------------------------------------
+# The waveform pass: every word on its wave, every wave owned
+# --------------------------------------------------------------------------
+
+def place_unaligned_on_waveform(
+    words: list[dict[str, Any]], islands: list[tuple[float, float]],
+) -> int:
+    """Lay each word the aligner could not place onto the wave between its neighbours.
+
+    A short word like "a" between two aligned words can only be the sound
+    between them. The run is spread across that sound in proportion to how
+    long each word takes to say. Returns how many words were placed.
+    """
+    import transcription
+
+    placed = 0
+    index = 0
+    while index < len(words):
+        if not word_timing_is_rough(words[index]):
+            index += 1
+            continue
+        first = index
+        while index < len(words) and word_timing_is_rough(words[index]):
+            index += 1
+        if first == 0 or index >= len(words):
+            continue  # needs an aligned word on both sides
+        low, high = float(words[first - 1]["end"]), float(words[index]["start"])
+        runs = transcription.islands_between(islands, low, high)
+        # Sound running straight on from a neighbour is that neighbour's tail
+        # or onset -- unless it is the only sound there is.
+        if len(runs) > 1 and runs[0][0] <= low + 0.011:
+            runs = runs[1:]
+        if len(runs) > 1 and runs[-1][1] >= high - 0.011:
+            runs = runs[:-1]
+        if not runs:
+            continue
+        start, end = runs[0][0], runs[-1][1]
+        run = words[first:index]
+        weights = [transcription.plausible_word_seconds(str(w.get("text", ""))) for w in run]
+        total = sum(weights)
+        cursor = start
+        for word, weight in zip(run, weights):
+            word["start"] = round(cursor, 3)
+            cursor += (end - start) * weight / total
+            word["end"] = round(max(cursor, word["start"] + 0.02), 3)
+            word["waveform_timed"] = True
+            placed += 1
+    return placed
+
+
+def park_whisper_model(model: Any) -> Any:
+    """Move a GPU Whisper model's weights to system memory, freeing the card."""
+    try:
+        engine = model.model
+        if engine.device == "cuda" and engine.model_is_loaded:
+            engine.unload_model(to_cpu=True)
+    except Exception as exc:
+        log.warning("whisper model could not be parked: %s", exc)
+    return model
+
+
+def unpark_whisper_model(model: Any) -> Any:
+    engine = model.model
+    if not engine.model_is_loaded:
+        engine.load_model()
+    return model
+
+
+def hear_unowned_wave(
+    draft: dict[str, Any], words: list[dict[str, Any]], islands: list[tuple[float, float]],
+    audio: Any, device: str, whisper: Any = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hear every stretch of wave no word owns, with its sentence around it.
+
+    What Whisper hears there is kept only if the aligner then finds those
+    words on that very stretch of wave, confidently. Returns the new words and
+    the stretches that stayed wordless, with what was heard in them.
+    """
+    import transcription
+
+    stretches = transcription.stretches_to_hear(islands, words)
+    if not stretches:
+        return [], []
+    language = str(draft.get("language") or "en")
+    total = float(draft.get("duration_s") or 0.0)
+    set_status("align", 96, f"listening again to {len(stretches)} stretch(es) with no words")
+    if whisper is None:
+        log.warning("no Whisper model to hear unowned wave with; left as sounds")
+        return [], [{"start": a, "end": b, "heard": ""} for a, b in stretches]
+    unpark_whisper_model(whisper)
+    try:
+        heard = [
+            transcription.hear_in_context(whisper, audio, language, stretch, words, total)
+            for stretch in stretches
+        ]
+    finally:
+        park_whisper_model(whisper)
+
+    added: list[dict[str, Any]] = []
+    unheard: list[dict[str, Any]] = []
+    windows = []
+    for stretch, fresh in zip(stretches, heard):
+        if not fresh:
+            unheard.append({"start": stretch[0], "end": stretch[1], "heard": ""})
+            continue
+        windows.append((stretch, fresh))
+    if not windows:
+        return added, unheard
+    try:
+        result = alignment_worker_call(
+            draft, device,
+            segments=[
+                {
+                    "start": round(max(0.0, stretch[0] - 0.1), 3),
+                    "end": round(min(total, stretch[1] + 0.1), 3),
+                    "text": spoken_text(" ".join(str(w["text"]) for w in fresh), language),
+                }
+                for stretch, fresh in windows
+            ],
+        )
+        groups = result.get("groups") or []
+    except Exception as exc:
+        log.warning("re-heard words could not be aligned: %s", exc)
+        groups = []
+    for position, (stretch, fresh) in enumerate(windows):
+        texts = [str(w["text"]) for w in fresh]
+        group = groups[position] if position < len(groups) else []
+        timings = aligned_token_timings(texts, group, language)
+        before = max((float(w["end"]) for w in words if float(w["end"]) <= stretch[0] + 0.05), default=0.0)
+        after = min((float(w["start"]) for w in words if float(w["start"]) >= stretch[1] - 0.05), default=total)
+        good = (
+            all(timing is not None for timing in timings)
+            and sum(t["score"] for t in timings) / len(timings) >= ALIGNMENT_MIN_SCORE
+            and all(
+                before - 0.01 <= t["start"] < t["end"] <= after + 0.01
+                and t["end"] - t["start"] <= ALIGNMENT_MAX_WORD_SECONDS * max(1, math.ceil(t["pieces"] / 2))
+                for t in timings
+            )
+            and all(b["start"] + MERGE_EPS >= a["start"] for a, b in zip(timings, timings[1:]))
+        )
+        if not good:
+            unheard.append({"start": stretch[0], "end": stretch[1], "heard": " ".join(texts)})
+            continue
+        for text, timing in zip(texts, timings):
+            added.append({
+                "kind": "word", "text": text, "cut": False,
+                "start": round(timing["start"], 3), "end": round(timing["end"], 3),
+                "alignment_score": round(timing["score"], 4), "alignment_pass": "reheard",
+            })
+    return added, unheard
+
+
+def waveform_pass(
+    draft: dict[str, Any], islands: list[tuple[float, float]], audio: Any,
+    device: Optional[str], whisper: Any = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[float, float]], dict[str, Any]]:
+    """Make the waveform the ground truth, the way an editor reads it by eye.
+
+    1. A word the aligner could not place is laid on the wave between its
+       aligned neighbours.
+    2. Wave no word owns is heard again in context; speech found there is
+       added as words, timed by the aligner.
+    3. Every word's edges move out to the ends of its wave, and two words in
+       unbroken sound meet at its quietest point.
+    4. Whatever wave is still unowned becomes a sound token.
+
+    Returns the rebuilt tokens and segments (sounds not yet woven in), the
+    sounds, and a coverage report.
+    """
+    import transcription
+
+    duration = float(draft.get("duration_s") or 0.0)
+    words = [dict(t) for t in draft.get("tokens", []) if t.get("kind") == "word"]
+    words.sort(key=lambda w: (float(w["start"]), float(w["end"])))
+    placed = place_unaligned_on_waveform(words, islands)
+
+    added: list[dict[str, Any]] = []
+    unheard: list[dict[str, Any]] = []
+    if device is not None and audio is not None:
+        try:
+            added, unheard = hear_unowned_wave(draft, words, islands, audio, device, whisper)
+        except Exception as exc:
+            log.warning("unowned wave could not be heard again: %s", exc)
+    if added:
+        words = sorted(words + added, key=lambda w: (float(w["start"]), float(w["end"])))
+
+    levels = transcription.frame_levels(audio) if audio is not None else None
+    smooth = transcription.smooth_levels(levels) if levels is not None else None
+    snapped = (
+        transcription.snap_words_to_waveform(words, islands, smooth, duration)
+        if smooth is not None else 0
+    )
+    sounds = [
+        (a, b) for a, b in transcription.unowned_wave(islands, words)
+        if b - a >= transcription.FLICKER_S
+    ]
+
+    # Rebuild tokens and sections around the new words. A run of re-heard
+    # words is a section of its own; every word keeps what alignment gave it.
+    fw_segments: list[dict[str, Any]] = []
+    previous: Any = object()
+    for word in words:
+        key = word.get("seg", "reheard")
+        if key != previous:
+            fw_segments.append({"words": []})
+            previous = key
+        fw_segments[-1]["words"].append(word)
+    tokens, segments = build_tokens(fw_segments, duration, GAP_THRESHOLD_DEFAULT)
+    built = [t for t in tokens if t["kind"] == "word"]
+    for token, word in zip(built, (w for s in fw_segments for w in s["words"])):
+        for key in ("alignment_score", "alignment_pass", "waveform_timed"):
+            if key in word:
+                token[key] = word[key]
+
+    aligned = sum(1 for t in built if "alignment_score" in t)
+    on_wave = sum(1 for t in built if t.get("waveform_timed"))
+    report = {
+        "words": len(built),
+        "aligned_words": aligned,
+        "waveform_words": on_wave,
+        "timed_from_audio": round((aligned + on_wave) / len(built), 4) if built else 1.0,
+        "reheard_words": len(added),
+        "edges_snapped": snapped,
+        "placed_on_waveform": placed,
+        "unheard_stretches": [
+            {"start": round(u["start"], 2), "end": round(u["end"], 2), "heard": u["heard"]}
+            for u in unheard
+        ],
+        **transcription.wave_coverage(islands, built, sounds),
+    }
+    return tokens, segments, sounds, report
 
 
 def alignment_source_identity(proj: dict[str, Any]) -> dict[str, Any]:
@@ -1721,6 +2474,23 @@ def recalibrate_alignment_job(
             candidate, stats = apply_aligned_word_timings(latest, result, fallback)
             stats["source"] = identity
             candidate["alignment"] = stats
+        set_status("align", 94, "re-timing the words the first pass missed")
+        rescue_unaligned_words(candidate, stats["device"])
+        stats = candidate["alignment"]
+        with _STATE_LOCK:
+            latest = CURRENT["project"]
+            if latest is None or alignment_source_identity(latest) != identity:
+                raise RuntimeError("project changed while timing was being aligned")
+            latest_tokens = latest.get("tokens", [])
+            candidate_tokens = candidate.get("tokens", [])
+            if [token.get("id") for token in latest_tokens] != [
+                token.get("id") for token in candidate_tokens
+            ]:
+                raise RuntimeError("transcript changed while timing was being aligned; run it again")
+            # Cuts made during the second pass are carried over, not lost.
+            for fresh, timed in zip(latest_tokens, candidate_tokens):
+                timed["cut"] = bool(fresh.get("cut"))
+            candidate["audio_gaps"] = copy.deepcopy(latest.get("audio_gaps", []))
             candidate["updated_at"] = utc_now()
             atomic_write_json(project_dir / "project.json", candidate)
             CURRENT["project"] = candidate
@@ -1908,7 +2678,14 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
         if duration <= 0:
             raise RuntimeError("media has zero duration")
 
-        from faster_whisper import WhisperModel  # heavy: import inside the job
+        # Heavy: both are imported inside the job.
+        from faster_whisper import WhisperModel
+        import transcription
+
+        if not FFMPEG:
+            resolve_ffmpeg()
+        set_status("probe", 3, "reading the audio")
+        audio = transcription.decode_audio(FFMPEG, media_path)
 
         # Accuracy first, deliberately. `large-v3-turbo` keeps four decoder
         # layers where `large-v3` has thirty-two, and it is the layers that
@@ -1921,8 +2698,7 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             ("large-v3", "cuda", "float16"),
             ("large-v3", "cpu", "int8"),
         ]
-        fw_segments: list[dict[str, Any]] = []
-        language = "en"
+        heard: dict[str, Any] = {}
         last_err: Optional[Exception] = None
         for model_name, device, compute in attempts:
             try:
@@ -1935,45 +2711,14 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                     download_root=str(MODELS_DIR), local_files_only=True,
                 )
                 set_status("transcribe", 4, f"transcribing with {model_name} ({device})")
-                seg_iter, info = model.transcribe(
-                    media_path, word_timestamps=True,
-                    # The VAD used to run *before* Whisper and delete anything
-                    # it judged non-speech, so a sentence begun softly or
-                    # trailing off never reached the model at all and could
-                    # not appear in the transcript. Whisper does its own
-                    # 30-second windowing over the whole file, so nothing is
-                    # gained by pre-trimming it and a whole sentence is what
-                    # is risked. Dead air is found later, by measurement.
-                    vad_filter=False,
-                    # Whisper's own two ways of discarding a window. The
-                    # defaults (0.6 / -1.0) throw away quiet or hesitant
-                    # speech along with true silence; loosened, a doubtful
-                    # window is transcribed and left for the editor to judge
-                    # rather than silently dropped.
-                    no_speech_threshold=0.92,
-                    log_prob_threshold=-2.0,
-                    # A wider beam is the one decoding knob that buys accuracy
-                    # outright. It costs time, which this pass is allowed.
-                    beam_size=10,
-                    # Each window is decoded on its own. This is what keeps a
-                    # long improvised take from inheriting a neighbour's
-                    # mistake and looping on it.
-                    condition_on_previous_text=False,
-                    language=requested_language or None,
+                # How the recording is windowed, decoded and checked for
+                # dropped speech lives in transcription.py, with the reasons.
+                heard = transcription.transcribe_recording(
+                    model, audio, requested_language or None,
+                    lambda fraction, message: set_status(
+                        "transcribe", 4 + fraction * 86, message
+                    ),
                 )
-                language = info.language or "en"
-                fw_segments = []
-                for seg in seg_iter:
-                    words = [
-                        {"text": w.word.strip(), "start": float(w.start), "end": float(w.end)}
-                        for w in (seg.words or [])
-                        if w.word.strip()
-                    ]
-                    if words:
-                        fw_segments.append({"words": words})
-                    pct = 4 + min(1.0, float(seg.end) / duration) * 90
-                    set_status("transcribe", pct,
-                               f"transcribing… {seg.end:.0f}s / {duration:.0f}s")
                 last_err = None
                 break
             except Exception as e:  # fall through to CPU small
@@ -1981,14 +2726,31 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                 log.warning("whisper attempt %s/%s failed: %s", model_name, device, e)
         if last_err is not None:
             raise last_err
+        language = heard["language"] or "en"
+        fw_segments = heard["segments"]
+        log.info("transcription: %s", heard["stats"])
+        for split in heard["splits"]:
+            log.info(
+                "split %.2f-%.2f at %.2f: was %r, heard %r, %s",
+                split["start"], split["end"], split["at"], split["was"], split["heard"],
+                "kept" if split["kept"] else "left as it was",
+            )
+        for noise in heard["dropped"]:
+            log.info(
+                "not speech %.2f-%.2f (no-speech %.2f): %r",
+                noise["start"], noise["end"], noise["no_speech"], noise["text"],
+            )
 
         tokens, segments = build_tokens(fw_segments, duration, GAP_THRESHOLD_DEFAULT)
         # The CTranslate2 model can occupy most of a small GPU. Release it
         # before the isolated forced-aligner gets its GPU-first attempt.
+        # Whisper is needed once more after alignment, to hear wave no word
+        # owns. Loading a second copy in this process aborts CTranslate2, so
+        # the one model is parked in system memory while the aligner has the
+        # GPU, and brought back afterwards.
+        whisper = park_whisper_model(model) if "model" in locals() else None
         if "model" in locals():
             del model
-            import gc
-            gc.collect()
 
         alignment_meta: dict[str, Any]
         alignment_draft = {
@@ -2007,9 +2769,12 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                 aligned_draft, alignment_meta = apply_aligned_word_timings(
                     alignment_draft, aligned_result, alignment_fallback
                 )
+                aligned_draft["alignment"] = alignment_meta
+                set_status("align", 95, "re-timing the words the first pass missed")
+                rescue_unaligned_words(aligned_draft, alignment_meta["device"])
+                alignment_meta = aligned_draft.pop("alignment")
                 tokens = aligned_draft["tokens"]
                 segments = aligned_draft["segments"]
-                alignment_meta["source"] = alignment_source_identity(aligned_draft)
             except Exception as alignment_error:
                 log.warning(
                     "new transcript alignment failed; saving unaligned timing: %s",
@@ -2025,6 +2790,42 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
                 "error": "Accurate timing runtime is not installed.",
                 "completed_at": utc_now(),
             }
+        # Sounds are placed against the final word timings, and the tokens are
+        # renumbered to make room for them, so this comes after alignment and
+        # before anything that refers to a token by its ID.
+        coverage: dict[str, Any] = {}
+        if alignment_meta.get("status") == "aligned":
+            # The waveform is the ground truth from here: every word on its
+            # wave, every stretch of wave owned by a word or a sound.
+            set_status("align", 96, "matching every word to the waveform")
+            tokens, segments, sounds, coverage = waveform_pass(
+                {**alignment_draft, "tokens": tokens, "segments": segments},
+                heard["islands"], audio, str(alignment_meta.get("device") or "cuda"),
+                whisper,
+            )
+            log.info("waveform coverage: %s", coverage)
+        else:
+            sounds = transcription.non_speech_sounds(
+                heard["islands"], [t for t in tokens if t["kind"] == "word"]
+            )
+        del audio
+        whisper = None  # done with it: free the parked weights
+        import gc
+        gc.collect()
+        tokens = weave_sound_tokens(tokens, sounds, duration, GAP_THRESHOLD_DEFAULT)
+        for unheard in coverage.get("unheard_stretches", []):
+            if not unheard.get("heard"):
+                continue
+            for token in tokens:
+                if (
+                    token["kind"] == "sound"
+                    and token["start"] < unheard["end"] and token["end"] > unheard["start"]
+                ):
+                    token["maybe_speech"] = unheard["heard"]
+        if alignment_meta.get("status") == "aligned":
+            alignment_meta["source"] = alignment_source_identity(
+                {**alignment_draft, "tokens": tokens}
+            )
         set_status("cluster", 95, "coloring retakes")
         clusters = find_clusters(segments)
         word_repeats = find_word_repeats(tokens)
@@ -2050,6 +2851,7 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             "language": language,
             "requested_language": requested_language or "auto",
             "alignment": alignment_meta,
+            "coverage": coverage,
             "tokens": tokens,
             "segments": segments,
             "clusters": clusters,
@@ -2075,6 +2877,7 @@ def transcribe_job(media_path: str, requested_language: Optional[str] = None) ->
             CURRENT["media_path"] = proj["source_path"]
             CURRENT["project_dir"] = str(project_dir)
         save_current_project()
+        warm_up_project(proj)
         set_status("ready", 100, "transcription complete")
         log.info("project ready: %d tokens, %d segments, %d clusters",
                  len(tokens), len(segments), len(clusters))
@@ -3019,6 +3822,39 @@ def _run_ffmpeg_with_progress(
     phase: str = "export",
 ) -> None:
     """Run ffmpeg, parsing -progress pipe:1 into /status. Raises on failure."""
+    cmd, script = _spill_long_filter_graph(cmd)
+    try:
+        _run_ffmpeg_progress_inner(cmd, edited_duration, label, phase)
+    finally:
+        if script is not None:
+            script.unlink(missing_ok=True)
+
+
+# Windows refuses a command line over 32,767 characters (WinError 206). An edit
+# with a few hundred keeps builds a filter graph longer than that, so a long
+# graph goes to a file and ffmpeg reads it with -filter_complex_script.
+FILTER_GRAPH_INLINE_LIMIT = 8000
+
+
+def _spill_long_filter_graph(cmd: list[str]) -> tuple[list[str], Optional[Path]]:
+    """Move an oversized -filter_complex value into a temp script file."""
+    try:
+        index = cmd.index("-filter_complex")
+    except ValueError:
+        return cmd, None
+    graph = cmd[index + 1]
+    if len(graph) <= FILTER_GRAPH_INLINE_LIMIT:
+        return cmd, None
+    fd, name = tempfile.mkstemp(prefix="retake_graph_", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(graph)
+    script = Path(name)
+    return cmd[:index] + ["-filter_complex_script", str(script)] + cmd[index + 2:], script
+
+
+def _run_ffmpeg_progress_inner(
+    cmd: list[str], edited_duration: float, label: str, phase: str,
+) -> None:
     proc = subprocess.Popen(
         cmd + ["-progress", "pipe:1", "-nostats"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -3106,10 +3942,47 @@ def audio_energy_profile(media_path: str, sample_rate: int = 16000) -> dict[str,
     }
 
 
-def _audio_concat_graph(keeps: list[tuple[float, float]], input_label: str = "0:a:0") -> str:
+# Every join fades out and back in over this long. On a join in silence it is
+# inaudible; on one between two words said in a single breath it is what keeps
+# the splice from clicking. It never changes a duration.
+JOIN_FADE_S = 0.006
+
+
+def _keep_audio_chain(
+    start: float, end: float, fade_in: bool, fade_out: bool,
+) -> str:
+    """atrim one keep, with a short fade on each side that meets a join."""
+    chain = f"atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+    length = end - start
+    fade = min(JOIN_FADE_S, length / 4.0)
+    if fade > 0.0005:
+        if fade_in:
+            chain += f",afade=t=in:st=0:d={fade:.4f}"
+        if fade_out:
+            chain += f",afade=t=out:st={length - fade:.6f}:d={fade:.4f}"
+    return chain
+
+
+def _keep_fades(keeps: list[tuple[float, float]], duration: Optional[float]) -> list[tuple[bool, bool]]:
+    """Which sides of each keep are joins (rather than the start or end of the file)."""
+    last = len(keeps) - 1
+    end_of_file = float(duration) if duration else None
+    return [
+        (
+            index > 0 or start > MERGE_EPS,
+            index < last or (end_of_file is not None and end < end_of_file - MERGE_EPS),
+        )
+        for index, (start, end) in enumerate(keeps)
+    ]
+
+
+def _audio_concat_graph(
+    keeps: list[tuple[float, float]], input_label: str = "0:a:0",
+    duration: Optional[float] = None,
+) -> str:
+    fades = _keep_fades(keeps, duration)
     parts = [
-        f"[{input_label}]atrim=start={start:.6f}:end={end:.6f},"
-        f"asetpts=PTS-STARTPTS[a{index}]"
+        f"[{input_label}]{_keep_audio_chain(start, end, *fades[index])}[a{index}]"
         for index, (start, end) in enumerate(keeps)
     ]
     labels = "".join(f"[a{index}]" for index in range(len(keeps)))
@@ -3124,7 +3997,10 @@ def _render_edited_audio_stem(
     channels = int(proj.get("probe", {}).get("channels") or 1)
     cmd = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", proj["source_path"], "-filter_complex", _audio_concat_graph(keeps),
+        "-i", proj["source_path"],
+        "-filter_complex", _audio_concat_graph(
+            keeps, duration=float(proj.get("duration_s") or 0.0) or None
+        ),
         "-map", "[out]", "-ar", str(sample_rate), "-ac", str(channels),
         "-c:a", "pcm_f32le", str(out),
     ]
@@ -3232,6 +4108,12 @@ def _normalize_audio_stem(
         raise RuntimeError(f"loudness measurement failed: {measured.stderr.strip()[-400:]}")
     values = _parse_loudnorm_measurement(measured.stderr)
     peak_limit = 10.0 ** (EXPORT_TRUE_PEAK_DB / 20.0)
+    # When loudnorm falls back to dynamic mode, the limiter's latency flush plus
+    # aresample's async fill leave ~0.1 s of extra tail. Trim back to the
+    # input's exact sample count so the stem never changes length.
+    source_samples = int(round(
+        float(probe_media(str(source)).get("duration_s") or edited_duration) * sample_rate
+    ))
     second_filter = (
         f"{leveling},loudnorm=I={target:.1f}:TP={EXPORT_TRUE_PEAK_DB:.1f}:LRA=11:"
         f"measured_I={values['input_i']:.3f}:measured_TP={values['input_tp']:.3f}:"
@@ -3239,7 +4121,8 @@ def _normalize_audio_stem(
         f"measured_thresh={values['input_thresh']:.3f}:"
         f"offset={values['target_offset']:.3f}:linear=true:print_format=summary,"
         f"alimiter=limit={peak_limit:.6f}:attack=5:release=50:level=false:latency=1,"
-        f"aresample={sample_rate}:async=1:first_pts=0"
+        f"aresample={sample_rate}:async=1:first_pts=0,"
+        f"atrim=end_sample={source_samples}"
     )
     cmd = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
@@ -3296,11 +4179,101 @@ def prepare_export_audio(
     return normalized, warnings, cleanup_status
 
 
+# --------------------------------------------------------------------------
+# A copy of the audio every browser can play
+# --------------------------------------------------------------------------
+
+# What Chrome, Edge, Firefox and Safari all decode. An iPhone voice memo saved
+# as lossless is ALAC in an .m4a, which none but Safari will play; the preview
+# then has no sound at all.
+BROWSER_AUDIO_CODECS = {
+    "aac", "mp3", "opus", "vorbis", "flac",
+    "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_u8",
+}
+LISTEN_COPY_VERSION = 1
+_LISTEN_LOCK = threading.Lock()
+
+
+def needs_listen_copy(proj: Optional[dict[str, Any]]) -> bool:
+    """An audio-only source the browser cannot decode."""
+    if not proj:
+        return False
+    probe = proj.get("probe") or {}
+    codec = probe.get("acodec")
+    return bool(codec) and not probe.get("has_video") and codec not in BROWSER_AUDIO_CODECS
+
+
+def listen_copy_paths(source_path: str) -> tuple[Path, Path, Path]:
+    project_dir = project_directory_for_media(source_path)
+    if project_dir is None:
+        raise RuntimeError("preview folder is unavailable")
+    folder = (project_dir / "preview").resolve()
+    folder.relative_to(project_dir.resolve())
+    return folder / "listen.flac", folder / "listen.partial.flac", folder / "listen.json"
+
+
+def ensure_listen_copy(proj: dict[str, Any]) -> Path:
+    """FLAC of the source: lossless, so nothing is lost, and with no encoder
+    delay, so the preview stays sample-aligned with the transcript."""
+    source = str(proj["source_path"])
+    final, partial, metadata = listen_copy_paths(source)
+    identity = {**preview_source_identity(source), "version": LISTEN_COPY_VERSION}
+    with _LISTEN_LOCK:
+        try:
+            stored = json.loads(metadata.read_text(encoding="utf-8"))
+            if stored.get("source") == identity and final.is_file() and (
+                final.stat().st_size == stored.get("size")
+            ):
+                return final
+        except (OSError, ValueError):
+            pass
+        if not FFMPEG:
+            resolve_ffmpeg()
+        final.parent.mkdir(parents=True, exist_ok=True)
+        partial.unlink(missing_ok=True)
+        result = _run([
+            FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", source,
+            "-map", "0:a:0", "-vn", "-c:a", "flac", "-compression_level", "5",
+            str(partial),
+        ])
+        if result.returncode != 0:
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(f"playable copy failed: {result.stderr.strip()[-300:]}")
+        expected = float(proj.get("duration_s") or 0.0)
+        actual = float(probe_media(str(partial)).get("duration_s") or 0.0)
+        if expected and abs(actual - expected) > 0.1:
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(f"playable copy is {actual:.2f}s, expected {expected:.2f}s")
+        os.replace(partial, final)
+        atomic_write_json(metadata, {
+            "source": identity, "size": final.stat().st_size, "created_at": utc_now(),
+        })
+        log.info("browser-playable copy ready: %s", final)
+        return final
+
+
+def warm_up_project(proj: dict[str, Any]) -> None:
+    """Prepare in the background what the first play and first preview will need."""
+    def work() -> None:
+        try:
+            if needs_listen_copy(proj):
+                ensure_listen_copy(proj)
+        except Exception as exc:
+            log.warning("playable copy unavailable: %s", exc)
+        try:
+            if (proj.get("probe") or {}).get("acodec") is not None:
+                load_track(proj["source_path"])
+        except Exception as exc:
+            log.warning("audio levels unavailable: %s", exc)
+    threading.Thread(target=work, daemon=True).start()
+
+
 def _ffmpeg_audio_cut(proj: dict[str, Any], keeps: list[tuple[float, float]], out: Path) -> None:
     """Sample-accurate audio cut+concat via one atrim/concat filtergraph."""
     parts = []
+    fades = _keep_fades(keeps, float(proj.get("duration_s") or 0.0) or None)
     for i, (a, b) in enumerate(keeps):
-        parts.append(f"[0:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]")
+        parts.append(f"[0:a]{_keep_audio_chain(a, b, *fades[i])}[a{i}]")
     concat_in = "".join(f"[a{i}]" for i in range(len(keeps)))
     graph = ";".join(parts) + f";{concat_in}concat=n={len(keeps)}:v=0:a=1[out]"
     cmd = [FFMPEG, "-y", "-hide_banner", "-i", proj["source_path"],
@@ -3765,11 +4738,11 @@ def _reliable_video_command(
             )
         else:
             audio_labels = []
+            fades = _keep_fades(keeps, float(proj.get("duration_s") or 0.0) or None)
             for index, (start, end) in enumerate(shifted_keeps):
                 label = f"a{index}"
                 graph_parts.append(
-                    f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},"
-                    f"asetpts=PTS-STARTPTS[{label}]"
+                    f"[0:a:0]{_keep_audio_chain(start, end, *fades[index])}[{label}]"
                 )
                 audio_labels.append(f"[{label}]")
             graph_parts.append(
@@ -3984,39 +4957,21 @@ def export_job(mode: str, enhancement: Optional[dict[str, Any]] = None) -> None:
         warnings: list[str] = []
         has_audio = proj.get("probe", {}).get("acodec") is not None
         if has_audio:
-            set_status("export", 2, "snapping joins to real silence")
-            try:
-                level_profile = audio_energy_profile(proj["source_path"])
-                silences = detect_silence_intervals(
-                    proj["source_path"], float(proj["duration_s"]),
-                    silence_db=float(level_profile["silence_db"]),
-                )
-                # A second, finer pass. On its own this threshold would call
-                # parts of quiet speech silent, so it is only ever consulted
-                # inside a pause already walled in by the two words either side
-                # of the join -- where it is what finds the dip between two
-                # words that the shy pass misses entirely.
-                troughs = detect_silence_intervals(
-                    proj["source_path"], float(proj["duration_s"]),
-                    min_duration=EXPORT_TROUGH_MIN_S,
-                    silence_db=export_trough_threshold_db(level_profile),
-                )
-                keeps = refine_export_keep_edges(
-                    keeps, silences, float(proj["duration_s"]),
-                    edge_bounds=export_edge_bounds(proj),
-                    troughs=troughs,
-                    handle=float(cut_composition_params(proj)["safety_handle"]),
-                )
-                before_interior = sum(b - a for a, b in keeps)
-                keeps = trim_interior_silence(
-                    keeps, silences, float(proj["duration_s"])
-                )
-                removed = before_interior - sum(b - a for a, b in keeps)
-                if removed > MERGE_EPS:
-                    log.info("export shortened %.2fs of dead air inside kept audio", removed)
-            except Exception as exc:
-                log.warning("export silence snapping skipped: %s", exc)
-                warnings.append("silence snapping was unavailable; original safe joins were used")
+            set_status("export", 2, "placing every join on the waveform")
+            plan = planned_joins(proj)
+            if plan is None:
+                warnings.append("the waveform was unavailable; joins use word timing only")
+            else:
+                keeps = [tuple(keep) for keep in plan["keeps"]]
+                flagged = [join for join in plan["joins"] if join["on_sound"]]
+                if flagged:
+                    warnings.append(
+                        f"{len(flagged)} join{'s' if len(flagged) != 1 else ''} "
+                        "fall between words said in one breath and were faded; "
+                        "they are marked amber on the edit strip"
+                    )
+            if not keeps:
+                raise RuntimeError("everything is cut - nothing to export")
         edited = sum(b - a for a, b in keeps)
         audio_stem: Optional[Path] = None
         cleanup_status = "not_applicable"
@@ -4090,8 +5045,7 @@ def export_text(kind: str) -> Path:
     """EDL / CSV / TXT / SRT / markers.md — each a few lines, written to exports/."""
     proj = CURRENT["project"]
     assert proj is not None
-    cuts = cut_intervals_from_tokens(proj)
-    keeps = keep_list(cuts, proj["duration_s"])
+    keeps = final_keeps(proj)
     cut_seg_ids = fully_cut_segments(proj)
 
     if kind == "edl":
@@ -4311,6 +5265,7 @@ def open_saved_project(payload: dict = Body(...)) -> JSONResponse:
             CURRENT["media_path"] = str(source)
             CURRENT["project_dir"] = str(project_dir)
             CURRENT["source_filename"] = proj.get("source_filename")
+        warm_up_project(proj)
         set_status("ready", 100, "project loaded from disk")
         return JSONResponse({"loaded": "existing"})
     except Exception as exc:
@@ -4359,6 +5314,7 @@ def open_media(payload: dict = Body(...)) -> JSONResponse:
                     CURRENT["media_path"] = proj["source_path"]
                     CURRENT["project_dir"] = str(project_dir)
                     CURRENT["source_filename"] = proj.get("source_filename")
+                warm_up_project(proj)
                 set_status("ready", 100, "project loaded from disk")
                 return JSONResponse({"loaded": "existing"})
         except Exception as e:
@@ -4641,8 +5597,14 @@ def media(request: Request) -> Response:
     """Serve original media with Starlette's disconnect-aware HTTP range support."""
     with _STATE_LOCK:
         path = CURRENT["media_path"]
+        proj = CURRENT["project"]
     if not path or not Path(path).is_file():
         return JSONResponse({"error": "no media"}, status_code=404)
+    if proj is not None and needs_listen_copy(proj):
+        try:
+            path = str(ensure_listen_copy(proj))
+        except Exception as exc:
+            log.warning("serving the original; playable copy failed: %s", exc)
     ext = Path(path).suffix.lower()
     mime = MIME_EXTRA.get(ext) or mimetypes.guess_type(path)[0] or "application/octet-stream"
     return FileResponse(
@@ -4789,6 +5751,36 @@ def post_cuts(payload: dict = Body(...)) -> JSONResponse:
     return JSONResponse(response)
 
 
+@app.post("/joins")
+def post_joins(payload: dict = Body(default={})) -> JSONResponse:
+    """Where every join of an edit lands, for the preview and its self-check.
+
+    The edit is sent with the request rather than read from the saved project,
+    so the answer belongs to exactly the cuts the page is showing.
+    """
+    with _STATE_LOCK:
+        current = CURRENT["project"]
+        if current is None:
+            return JSONResponse({"error": "no project"}, status_code=404)
+        proj = copy.deepcopy(current)
+    try:
+        if "cut_ids" in payload:
+            cut_ids = set(int(i) for i in payload.get("cut_ids") or [])
+            for token in proj.get("tokens", []):
+                token["cut"] = token.get("id") in cut_ids
+        if "audio_gaps" in payload:
+            ensure_audio_gap_state(proj)
+            proj["audio_gaps"] = validate_audio_gaps(
+                payload["audio_gaps"], proj["audio_gaps"], float(proj["duration_s"])
+            )
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    plan = planned_joins(proj)
+    if plan is None:
+        return JSONResponse({"available": False})
+    return JSONResponse({"available": True, **plan})
+
+
 @app.post("/gaps/detect")
 def start_gap_detection(payload: dict = Body(default={})) -> JSONResponse:
     with _STATE_LOCK:
@@ -4833,6 +5825,26 @@ def save_audio_gaps(payload: dict = Body(...)) -> JSONResponse:
         return JSONResponse({"ok": True, "gaps": gaps, "settings": settings})
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.get("/overview")
+def get_overview(points: int = 1200) -> JSONResponse:
+    """The whole recording's loudness in ``points`` buckets, for the edit strip."""
+    with _STATE_LOCK:
+        proj = CURRENT["project"]
+        source = str(proj["source_path"]) if proj is not None else ""
+    if not source:
+        return JSONResponse({"error": "no project"}, status_code=404)
+    try:
+        track = load_track(source)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    points = max(100, min(4000, int(points)))
+    linear = np.power(10.0, track.db / 20.0)
+    buckets = np.array_split(linear, points)
+    peaks = np.array([bucket.max() if len(bucket) else 0.0 for bucket in buckets])
+    top = float(peaks.max()) or 1.0
+    return JSONResponse({"peaks": [round(float(v), 4) for v in peaks / top]})
 
 
 @app.get("/waveform")
@@ -5001,6 +6013,14 @@ def get_assistant_summary() -> JSONResponse:
         summary["language"] = proj.get("language")
         summary["aligned"] = project_uses_aligned_timing(proj)
         summary["source_filename"] = CURRENT.get("source_filename")
+        if proj.get("coverage"):
+            summary["waveform_coverage"] = proj["coverage"]
+        summary["sounds_that_may_be_speech"] = [
+            {"id": t.get("id"), "start": t.get("start"), "end": t.get("end"),
+             "heard": t.get("maybe_speech")}
+            for t in proj.get("tokens", [])
+            if t.get("kind") == "sound" and t.get("maybe_speech")
+        ]
     summary["project"] = Path(project_dir).name if project_dir else None
     summary["undo_available"] = bool(project_dir and assistant_backups(Path(project_dir)))
     return JSONResponse(summary)
