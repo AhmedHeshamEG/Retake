@@ -35,8 +35,9 @@ is never clipped.
 
 ## What it does
 
-- **Transcribes locally** with faster-whisper (large-v3-turbo, on the GPU when there is one), with word-level
-  timestamps. Nothing is uploaded anywhere.
+- **Transcribes locally** with faster-whisper (the full large-v3, on the GPU when there is one), with word-level
+  timestamps. It checks its own transcript against the audio and goes back for speech it skipped. Nothing is
+  uploaded anywhere.
 - **Shows you the retakes.** Words and lines you said more than once are colour-coded, and repeated attempts at a
   line are grouped as takes, so the restarts stand out before you've played anything.
 - **Cuts by word.** Click a word to cut it, Alt+click or double-click to jump there. Play the final cut before you
@@ -51,7 +52,7 @@ is never clipped.
 
 ## Install
 
-You need Python 3.11 and about 2 GB for the models.
+You need Python 3.11 and about 3.5 GB for the models.
 
 ```bash
 git clone https://github.com/AhmedHeshamEG/Retake.git
@@ -64,7 +65,7 @@ pip install -r requirements.txt
 Retake never downloads anything while it runs, so fetch the models into `models/` once:
 
 ```bash
-python -c "from faster_whisper.utils import download_model as d; d('large-v3-turbo', cache_dir='models')"
+python -c "from faster_whisper.utils import download_model as d; d('large-v3', cache_dir='models')"
 python -c "from sentence_transformers import SentenceTransformer as S; S('all-MiniLM-L6-v2', cache_folder='models')"
 ```
 

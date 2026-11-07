@@ -16,7 +16,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt \
     && python -m pip install --no-cache-dir -r requirements-alignment.txt \
     && python -m pip install --no-cache-dir -r requirements-enhancement.txt
 
-COPY retake.py retake_mcp.py alignment_worker.py enhancement_worker.py index.html ./
+COPY retake.py retake_mcp.py transcription.py splice.py alignment_worker.py enhancement_worker.py index.html ./
 RUN mkdir -p /app/models/tls /app/projects/.incoming
 
 # 8710 plain HTTP (and the /mcp endpoint); 8443 HTTPS for phone transfers.

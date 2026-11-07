@@ -1,6 +1,6 @@
 ---
 name: retake-brain
-description: Edit improvised talking-head video by transcript - detect repeated takes, false starts, filler, dead air, and Whisper hallucinations, then produce a decisive cut-list ("last complete attempt wins") and, when Retake's MCP server is connected, apply it. Use whenever someone wants a self-recorded video edited, cut down, or cleaned; asks "what should I take off", "make the cut list", "edit my video", "قص الفيديو", "امنتج"; mentions Retake, takes, retakes, or improvised recording; or simply drops an SRT/TXT transcript and says "help".
+description: Edit improvised talking-head video by transcript - detect repeated takes, false starts, filler, dead air, and Whisper hallucinations, then produce a decisive cut-list ("last complete attempt wins") and, when Retake's MCP server is connected, apply it. Use whenever someone wants a self-recorded video edited, cut down, or cleaned; asks "what should I take off", "make the cut list", "edit my video"; mentions Retake, takes, retakes, or improvised recording; or simply drops an SRT/TXT transcript and says "help".
 ---
 
 # Retake Brain - take-selection editor for improvised video
@@ -12,11 +12,15 @@ a human editor would make - and flags the few that genuinely need ears.
 
 **Be decisive.** Every repeated region gets ONE winner. Never hedge with "you
 could maybe consider". Uncertainty is expressed only through explicit flags
-(⚠️ / "اسمعها بودانك"), never through indecision in the list itself.
+(⚠️ / "listen to this one"), never through indecision in the list itself.
 
 **Never cut for being informal.** Humor, asides, personality, accent, and
 deliberate self-corrections are the product. Cuts remove failed attempts, not
 personality.
+
+**Write in English.** Every heading, label, comment, flag, and command in this
+skill is English, whatever language the recording is in. Quoted transcript text
+is the one exception and never changes: see section 6.
 
 ---
 
@@ -36,9 +40,9 @@ and `.txt` (narrative, if given); read both. If a file was uploaded but is not i
 context, read it from the uploads directory first. SRT timestamps are
 block-level, so boundaries are approximate (±1s) - say so once at the top of the
 first answer. The deliverable is the cut-list in chat; the person pastes it into
-Retake's "Cut by instruction" box, which parses the exact grammar in section 5.
+Retake's "Cut by instruction" box, which parses the exact grammar in section 6.
 
-The editorial work in sections 2-4 is identical either way. Only where the
+The editorial work in sections 2-5 is identical either way. Only where the
 transcript comes from, and what happens to the list afterwards, differ.
 
 ## 2. Understand the script first (mandatory)
@@ -65,7 +69,7 @@ Then identify the special kinds:
   repeated "you you you", lone dots, nonsense strings, an orphan single word
   floating between two long gaps. Cut, and say it is not speech. If a strange
   token might be a real sign-off, flag it rather than silently cutting.
-- **DEAD AIR** - see the next section, which changed.
+- **DEAD AIR** - see the next section, which is narrower than it looks.
 
 ## 4. Dead air: what Retake already handles
 
@@ -75,10 +79,18 @@ word's start. Deleting a take therefore already removes the breath before it and
 the thinking pause after it. Listing those gaps separately is noise, and asking
 for them twice is not additive - they are gone the moment the take is cut.
 
-**Only one kind of gap still needs a command: silence sitting between two
-regions you are KEEPING.** That is the pause where they stopped to think and
-both neighbours are keepers. List those explicitly when ≥3s, with the duration
-in bold, using the `gap` command form.
+Export tightens the result further, on its own: it snaps each join to real
+measured silence, and shortens any long silence left *inside* kept audio to a
+natural pause. Neither of those is a decision to report - they are the floor,
+not the edit.
+
+**One kind of gap is still yours: a long, deliberate stall between two regions
+the creator is KEEPING.** That is the pause where they stopped to think and both
+neighbours are keepers. Removing eight seconds of it is an editorial call about
+pace, not a cleanup, so it belongs in the list where they can see and refuse it.
+List those explicitly when ≥3s, with the duration in bold, using the `gap`
+command form. Shorter pauses are rhythm - leave them alone and let export handle
+whatever remains.
 
 There is no "cut all gaps" button. Earlier versions of this skill recommended
 one; it was removed from the app. Never suggest it.
@@ -104,9 +116,9 @@ Apply in order:
 5. **Trim intra-take debris.** False-start prefixes, doubled connectives, an
    orphan "or/and/so" belonging to a discarded attempt, wrong-word slips.
 6. **Splice risk.** Whenever a kept region starts or ends mid-sentence - joining
-   two half-attempts into one sentence - flag it "اسمعها بودانك". Text cannot
-   verify that the audio joins naturally. Never silently splice inside a breath
-   group.
+   two half-attempts into one sentence - flag it "listen to this one". Text
+   cannot verify that the audio joins naturally. Never silently splice inside a
+   breath group.
 7. **Genuinely torn between two complete, fluent takes?** Keep the last one and
    flag it, with one line on why the earlier might win on delivery.
 
@@ -124,13 +136,12 @@ mode when pasted in, and in connected mode when passed to `plan_edit`.
 
 **Global rules:**
 
-- Commentary and labels in the person's own language (Egyptian Arabic is the
-  default when they write Arabic). Quoted transcript text ALWAYS stays in its
-  original language.
-- Every quote is **verbatim, character for character**, including Whisper's
-  errors, wrong words, and odd spellings ("u .s", "gpt 5 .6"). Never correct,
-  normalize, or paraphrase inside quotes - matching depends on the exact words
-  in the exact order.
+- Every label, reason, flag, and heading is in English, including when the
+  recording is not.
+- Every quote is **verbatim, character for character, in the transcript's own
+  language**, including Whisper's errors, wrong words, and odd spellings
+  ("u .s", "gpt 5 .6"). Never translate, correct, normalize, or paraphrase
+  inside quotes - matching depends on the exact words in the exact order.
 - **One command per line.** Never combine two, never wrap one across lines.
 - Chronological throughout: clusters in video order, commands in timeline order.
 
@@ -138,19 +149,21 @@ mode when pasted in, and in connected mode when passed to `plan_edit`.
 
 | Form | Meaning |
 |---|---|
-| `شيل: "<verbatim>"` or `cut: "<verbatim>"` | remove this text |
-| `خلّي: "<verbatim>"` or `keep: "<verbatim>"` | protect this text |
-| `شيل gap: mm:ss.s → mm:ss.s — **N ثانية**` | remove a silence between two kept regions |
-| `قرار مطلوب: <one line>` | open a decision block; the parser waits for a human |
+| `cut: "<verbatim>"` | remove this text |
+| `keep: "<verbatim>"` | protect this text |
+| `cut gap: mm:ss.s → mm:ss.s — **N seconds**` | remove a stall between two kept regions |
+| `Needs a decision: <one line>` | open a decision block; the parser waits for a human |
 
-A gap command must contain the word `gap` (or `silence`/`سكوت`), a cut word, and
-both timestamps - all three, or it will not parse.
+A gap command must contain the word `gap`, a cut word, and both timestamps - all
+three, or it will not parse. Write the duration as "seconds", never "second":
+the bare word is how the parser marks an ordinal.
 
 **Disambiguation - mandatory when the quoted text occurs more than once inside
-the cluster's window.** Append exactly one of `(أول مرة)`, `(آخر مرة)`,
-`(كل المرات)` - or `(first)`, `(last)`, `(all)` - right after the closing quote.
-A short reason may ride inside the same parentheses after a dash:
-`(أول مرة — تهتهة)`. Reasons never get their own line.
+the cluster's window.** Append exactly one of `(first)`, `(last)`, or
+`(every time)` right after the closing quote. A short reason may ride inside the
+same parentheses after a dash: `(first — stutter)`. Reasons never get their own
+line, and never contain the words cut, keep, remove, or drop - the parser reads
+those as commands wherever they appear.
 
 **Cluster headers scope the search window:**
 
@@ -160,27 +173,27 @@ The range is the window the parser searches for that cluster's quotes, so it
 must actually contain them. A header must carry two timestamps and no command
 word, or it stops scoping. Put ⚠️ at the end of the line for fact conflicts.
 
-**Decision blocks:** after the `قرار مطلوب:` line, one bullet per option, each
-containing complete commands in the same grammar. Do not pre-pick a winner.
+**Decision blocks:** after the `Needs a decision:` line, one bullet per option,
+each containing complete commands in the same grammar. Do not pre-pick a winner.
 
 Example, exactly as it should look:
 
-**Cluster 2 — الحكومة (00:58.9 → 01:37.9)**
+**Cluster 2 — the government line (00:58.9 → 01:37.9)**
 
-خلّي: "and you publish it"
-شيل: "the government the government tells you okay since it's dangerous we will take it off" (أول مرة — تهتهة)
-خلّي: "the government will tell you okay since it's dangerous we will take it off" (آخر مرة)
-شيل gap: 01:15.5 → 01:37.9 — **٢٢ ثانية**
+keep: "and you publish it"
+cut: "the government the government tells you okay since it's dangerous we will take it off" (first — stutter)
+keep: "the government will tell you okay since it's dangerous we will take it off" (last)
+cut gap: 01:15.5 → 01:37.9 — **22 seconds**
 
-**Cluster 5 — مدة GPT 5.6 (03:33.9 → 04:17.7)** ⚠️
+**Cluster 5 — how long GPT 5.6 ran (03:33.9 → 04:17.7)** ⚠️
 
-قرار مطلوب: بتقول "12 days" مرتين و"two weeks" أربع مرات — اختار الرقم الصح الأول:
-- لو 12 days → خلّي: "it stayed for 12 days inside of 20 companies" + شيل: "it stayed for two weeks" (كل المرات)
-- لو two weeks → خلّي: "it stayed for two weeks inside of 20 companies that were like" (آخر مرة) + شيل: "it was like 12 days present inside of 20 companies"
+Needs a decision: you say "12 days" twice and "two weeks" four times — choose the correct number first:
+- if 12 days → keep: "it stayed for 12 days inside of 20 companies" + cut: "it stayed for two weeks" (every time)
+- if two weeks → keep: "it stayed for two weeks inside of 20 companies that were like" (last) + cut: "it was like 12 days present inside of 20 companies"
 
 **Closing - exactly two items after the last cluster:**
 
-1. **الحصيلة:** dead attempts count, total seconds removed, estimated final
+1. **The tally:** dead attempts count, total seconds removed, estimated final
    duration against the original.
 2. The short list of decisions that need **ears only** - splices, delivery calls,
    fact conflicts. Everything else is mechanical.
@@ -212,7 +225,9 @@ Decision blocks never apply themselves - resolve the question in conversation
 first, then send the chosen branch's commands.
 
 Do not run `start_export` unless asked. Exporting is their call, and it is a
-long job.
+long job. The exported file will be slightly shorter than the duration the
+editor reports, because export snaps joins to measured silence and shortens
+leftover dead air inside kept audio. Say so once if they ask; it is not a bug.
 
 If word boundaries look consistently late or early - clipped word beginnings,
 trailing syllables - suggest `recalibrate_timing`, which re-times every word
@@ -224,7 +239,7 @@ cached.
 1. Detect the mode. Read the transcript - live via `read_transcript`, or from
    the uploaded files.
 2. Reconstruct the narrative internally. Do not print it.
-3. Cluster and classify: slate, retakes, hallucinations, kept-to-kept gaps.
+3. Cluster and classify: slate, retakes, hallucinations, kept-to-kept stalls.
 4. Pick one winner per cluster. Verify shaky quotes with `find_phrase`.
 5. Post the cut-list in chat.
 6. Connected mode only: `plan_edit` → report anything unresolved →

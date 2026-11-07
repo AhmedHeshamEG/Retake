@@ -48,10 +48,44 @@ def main() -> int:
         device=device,
         model_dir=str(Path(request["model_dir"]).resolve()),
     )
-    result = whisperx.align(
-        request["segments"], model, metadata, audio, device,
-        return_char_alignments=False,
-    )
+    groups = None
+    if request.get("separate"):
+        # One small window per run of words the first pass could not place.
+        # Aligned one at a time, each keeps its own words: whisperx may split a
+        # segment into sentences, which would lose track of which run is which.
+        # Each window is handed only its own slice of the recording; handing
+        # whisperx the whole file costs seconds per window on a long take.
+        groups = []
+        sample_rate = 16000
+        for segment in request["segments"]:
+            try:
+                first = max(0, int(float(segment["start"]) * sample_rate))
+                last = min(len(audio), int(float(segment["end"]) * sample_rate) + 1)
+                offset = first / sample_rate
+                local = {
+                    "start": 0.0, "end": (last - first) / sample_rate,
+                    "text": segment["text"],
+                }
+                aligned = whisperx.align(
+                    [local], model, metadata, audio[first:last], device,
+                    return_char_alignments=False,
+                )
+                words = []
+                for word in aligned.get("word_segments", []):
+                    word = dict(word)
+                    for key in ("start", "end"):
+                        if word.get(key) is not None:
+                            word[key] = float(word[key]) + offset
+                    words.append(word)
+                groups.append(words)
+            except Exception:
+                groups.append([])
+        result = {"word_segments": [word for group in groups for word in group]}
+    else:
+        result = whisperx.align(
+            request["segments"], model, metadata, audio, device,
+            return_char_alignments=False,
+        )
     output = {
         "device": device,
         "model": (
@@ -62,6 +96,8 @@ def main() -> int:
         "elapsed_s": round(time.monotonic() - started, 3),
         "words": result.get("word_segments", []),
     }
+    if groups is not None:
+        output["groups"] = groups
     json.dump(output, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     return 0
 

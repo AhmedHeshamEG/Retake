@@ -74,6 +74,15 @@ main{display:flex; flex:1; min-height:0}
   color:var(--amber); background:rgba(17,17,19,.92);
 }
 #codecNotice.on{display:block}
+/* The edit strip: the whole recording, what is cut, and any join worth a listen. */
+#editStrip{padding:8px 12px 2px}
+#editStrip[hidden]{display:none}
+#stripCanvas{display:block; width:100%; height:44px; border-radius:6px; background:#090c10; cursor:pointer; touch-action:none}
+#stripMeta{display:flex; align-items:center; gap:8px; min-height:26px; font-size:12.5px; color:var(--dim)}
+#stripMeta .spacer{flex:1}
+#stripInfo{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+#nextFlag{border-color:var(--amber); color:var(--amber); background:transparent; white-space:nowrap; flex:none}
+#nextFlag:hover{background:rgba(255,178,36,.12)}
 
 #transcript{
   flex:1; overflow-y:auto; padding:26px 34px 46vh;
@@ -241,6 +250,23 @@ header{
 .toggle-button{display:inline-flex;align-items:center;gap:7px}.toggle-button i{width:8px;height:8px;border-radius:50%;background:#59616d}.toggle-button[aria-pressed="true"]{border-color:#536c61;background:#17241e}.toggle-button[aria-pressed="true"] i{background:var(--ok);box-shadow:0 0 8px #42cf8288}
 #gapSettingsPanel{position:absolute;z-index:65;top:42px;left:0;width:286px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
 #gapSettingsPanel label{display:grid;grid-template-columns:1fr 76px 24px;align-items:center;gap:6px;margin:8px 0;color:var(--dim);font-size:12px}
+#gapBulkPanel{position:absolute;z-index:65;top:42px;left:0;width:300px;padding:12px;border:1px solid #3a414b;border-radius:10px;background:#11151a;box-shadow:0 12px 32px #000a}
+#gapBulkPanel .gap-threshold{display:grid;grid-template-columns:1fr 70px 16px;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+#gapBulkPanel .gap-threshold input{width:70px;padding:6px 7px;font-variant-numeric:tabular-nums}
+#gapBulkPanel .gap-threshold+.gap-threshold{margin-top:5px}
+/* The bars are the detected silences themselves, shortest to longest, so the
+   range is chosen against the recording rather than guessed at. */
+#gapHisto{display:flex;align-items:flex-end;gap:2px;height:40px;margin:9px 0 2px}
+#gapHisto:empty{display:none}
+#gapHisto button{flex:1;min-width:0;padding:0;height:100%;display:flex;align-items:flex-end;background:none;border:0;border-radius:2px;cursor:pointer}
+#gapHisto button:hover{background:#ffffff0d}
+#gapHisto b{display:block;width:100%;min-height:2px;border-radius:2px 2px 0 0;background:#39414c}
+#gapHisto button.in b{background:var(--accent,#4c8cf5)}
+#gapLongerHint{display:block;margin:7px 0 2px;color:#747d89;font-size:11px;line-height:1.45}
+.gap-scope-actions{display:grid;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid #2d3239}
+.gap-scope-actions button{display:flex;justify-content:space-between;align-items:center;width:100%;text-align:left}
+.gap-scope-actions button em{font-style:normal;color:#8d96a2;font-variant-numeric:tabular-nums}
+.gap-scope-actions button:disabled em{color:#5c636d}
 #gapSettingsPanel input{width:76px;padding:6px 7px;font-variant-numeric:tabular-nums}.gap-settings-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:11px}
 .toolbar-count{color:var(--accent);font-weight:700;white-space:nowrap}
 .find-wrap{display:flex;align-items:center;gap:8px;margin-left:auto}
@@ -256,6 +282,12 @@ header{
 #transcript .w.prop{box-shadow:inset 0 -3px 0 var(--amber);border-bottom-color:var(--amber)}
 #transcript .g{display:none;padding:0 11px;line-height:27px;margin:3px 5px;background:#1b2027}
 #transcript.show-legacy-gaps .g{display:inline-block}
+/* A sound is audible but has no words: a breath, a click, a hum. It is always
+   shown, because unlike a silence it is something the listener will hear. */
+#transcript .snd{display:inline-block;padding:0 8px;line-height:23px;margin:3px 3px;border:1px dashed #4a4436;border-radius:999px;background:#1d1a14;color:#b9a577;font:11px ui-monospace,Consolas,monospace;cursor:pointer;white-space:nowrap;vertical-align:middle}
+#transcript .snd:hover,#transcript .snd:focus{border-color:#8a7a52;color:#ead9a8;outline:none}
+#transcript .snd.maybe{border-style:solid;border-color:#c99a3a;color:#f0c46a}
+#transcript .snd.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}
 #transcript .ag{display:inline-flex;align-items:center;gap:6px;padding:0 9px;line-height:25px;margin:3px 5px;border:1px solid #3d4652;border-radius:999px;background:#1a2027;color:#aab2be;font:11px ui-monospace,Consolas,monospace;cursor:pointer;vertical-align:middle}
 #transcript .ag:hover{border-color:#748091;color:#eef0f2}.ag .gap-edit{border:0;background:transparent;padding:0;color:#9299a5}.ag.cut{border-color:#a8403b;background:#28191a;color:#e6908b;text-decoration:line-through}.ag.manual::after{content:"•";color:var(--amber)}
 #transcript .ag.suggest{border-color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber);color:#f1c46d}
@@ -370,9 +402,26 @@ header{
         <div class="group gap-tools">
           <button id="gapToggle" class="small toggle-button" aria-pressed="false"><i></i> Show gaps</button>
           <button id="gapSettingsBtn" class="small" title="Gap detection settings" disabled>⚙</button>
-          <button id="gapApply" class="small" disabled>Remove all gaps</button>
-          <button id="gapScoped" class="small" title="Prepare gaps only around speech that will remain" hidden disabled>Remove gaps in kept sentences</button>
+          <button id="gapApply" class="small" disabled>Remove gaps…</button>
           <button id="gapCancel" class="small" hidden>Cancel</button>
+          <button id="soundCut" class="small" hidden title="Breaths, clicks and other sounds that have no words. They are not silences, so removing gaps leaves them in."></button>
+          <div id="gapBulkPanel" hidden>
+            <label class="gap-threshold">Silences from
+              <input id="gapLonger" type="number" min="0" max="60" step="0.1" value="0">
+              <span>s</span>
+            </label>
+            <label class="gap-threshold">up to
+              <input id="gapShorter" type="number" min="0" max="60" step="0.1" placeholder="any">
+              <span>s</span>
+            </label>
+            <div id="gapHisto" role="group" aria-label="Detected silences by length; click a bar to filter to it"></div>
+            <small id="gapLongerHint">Counts every detected silence.</small>
+            <div class="gap-scope-actions">
+              <button id="gapScopeAll" class="small">Everywhere<em></em></button>
+              <button id="gapScoped" class="small" title="Silences inside sentences that still have words you are keeping">In kept sentences<em></em></button>
+              <button id="gapScopeRemoved" class="small" title="Silences inside sentences you have cut entirely">In removed sentences<em></em></button>
+            </div>
+          </div>
           <button id="gapPreview" class="small" title="Play the exact edited cut before exporting">▶ Play final cut</button>
           <span id="gapCount" class="toolbar-count">Off</span>
           <div id="gapSettingsPanel" hidden>
@@ -405,6 +454,14 @@ header{
         <div id="playerWrap">
           <video id="player" preload="metadata" controls></video>
           <div id="codecNotice">Preview unavailable for this codec — editing and export still work.</div>
+        </div>
+        <div id="editStrip" hidden>
+          <canvas id="stripCanvas" height="88" aria-label="Whole recording: cut parts shaded, joins to check marked amber. Click to seek."></canvas>
+          <div id="stripMeta">
+            <span id="stripInfo">Placing joins…</span>
+            <span class="spacer"></span>
+            <button id="nextFlag" class="small" hidden title="Play from just before the next join that falls between words said in one breath">Check next join ▸</button>
+          </div>
         </div>
         <div class="playerMeta">
           <div id="playerTime">00:00:00.000 / 00:00:00.000</div>
@@ -581,17 +638,23 @@ const S = {
   },
   autoscroll: true,
   cutIvs: [], keeps: [],    // derived intervals
+  planned: null,            // {sig, keeps, joins}: where the server put every join
+  planPending: null,        // signature of the edit a /joins request is out for
+  stripPeaks: null,         // whole-recording waveform for the edit strip
+  flagIndex: -1,
   transcriptCutIvs: [],     // authoritative backend-composed transcript cuts
   cutsSynced: true,
   cutRevision: 0,
   segTokens: new Map(),     // seg id -> [word token ids]
   gapIds: [],               // gap token ids
+  soundIds: [],             // wordless-sound token ids
   showGaps: false,
   audioGaps: [],
   gapSettings: {min_duration_s:.35,silence_db:-40,keep_pause_s:.12},
   gapDetecting: false,
   gapSuggestions: new Map(),
   scopedGapIds: new Set(),
+  removedGapIds: new Set(),
   gapEditor: null,
   voiceEnhancement: {enabled:true,profile:"great",output_loudness:80,voice_leveling:25,noise_cleanup:25,original_detail:90},
   markers: [],
@@ -606,6 +669,7 @@ const S = {
   aiRunning: false,
   loading: false,           // transcription in flight
   uploadFile: null,
+  uploadResume: null,
   uploadSession: null,
   uploadAbort: null,
   uploading: false,
@@ -692,10 +756,114 @@ function keepList(cuts, dur, eps = 0.001) {
   return keeps;
 }
 
+
+/* ============================================================ planned joins */
+function editSignature() {
+  const gaps = S.audioGaps.filter((gap) => gap.cut)
+    .map((gap) => `${gap.id}:${gap.start}:${gap.end}:${gap.manual ? 1 : 0}`).join(",");
+  return [...S.cut].sort((a, b) => a - b).join(",") + "|" + gaps;
+}
+function cutsFromKeeps(keeps, dur) {
+  const cuts = []; let cur = 0;
+  for (const [a, b] of keeps) { if (a - cur > 0.001) cuts.push([cur, a]); cur = b; }
+  if (dur - cur > 0.001) cuts.push([cur, dur]);
+  return cuts;
+}
+const requestJoins = debounce(async () => {
+  const P = S.proj; if (!P) return;
+  const sig = editSignature();
+  S.planPending = sig;
+  try {
+    const plan = await api("/joins", {
+      cut_ids: [...S.cut],
+      audio_gaps: S.audioGaps.map((gap) => ({id:gap.id, start:gap.start, end:gap.end, cut:!!gap.cut, manual:!!gap.manual})),
+    });
+    if (S.proj !== P || S.planPending !== sig) return;
+    S.planPending = null;
+    if (!plan.available) { S.planned = null; renderStripInfo(); return; }
+    S.planned = {sig, keeps: plan.keeps, joins: plan.joins || []};
+    S.flagIndex = -1;
+    if (editSignature() === sig) recompute();
+  } catch (error) {
+    if (S.planPending === sig) S.planPending = null;
+    $("stripInfo").textContent = "Joins could not be placed: " + error.message;
+  }
+}, 250);
+function flaggedJoins() {
+  return (S.planned?.joins || []).filter((join) => join.on_sound);
+}
+function renderStripInfo() {
+  const info = $("stripInfo"), button = $("nextFlag");
+  if (!S.planned) { info.textContent = S.proj?.probe?.acodec ? "Placing joins…" : ""; button.hidden = true; return; }
+  const joins = S.planned.joins.length, flagged = flaggedJoins().length;
+  info.textContent = !joins ? "No cuts yet"
+    : flagged ? `${joins} joins · ${flagged} between words said in one breath`
+    : `${joins} joins · all in silence`;
+  button.hidden = !flagged;
+}
+async function loadStripPeaks() {
+  const P = S.proj; if (!P || !P.probe?.acodec) return;
+  try {
+    const data = await api(`/overview?points=1200`);
+    if (S.proj === P) { S.stripPeaks = data.peaks || []; drawStrip(); }
+  } catch { /* the strip still shows cuts without a waveform */ }
+}
+function drawStrip() {
+  const P = S.proj, canvas = $("stripCanvas");
+  $("editStrip").hidden = !P;
+  if (!P) return;
+  const width = Math.max(200, Math.round(canvas.clientWidth * devicePixelRatio || 600));
+  if (canvas.width !== width) canvas.width = width;
+  const ctx = canvas.getContext("2d"), w = canvas.width, h = canvas.height, dur = P.duration_s || 1;
+  const x = (t) => t / dur * w;
+  ctx.clearRect(0, 0, w, h);
+  // Kept audio is drawn light and cut audio dim red, so even a heavily cut
+  // take still reads as a waveform rather than a red bar.
+  const peaks = S.stripPeaks;
+  if (peaks?.length) {
+    const step = w / peaks.length;
+    for (let i = 0; i < peaks.length; i++) {
+      const v = Math.max(1, peaks[i] * (h * .44));
+      ctx.fillStyle = insideCut((i + .5) / peaks.length * dur) ? "#6e3436" : "#a9b8c9";
+      ctx.fillRect(i * step, h / 2 - v, Math.max(1, step - .3), v * 2);
+    }
+  } else {
+    ctx.fillStyle = "rgba(229,72,77,.38)";
+    for (const [a, b] of S.cutIvs) ctx.fillRect(x(a), 0, Math.max(1, x(b) - x(a)), h);
+  }
+  ctx.fillStyle = "#FFB224";
+  for (const join of flaggedJoins()) ctx.fillRect(x(join.time) - 2 * devicePixelRatio, 0, 4 * devicePixelRatio, h);
+  const playhead = x(player.currentTime || 0);
+  ctx.fillStyle = "#EDEDEF";
+  ctx.fillRect(playhead - devicePixelRatio / 2, 0, devicePixelRatio, h);
+  renderStripInfo();
+}
+$("stripCanvas").addEventListener("pointerdown", (event) => {
+  const P = S.proj; if (!P) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  const t = Math.max(0, Math.min(P.duration_s, (event.clientX - rect.left) / rect.width * P.duration_s));
+  // A click near an amber mark plays into that join, which is what it is for.
+  const near = flaggedJoins().find((join) => Math.abs(join.time - t) / P.duration_s * rect.width < 6);
+  player.currentTime = near ? Math.max(0, near.time - 1.5) : t;
+  if (near) player.play().catch(() => {});
+  drawStrip();
+});
+$("nextFlag").addEventListener("click", () => {
+  const flagged = flaggedJoins(); if (!flagged.length) return;
+  const now = player.currentTime || 0;
+  let next = flagged.findIndex((join) => join.time - 1.5 > now + .05);
+  if (next < 0) next = 0;
+  S.flagIndex = next;
+  player.currentTime = Math.max(0, flagged[next].time - 1.5);
+  player.play().catch(() => {});
+  toast(`Join ${next + 1} of ${flagged.length} at ${fmtTime(flagged[next].time)} — the words either side run together, so it was cut at the quietest instant and faded.`);
+});
+addEventListener("resize", debounce(drawStrip, 120));
+
 /* ================================================================ transcript */
 function renderTranscript() {
   const P = S.proj, T = $("transcript");
-  S.segTokens = new Map(); S.gapIds = [];
+  S.segTokens = new Map(); S.gapIds = []; S.soundIds = [];
   const seg2cl = new Map(), clOrd = new Map();   // seg id -> [cluster idx, pos, size]
   P.clusters.forEach((c, ci) =>
     c.members.forEach((sid, k) => { seg2cl.set(sid, ci); clOrd.set(sid, [k + 1, c.members.length]); }));
@@ -718,6 +886,14 @@ function renderTranscript() {
       S.gapIds.push(t.id);
       const secs = (t.end - t.start).toFixed(1);
       html.push(`<span class="g" data-id="${t.id}" title="silence ${fmtTime(t.start)} – ${fmtTime(t.end)}">⋯ ${secs}s ⋯</span> `);
+      continue;
+    }
+    if (t.kind === "sound") {
+      // Listed with the gaps so striking a sentence takes its inner sounds too.
+      S.gapIds.push(t.id); S.soundIds.push(t.id);
+      const secs = (t.end - t.start).toFixed(2);
+      const maybe = t.maybe_speech ? ` May be speech: Whisper heard “${escHtml(t.maybe_speech)}” but it did not line up with the wave — listen.` : "";
+      html.push(`<span class="snd${t.maybe_speech ? " maybe" : ""}" tabindex="0" role="button" data-id="${t.id}" title="Sound with no words, ${fmtTime(t.start)} – ${fmtTime(t.end)}.${maybe} Click to cut, Alt-click to hear it.">♪ ${secs}s${t.maybe_speech ? " ?" : ""}</span> `);
       continue;
     }
     if (t.seg !== lastSeg) {
@@ -831,6 +1007,16 @@ function recompute() {
   for (const gap of S.audioGaps) if (gap.cut && gap.end > gap.start) ivs.push([gap.start, gap.end]);
   S.cutIvs = mergeIntervals(ivs);
   S.keeps = keepList(S.cutIvs, P.duration_s);
+  // Once the server has placed this exact edit on the waveform, preview plays
+  // its joins -- the same ones the export will use.
+  const sig = editSignature();
+  if (S.planned && S.planned.sig === sig) {
+    S.keeps = S.planned.keeps.map((keep) => [...keep]);
+    S.cutIvs = cutsFromKeeps(S.keeps, P.duration_s);
+  } else if (S.planPending !== sig) {
+    requestJoins();
+  }
+  drawStrip();
   const edited = S.keeps.reduce((a,[x,y]) => a + (y - x), 0);
   $("durOrig").textContent = fmtDur(P.duration_s);
   $("durEdit").textContent = fmtDur(edited);
@@ -840,7 +1026,22 @@ function recompute() {
   $("gapStat").textContent = S.audioGaps.length || P.tokens.filter((t) => t.kind === "gap").length;
   $("repeatStat").textContent = P.word_repeats.length;
   updateGapControls();
+  updateSoundControl();
 }
+/* One button for every wordless sound: it cuts the ones still in, and once
+   they are all out it offers to put them back. It goes through toggleTokens,
+   so it is one undo step and saves like any other cut. */
+function updateSoundControl() {
+  const ids = S.soundIds, kept = ids.filter((id) => !S.cut.has(id)).length;
+  $("soundCut").hidden = !ids.length;
+  $("soundCut").textContent = kept
+    ? `Cut ${kept} sound${kept === 1 ? "" : "s"}`
+    : `Restore ${ids.length} sound${ids.length === 1 ? "" : "s"}`;
+}
+$("soundCut").addEventListener("click", () => {
+  if (!S.soundIds.length) return;
+  toggleTokens(S.soundIds, S.soundIds.some((id) => !S.cut.has(id)));
+});
 const saveCuts = debounce(async () => {
   if (!S.proj) return;
   const revision = S.cutRevision;
@@ -852,6 +1053,7 @@ const saveCuts = debounce(async () => {
     S.proj.transcript_cut_intervals = result.transcript_cut_intervals || [];
     S.proj.cut_intervals = result.cut_intervals || [];
     S.scopedGapIds = new Set(result.scoped_gap_candidate_ids || []);
+    S.removedGapIds = new Set(result.removed_gap_candidate_ids || []);
     S.cutsSynced = true;
     recompute();
   } catch (e) { toast("autosave failed: " + e.message, "error"); }
@@ -931,12 +1133,23 @@ function updateGapControls() {
   $("gapToggle").setAttribute("aria-pressed", String(S.showGaps));
   $("gapToggle").innerHTML = `<i></i> ${S.showGaps ? "Hide" : "Show"} gaps`;
   const analyzed = !!S.proj?.audio_gaps_analyzed;
-  const hasScopedGaps = S.audioGaps.some((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
   $("gapSettingsBtn").disabled = !S.showGaps || S.gapDetecting;
   $("gapApply").disabled = !S.showGaps || !analyzed || !S.audioGaps.length || S.gapDetecting;
-  $("gapScoped").hidden = !S.showGaps;
-  $("gapScoped").disabled = !analyzed || !hasScopedGaps || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
-  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove all gaps";
+  $("gapApply").textContent = S.gapSuggestions.size ? `Apply ${S.gapSuggestions.size} suggestions` : "Remove gaps…";
+  if (!S.showGaps || S.gapSuggestions.size) $("gapBulkPanel").hidden = true;
+  /* Each scope shows how many silences it would actually offer, so an empty
+     one reads as "there are none" rather than as a button that does nothing. */
+  for (const [id, scope] of [["gapScopeAll","all"],["gapScoped","kept"],["gapScopeRemoved","removed"]]) {
+    const count = analyzed ? gapsInScope(scope).length : 0;
+    const blocked = !analyzed || S.gapDetecting || !S.cutsSynced || !!S.gapSuggestions.size;
+    $(id).disabled = blocked || !count;
+    $(id).querySelector("em").textContent = count ? String(count) : "none";
+  }
+  const range = gapRangeLabel();
+  $("gapLongerHint").textContent = range
+    ? `Offers only silences ${range}. Detection is unchanged — the gear sets what counts as silence.`
+    : "Counts every detected silence. The gear sets what counts as silence at all.";
+  renderGapHistogram();
   $("gapCancel").hidden = !S.gapSuggestions.size;
   $("gapPreview").disabled = !S.proj || S.gapDetecting;
   $("gapCount").textContent = S.gapDetecting ? "Detecting…" : !S.showGaps ? "Off" : `${S.audioGaps.length} gap${S.audioGaps.length === 1 ? "" : "s"}`;
@@ -965,6 +1178,7 @@ async function refreshGapResults() {
   S.audioGaps = S.proj.audio_gaps.map((gap) => ({...gap}));
   S.gapSettings = {...S.proj.audio_gap_settings};
   S.scopedGapIds = new Set(project.scoped_gap_candidate_ids || []);
+  S.removedGapIds = new Set(project.removed_gap_candidate_ids || []);
   if (S.cutsSynced)
     S.transcriptCutIvs = (project.transcript_cut_intervals || []).map((iv) => [...iv]);
   S.gapSuggestions.clear();
@@ -974,6 +1188,7 @@ $("gapToggle").addEventListener("click", async () => {
   S.showGaps = !S.showGaps;
   if (!S.showGaps) {
     $("gapSettingsPanel").hidden = true;
+    $("gapBulkPanel").hidden = true;
     closeGapEditor();
     clearGapSuggestions(false);
   }
@@ -983,6 +1198,15 @@ $("gapToggle").addEventListener("click", async () => {
 });
 $("gapSettingsBtn").addEventListener("click", () => {
   $("gapSettingsPanel").hidden = !$("gapSettingsPanel").hidden;
+  /* The two panels occupy the same corner, so only one is ever open. */
+  if (!$("gapSettingsPanel").hidden) $("gapBulkPanel").hidden = true;
+});
+/* Clicking away closes whichever panel is open, the way the rest of the
+   toolbar behaves. */
+document.addEventListener("click", (event) => {
+  if (event.target.closest(".gap-tools")) return;
+  $("gapBulkPanel").hidden = true;
+  $("gapSettingsPanel").hidden = true;
 });
 $("gapSettingsClose").addEventListener("click", () => {
   $("gapSettingsPanel").hidden = true;
@@ -1033,23 +1257,127 @@ $("gapApply").addEventListener("click", () => {
     toast(`Applied ${count} export gap cuts · Ctrl+Z to undo`);
     return;
   }
-  const eligible = S.audioGaps.filter((gap) => bulkBounds(gap));
+  /* No pending suggestions: open the panel and let the scope be chosen. */
+  const panel = $("gapBulkPanel");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) { $("gapSettingsPanel").hidden = true; updateGapControls(); }
+});
+
+/* The length filter is deliberately separate from the detection settings in
+   the gear panel. Those decide what counts as a silence at all and re-run the
+   analysis; this one only narrows what has already been found, so it can be
+   changed freely without losing the gaps that were detected, or the manual
+   boundary edits made to them. */
+function gapLongerThan() {
+  const value = Number($("gapLonger").value);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+/* The upper bound is optional and empty by default, so the control still reads
+   as "longer than X" until a ceiling is actually wanted. A blank, zero or
+   nonsensical box means no ceiling rather than a range that matches nothing. */
+function gapShorterThan() {
+  const raw = $("gapShorter").value.trim();
+  if (!raw) return Infinity;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : Infinity;
+}
+function gapRangeLabel() {
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
+  if (minimum && Number.isFinite(maximum)) return `between ${minimum.toFixed(2)}s and ${maximum.toFixed(2)}s`;
+  if (minimum) return `longer than ${minimum.toFixed(2)}s`;
+  if (Number.isFinite(maximum)) return `shorter than ${maximum.toFixed(2)}s`;
+  return "";
+}
+/* A length filter with two boxes is only intuitive if the recording says which
+   numbers are worth typing. The strip is a histogram of every detected silence
+   by length, shortest on the left; the bars inside the range are lit, and
+   clicking one sets the range to that bucket (clicking the lit bucket again
+   clears it). It reads the same gaps the scope buttons count, so it never
+   triggers detection. */
+const GAP_HISTO_BUCKETS = 14;
+function gapHistogramBuckets() {
+  const lengths = S.audioGaps
+    .filter((gap) => bulkBounds(gap))
+    .map((gap) => gap.detected_end - gap.detected_start)
+    .sort((a, b) => a - b);
+  if (lengths.length < 2) return [];
+  const lo = lengths[0], hi = lengths[lengths.length - 1];
+  const span = hi - lo;
+  if (span < .01) return [];
+  const width = span / GAP_HISTO_BUCKETS;
+  const buckets = Array.from({length: GAP_HISTO_BUCKETS}, (_unused, index) => ({
+    start: lo + index * width, end: lo + (index + 1) * width, count: 0,
+  }));
+  for (const length of lengths) {
+    const index = Math.min(GAP_HISTO_BUCKETS - 1, Math.floor((length - lo) / width));
+    buckets[index].count += 1;
+  }
+  return buckets;
+}
+function renderGapHistogram() {
+  const strip = $("gapHisto");
+  const buckets = $("gapBulkPanel").hidden ? [] : gapHistogramBuckets();
+  if (!buckets.length) { strip.innerHTML = ""; return; }
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
+  const tallest = Math.max(...buckets.map((bucket) => bucket.count));
+  strip.innerHTML = buckets.map((bucket, index) => {
+    const lit = bucket.end >= minimum - .0005 && bucket.start <= maximum + .0005;
+    const height = Math.round((bucket.count / tallest) * 100);
+    return `<button type="button" class="${lit ? "in" : ""}" data-bucket="${index}" `
+      + `title="${bucket.count} silence${bucket.count === 1 ? "" : "s"} `
+      + `${bucket.start.toFixed(2)}–${bucket.end.toFixed(2)}s"><b style="height:${height}%"></b></button>`;
+  }).join("");
+}
+$("gapHisto").addEventListener("click", (event) => {
+  const bar = event.target.closest("button[data-bucket]"); if (!bar) return;
+  const bucket = gapHistogramBuckets()[Number(bar.dataset.bucket)]; if (!bucket) return;
+  /* Widen a touch at both ends so a gap sitting exactly on a bucket edge is
+     not lost to the two decimal places the boxes show. */
+  const lower = Math.max(0, Math.floor(bucket.start * 100) / 100);
+  const upper = Math.ceil(bucket.end * 100) / 100;
+  const already = gapLongerThan() === lower && gapShorterThan() === upper;
+  $("gapLonger").value = already ? 0 : lower.toFixed(2);
+  $("gapShorter").value = already ? "" : upper.toFixed(2);
+  updateGapControls();
+});
+function gapsInScope(scope) {
+  const minimum = gapLongerThan(), maximum = gapShorterThan();
+  return S.audioGaps.filter((gap) => {
+    if (!bulkBounds(gap)) return false;
+    if (gap.detected_end - gap.detected_start < minimum - .0005) return false;
+    if (gap.detected_end - gap.detected_start > maximum + .0005) return false;
+    if (scope === "kept") return S.scopedGapIds.has(gap.id);
+    if (scope === "removed") return S.removedGapIds.has(gap.id);
+    return true;
+  });
+}
+const GAP_SCOPE_LABEL = {
+  all: "anywhere in the recording",
+  kept: "in sentences that still have kept words",
+  removed: "in sentences you have cut entirely",
+};
+function reviewGapScope(scope) {
+  const eligible = gapsInScope(scope);
   if (!eligible.length) {
-    toast("No gaps are longer than the natural pause you chose"); return;
+    const range = gapRangeLabel();
+    toast(range
+      ? `No silences ${range} ${GAP_SCOPE_LABEL[scope]}`
+      : `No removable silences ${GAP_SCOPE_LABEL[scope]}`, "warn");
+    return;
   }
   S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
+  $("gapBulkPanel").hidden = true;
   renderTranscript(); updateGapControls();
-  toast(`Reviewing ${eligible.length} suggested gap cuts with ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s natural pause`);
-});
-$("gapScoped").addEventListener("click", () => {
-  const eligible = S.audioGaps.filter((gap) => S.scopedGapIds.has(gap.id) && bulkBounds(gap));
-  if (!eligible.length) {
-    toast("No removable gaps belong to sentences with kept words"); return;
-  }
-  S.gapSuggestions = new Map(eligible.map((gap) => [gap.id, bulkBounds(gap)]));
-  renderTranscript(); updateGapControls();
-  toast(`Reviewing ${eligible.length} gaps from sentences that still contain kept words`);
-});
+  const range = gapRangeLabel();
+  toast(`Reviewing ${eligible.length} silence${eligible.length === 1 ? "" : "s"}`
+    + (range ? ` ${range}` : "")
+    + ` ${GAP_SCOPE_LABEL[scope]} · ${Number(S.gapSettings.keep_pause_s).toFixed(2)}s pause kept`);
+}
+$("gapScopeAll").addEventListener("click", () => reviewGapScope("all"));
+$("gapScoped").addEventListener("click", () => reviewGapScope("kept"));
+$("gapScopeRemoved").addEventListener("click", () => reviewGapScope("removed"));
+$("gapLonger").addEventListener("input", updateGapControls);
+$("gapShorter").addEventListener("input", updateGapControls);
 function clearGapSuggestions(render = true) {
   S.gapSuggestions.clear();
   if (render && S.proj) renderTranscript();
@@ -1361,12 +1689,17 @@ function armCutSeekRecovery() {
 }
 function skipTick() {
   if (!S.proj || !S.edited || player.paused || player.seeking || skipState.pending) return;
-  const iv = insideCut(player.currentTime);
+  // Audio has no frames to wake this up, so it is polled every animation frame;
+  // looking one frame ahead jumps before the cut is heard, not after.
+  const ahead = S.proj.probe?.has_video ? 0 : 0.017;
+  const iv = insideCut(player.currentTime) || insideCut(player.currentTime + ahead);
   if (!iv) return;
   if (iv[1] >= S.proj.duration_s - 0.05) {
     player.pause(); player.currentTime = S.proj.duration_s; clearSkipState(); return;
   }
-  const target = Math.min(S.proj.duration_s, iv[1] + 0.04);
+  // Video seeks land on a frame, so they need a margin past the cut; audio
+  // seeks are sample-exact and a margin would only clip the next word.
+  const target = Math.min(S.proj.duration_s, iv[1] + (S.proj.probe?.has_video ? 0.04 : 0.002));
   if (skipState.target !== null && Math.abs(skipState.target - target) < 0.02) return;
   skipState.pending = true; skipState.target = target;
   skipState.wasPlaying = !player.paused; skipState.retries = 0;
@@ -1376,7 +1709,7 @@ function skipTick() {
 function updatePlayerTime() {
   $("playerTime").textContent = `${fmtTime(player.currentTime)} / ${fmtTime(S.proj?.duration_s || player.duration || 0)}`;
 }
-player.addEventListener("timeupdate", () => { skipTick(); highlightWord(); updatePlayerTime(); });
+player.addEventListener("timeupdate", () => { skipTick(); highlightWord(); updatePlayerTime(); if (player.paused) drawStrip(); });
 player.addEventListener("seeked", finishCutSeek);
 player.addEventListener("canplay", () => {
   if (skipState.pending && skipState.target !== null &&
@@ -1400,6 +1733,12 @@ if (player.requestVideoFrameCallback) {
   const onVideoFrame = () => { skipTick(); player.requestVideoFrameCallback(onVideoFrame); };
   player.requestVideoFrameCallback(onVideoFrame);
 }
+// timeupdate fires about four times a second, which let up to a quarter of a
+// second of a cut play before the jump. A frame-rate check closes that.
+(function frameTick() {
+  if (S.proj && !player.paused) { skipTick(); if (!$("editStrip").hidden) drawStrip(); }
+  requestAnimationFrame(frameTick);
+})();
 player.addEventListener("error", () => {
   clearSkipState();
   if (S.smoothPreview.active && !S.smoothPreview.fallingBack) {
@@ -1788,37 +2127,241 @@ async function refreshProjects() {
 function setUploadActions(retry, cancel) {
   $("uploadRetry").classList.toggle("on", retry);
   $("uploadCancel").classList.toggle("on", cancel);
+  /* "Retry" implies starting over. Nothing already on the laptop is ever
+     re-sent, so when there is something to continue from, say so. */
+  $("uploadRetry").textContent = S.uploadFile ? "Retry" : "Resume";
 }
 
-async function reacquireWakeLock() {
-  if (document.visibilityState !== "visible" || !S.uploading || !navigator.wakeLock) return;
-  try { S.wakeLock = await navigator.wakeLock.request("screen"); } catch (_) {}
+/* ------------------------------------------------- keeping a transfer alive
+   A phone that locks its screen suspends the tab, and a suspended tab cannot
+   run fetch -- which is what used to strand a transfer halfway. The obvious
+   fix, navigator.wakeLock, is unavailable here on purpose: it requires a
+   secure context, and a LAN address cannot have one without a certificate the
+   phone must first be talked into trusting. That road is closed.
+
+   A page that is playing audio keeps running while the screen is off; that is
+   how every web audio player works, and it needs no certificate. So for as
+   long as a transfer is in flight, Retake loops one second of inaudible tone.
+   Playback has to begin inside a real tap, so it starts from the same gesture
+   that chooses the file. */
+let keepAliveEl = null, keepAliveUrl = null, keepAliveWatchdog = 0;
+
+function silentLoopUrl() {
+  if (keepAliveUrl) return keepAliveUrl;
+  const rate = 8000, frames = rate, bytes = frames * 2;
+  const buffer = new ArrayBuffer(44 + bytes), view = new DataView(buffer);
+  const ascii = (at, text) => { for (let i = 0; i < text.length; i++) view.setUint8(at + i, text.charCodeAt(i)); };
+  ascii(0, "RIFF"); view.setUint32(4, 36 + bytes, true); ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  ascii(36, "data"); view.setUint32(40, bytes, true);
+  /* One LSB of a 100 Hz tone: below the noise floor of any speaker, but not
+     digital silence, which some phones discard as "nothing is playing". */
+  for (let i = 0; i < frames; i++) {
+    view.setInt16(44 + i * 2, Math.round(Math.sin(2 * Math.PI * 100 * i / rate)), true);
+  }
+  keepAliveUrl = URL.createObjectURL(new Blob([buffer], {type:"audio/wav"}));
+  return keepAliveUrl;
 }
 
-/* A backgrounded phone browser cannot run fetch. Rather than burning retries
-   against a tab that is asleep, wait for it to come back and carry on. */
-function whenVisible() {
-  if (document.visibilityState === "visible") return Promise.resolve();
+/* Called from the tap that starts a transfer, so playback is user-activated. */
+function startKeepAlive() {
+  /* A laptop does not suspend its own tab, and has no reason to open an audio
+     session for a local file copy. This is a phone workaround only. */
+  const phone = matchMedia?.("(pointer: coarse)").matches;
+  try {
+    if (!phone) throw new Error("desktop");
+    if (!keepAliveEl) {
+      keepAliveEl = new Audio(silentLoopUrl());
+      keepAliveEl.loop = true; keepAliveEl.volume = 0.02;
+      keepAliveEl.setAttribute("playsinline", "");
+    }
+    keepAliveEl.play().catch(() => {});
+    /* Armed from the tap that opens the picker, which the person may simply
+       cancel. Nothing must be left playing behind a picker nobody used. */
+    clearTimeout(keepAliveWatchdog);
+    keepAliveWatchdog = setTimeout(() => { if (!S.uploading) stopKeepAlive(); }, 90000);
+  } catch (_) {}
+  if (navigator.wakeLock) {
+    navigator.wakeLock.request("screen").then((lock) => { S.wakeLock = lock; }).catch(() => {});
+  }
+}
+
+function stopKeepAlive() {
+  clearTimeout(keepAliveWatchdog); keepAliveWatchdog = 0;
+  try { keepAliveEl?.pause(); } catch (_) {}
+  if (S.wakeLock) { S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
+}
+
+function keepAliveRunning() {
+  return !!keepAliveEl && !keepAliveEl.paused && !keepAliveEl.ended;
+}
+
+/* Restart both after the screen comes back, in case either was torn down. */
+async function reacquireKeepAlive() {
+  if (document.visibilityState !== "visible" || !S.uploading) return;
+  startKeepAlive();
+}
+
+/* Reached only after a chunk has already failed. If the tab really is frozen,
+   fetch cannot run and waiting beats burning retries -- but while the audio loop
+   is playing the tab is not frozen, and a hidden window must never be made to
+   wait for a link that is working. */
+function whenRunnable() {
+  if (document.visibilityState === "visible" || keepAliveRunning()) return Promise.resolve();
   return new Promise((resolve) => {
-    const onVisible = () => {
-      if (document.visibilityState !== "visible") return;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
       document.removeEventListener("visibilitychange", onVisible);
+      clearTimeout(timer);
       resolve();
     };
+    const onVisible = () => { if (document.visibilityState === "visible") finish(); };
     document.addEventListener("visibilitychange", onVisible);
+    const timer = setTimeout(finish, 60000);
   });
 }
 
-const UPLOAD_MIN_CHUNK = 256 * 1024;
-const UPLOAD_MAX_CHUNK = 8 * 1024 * 1024;   /* matches UPLOAD_CHUNK_MAX_BYTES */
-const UPLOAD_STALL_LIMIT_MS = 5 * 60 * 1000;
+/* One request carries the whole file. That is the entire transport.
 
-/* Big chunks are far faster over Wi-Fi, small ones recover faster from a drop.
-   Aim for a few seconds per chunk and let the link decide the size. */
-function nextChunkSize(current, seconds) {
-  if (seconds < 1.5) return Math.min(UPLOAD_MAX_CHUNK, current * 2);
-  if (seconds > 6) return Math.max(UPLOAD_MIN_CHUNK, Math.floor(current / 2));
-  return current;
+   Every earlier version read the file in slices and sent one request each. On
+   an iPhone that is the one shape that cannot work: WebKit invalidates the
+   handle behind a file picked out of the photo library about a minute after it
+   is opened (bugs.webkit.org 228683), so the first slices arrive, the rest come
+   back empty or never come back at all, and a large video stops dead with no
+   error to report. Four of those at once stops it four times faster.
+
+   Handing the whole File to one request moves the reading into the browser,
+   which streams it off the phone over a single handle it opened itself. It is
+   also what tus, the resumable-upload standard, does by default -- chunking is
+   its opt-in, not its normal mode -- and it is less code by a wide margin.
+
+   Resuming survives because the laptop writes wherever it is told: if the
+   request dies, ask how much landed and send the rest as one more request. */
+const UPLOAD_SILENCE_LIMIT_MS = 60 * 1000;
+const UPLOAD_RETRIES = 4;
+
+/* Sends bytes to the laptop and refuses to wait forever for them.
+
+   XMLHttpRequest rather than fetch, for one reason: it reports how much of the
+   body has actually gone. fetch resolves when the reply arrives and says
+   nothing before then, so a request whose bytes have stopped moving is
+   indistinguishable from one still in flight -- which is how a transfer used to
+   hang with no error and a bar on zero. Upload progress separates them, and it
+   is also what the progress line shows. */
+function sendBody(session, offset, body, signal, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let lastMoved = Date.now(), settled = false;
+    const cleanup = () => {
+      clearInterval(watchdog);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const stop = (error) => {
+      if (settled) return;
+      settled = true; cleanup();
+      try { xhr.abort(); } catch (_) {}
+      reject(error);
+    };
+    function onAbort() {
+      const cancelled = new Error("cancelled");
+      cancelled.name = "AbortError";
+      stop(cancelled);
+    }
+    /* A minute of silence, because the first stretch of it is the phone
+       exporting the video out of its photo library before a byte can move. */
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastMoved > UPLOAD_SILENCE_LIMIT_MS) {
+        stop(new Error("the phone stopped sending, nothing moved for a minute"));
+      }
+    }, 2000);
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener("abort", onAbort);
+    xhr.open("POST", `/upload/chunk/${session}`);
+    xhr.setRequestHeader("X-Upload-Offset", String(offset));
+    xhr.upload.onprogress = (event) => { lastMoved = Date.now(); onProgress(event.loaded); };
+    xhr.onload = () => {
+      if (settled) return;
+      settled = true; cleanup();
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (_) {}
+      resolve({status:xhr.status, data});
+    };
+    xhr.onerror = () => stop(new Error("the connection to the laptop dropped"));
+    xhr.ontimeout = () => stop(new Error("the laptop stopped answering"));
+    xhr.send(body);
+  });
+}
+
+/* Sends one file, from wherever the laptop already got to. */
+async function runTransfer(file, descriptor) {
+  let start = await api("/upload/start", descriptor);
+  S.uploadSession = start.session;
+  localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
+  S.uploadAbort = new AbortController();
+
+  const base = Math.min(file.size, Number(start.offset) || 0);
+  let offset = base;
+  const startedAt = performance.now();
+
+  const report = (sent, note) => {
+    const shown = Math.min(file.size, offset + sent);
+    const pct = file.size ? shown / file.size * 100 : 0;
+    const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
+    $("progressFill").style.width = `${pct}%`;
+    $("progressMsg").textContent = note || (
+      `Uploading ${fmtBytes(shown)} of ${fmtBytes(file.size)} · ${fmtBytes(Math.max(0, shown - base) / seconds)}/s`
+    );
+  };
+  /* Says what is happening during the one stretch where nothing can: the phone
+     exporting a photo-library video before the first byte exists. */
+  report(0, "Preparing the video on your phone…");
+
+  for (let attempt = 0; offset < file.size; ) {
+    try {
+      const from = offset;
+      const {status, data} = await sendBody(
+        S.uploadSession, from, file.slice(from), S.uploadAbort.signal,
+        (loaded) => report(loaded),
+      );
+      if (status === 404) {
+        /* The laptop forgot this transfer; start it again from whatever it
+           still has, rather than pushing bytes into nothing. */
+        const gone = new Error("upload session expired");
+        gone.needsRestart = true;
+        throw gone;
+      }
+      if (status < 200 || status >= 300) throw new Error(data.error || `HTTP ${status}`);
+      offset = Math.min(file.size, Math.max(offset, Number(data.end) || file.size));
+      attempt = 0;
+      report(0);
+    } catch (error) {
+      if (error.name === "AbortError" || error.needsRestart) throw error;
+      if (++attempt > UPLOAD_RETRIES) throw error;
+      report(0, `${error.message} · retrying…`);
+      await new Promise((resolve) => setTimeout(resolve, 500 * (2 ** attempt)));
+      /* Only now is it worth asking whether the tab is running at all. Asking
+         before every request stalled a hidden window for nothing. */
+      await whenRunnable();
+      /* Ask the laptop what it actually has rather than trusting the count
+         here: a request can die after the bytes landed. */
+      start = await api("/upload/start", descriptor);
+      S.uploadSession = start.session;
+      const landed = Math.min(file.size, Number(start.offset) || 0);
+      if (landed <= offset && attempt >= 2) {
+        /* Two goes, nothing moved. On iOS this is the picked file going stale,
+           and only the person can fix it, by picking it again. */
+        const stale = new Error("the phone released this file");
+        stale.needsReselect = true;
+        throw stale;
+      }
+      offset = Math.max(offset, landed);
+    }
+  }
+  return await api("/upload/finish", {session:S.uploadSession});
 }
 
 async function uploadSelectedFile(file) {
@@ -1827,98 +2370,75 @@ async function uploadSelectedFile(file) {
   S.uploadFile = file;
   $("selectedFile").textContent = `${file.name} · ${fmtBytes(file.size)}`;
   $("progressPanel").classList.add("on"); setUploadActions(false, true);
-  const startedAt = performance.now();
   const descriptor = {
     name:file.name, size:file.size, fingerprint:`${file.lastModified}:${file.type}`,
     lastModified:file.lastModified, type:file.type,
   };
   try {
-    let wakeLockOk = false;
-    if (navigator.wakeLock) {
-      try { S.wakeLock = await navigator.wakeLock.request("screen"); wakeLockOk = true; } catch (_) {}
-    }
-    if (!wakeLockOk && location.protocol !== "https:") {
-      toast("This page can't keep the screen awake over plain HTTP. Open Retake's https:// address instead (the command window prints it) and the transfer will survive a screen lock. It resumes by itself either way.", "warn", 14000);
-    }
-    document.addEventListener("visibilitychange", reacquireWakeLock);
-    const start = await api("/upload/start", descriptor);
-    S.uploadSession = start.session; let offset = Number(start.offset) || 0;
-    localStorage.setItem("retakePendingTransfer", JSON.stringify({...descriptor, session:start.session}));
-    S.uploadAbort = new AbortController();
-    let chunkSize = 1024 * 1024;
-    while (offset < file.size) {
-      let sent = false, attempt = 0, stalledSince = 0;
-      while (!sent) {
-        /* Locking the phone suspends this tab; resume where we left off. */
-        await whenVisible();
-        try {
-          const startedChunk = performance.now();
-          const end = Math.min(file.size, offset + chunkSize), chunk = file.slice(offset, end);
-          const response = await fetch(`/upload/chunk/${S.uploadSession}`, {
-            method:"POST", headers:{"X-Upload-Offset":String(offset)}, body:chunk,
-            signal:S.uploadAbort.signal,
-          });
-          const data = await response.json();
-          if (response.status === 409 && Number.isFinite(Number(data.offset))) {
-            offset = Number(data.offset); sent = true; break;
-          }
-          if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-          chunkSize = nextChunkSize(chunkSize, (performance.now() - startedChunk) / 1000);
-          offset = Number(data.offset); sent = true; stalledSince = 0;
-        } catch (error) {
-          if (error.name === "AbortError") throw error;
-          if (!stalledSince) stalledSince = Date.now();
-          if (Date.now() - stalledSince > UPLOAD_STALL_LIMIT_MS) {
-            throw new Error(`the connection has been down for five minutes: ${error.message}`);
-          }
-          /* A drop often means the chunk was too ambitious for this link. */
-          chunkSize = Math.max(UPLOAD_MIN_CHUNK, Math.floor(chunkSize / 2));
-          const waited = Math.round((Date.now() - stalledSince) / 1000);
-          $("progressMsg").textContent = `Connection interrupted · resuming automatically (${waited}s)…`;
-          const delay = Math.min(8000, 500 * (2 ** Math.min(attempt++, 5)));
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          await whenVisible();
-          try {
-            const resumed = await api("/upload/start", descriptor);
-            S.uploadSession = resumed.session;
-            offset = Number(resumed.offset) || 0;
-          } catch (_) { /* server still unreachable; the loop keeps waiting */ }
-        }
+    startKeepAlive();
+    document.addEventListener("visibilitychange", reacquireKeepAlive);
+    let complete = null;
+    for (let restart = 0; complete === null; restart++) {
+      try {
+        complete = await runTransfer(file, descriptor);
+      } catch (error) {
+        if (!error.needsRestart || restart >= 2) throw error;
+        $("progressMsg").textContent = "Reconnecting to Retake…";
       }
-      const pct = file.size ? offset / file.size * 100 : 0;
-      const seconds = Math.max(.1, (performance.now() - startedAt) / 1000);
-      $("progressFill").style.width = `${pct}%`;
-      $("progressMsg").textContent = `Uploading ${fmtBytes(offset)} of ${fmtBytes(file.size)} · ${fmtBytes(offset / seconds)}/s`;
     }
-    const complete = await api("/upload/finish", {session:start.session});
     S.uploadSession = null; S.uploadAbort = null;
     localStorage.removeItem("retakePendingTransfer");
+    S.uploadResume = null;
+    $("progressFill").style.width = "100%";
     $("progressMsg").textContent = "Upload complete · opening media";
     setUploadActions(false, false);
     await openPath(complete.path, $("languageSelect").value, complete.source_filename);
   } catch (error) {
     if (error.name === "AbortError") return;
-    $("progressMsg").textContent = `Upload paused: ${error.message}`;
-    setUploadActions(true, false);
-    toast(error.message, "error", 10000);
+    if (error.needsReselect) {
+      /* Safari cannot re-open a file by itself, so this is the one moment a
+         transfer genuinely needs a tap. Everything already sent is kept. */
+      S.uploadFile = null;
+      S.uploadResume = descriptor;
+      $("progressMsg").textContent =
+        `Paused — nothing was lost. `
+        + "Tap Resume and pick the same file to carry on from there.";
+      setUploadActions(true, false);
+    } else {
+      $("progressMsg").textContent = `Upload paused: ${error.message}`;
+      setUploadActions(true, false);
+      toast(error.message, "error", 10000);
+    }
   } finally {
     S.uploading = false;
-    document.removeEventListener("visibilitychange", reacquireWakeLock);
-    if (S.wakeLock) { await S.wakeLock.release().catch(() => {}); S.wakeLock = null; }
+    document.removeEventListener("visibilitychange", reacquireKeepAlive);
+    stopKeepAlive();
   }
 }
 
-$("chooseFile").addEventListener("click", () => $("mediaFile").click());
+/* Playback must begin inside the tap itself, so arm the keep-alive here as
+   well as in uploadSelectedFile; by the time the picker returns, the gesture
+   has expired. */
+$("chooseFile").addEventListener("click", () => { startKeepAlive(); $("mediaFile").click(); });
+$("mediaFile").addEventListener("cancel", () => { if (!S.uploading) stopKeepAlive(); });
 $("mediaFile").addEventListener("change", (event) => {
   const file = event.target.files?.[0]; event.target.value = "";
-  if (file) uploadSelectedFile(file);
+  if (!file) { if (!S.uploading) stopKeepAlive(); return; }
+  uploadSelectedFile(file);
 });
-$("uploadRetry").addEventListener("click", () => { if (S.uploadFile) uploadSelectedFile(S.uploadFile); });
+$("uploadRetry").addEventListener("click", () => {
+  if (S.uploadFile) { uploadSelectedFile(S.uploadFile); return; }
+  /* Resuming a transfer the phone forgot: the same file produces the same
+     server session, so picking it again continues from the byte that arrived. */
+  startKeepAlive();
+  $("mediaFile").click();
+});
 $("uploadCancel").addEventListener("click", async () => {
   S.uploadAbort?.abort();
   if (S.uploadSession) await api("/upload/cancel", {session:S.uploadSession}).catch(() => {});
-  S.uploadSession = null; S.uploadAbort = null; S.uploadFile = null;
+  S.uploadSession = null; S.uploadAbort = null; S.uploadFile = null; S.uploadResume = null;
   localStorage.removeItem("retakePendingTransfer");
+  stopKeepAlive();
   $("progressPanel").classList.remove("on"); $("selectedFile").textContent = "No file selected";
   setUploadActions(false, false);
 });
@@ -1946,7 +2466,10 @@ async function loadProject() {
   S.cut = new Set(P.tokens.filter((t) => t.cut).map((t) => t.id));
   S.transcriptCutIvs = (P.transcript_cut_intervals || []).map((iv) => [...iv]);
   S.scopedGapIds = new Set(P.scoped_gap_candidate_ids || []);
+  S.removedGapIds = new Set(P.removed_gap_candidate_ids || []);
   S.cutsSynced = true; S.cutRevision = 0;
+  S.planned = null; S.planPending = null; S.stripPeaks = null; S.flagIndex = -1;
+  loadStripPeaks();
   S.showGaps = false;
   S.audioGaps = (P.audio_gaps || []).map((gap) => ({...gap}));
   S.gapSuggestions.clear();
@@ -2109,19 +2632,21 @@ $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help
         S.uploadSession = state.session;
       } catch (_) { S.uploadSession = pending.session || null; }
       $("progressPanel").classList.add("on");
+      S.uploadFile = null; S.uploadResume = pending;
       if (received === null) {
         $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
-        $("progressMsg").textContent = "Transfer interrupted. Retake could not be reached to check what arrived — choose the same file again to continue.";
+        $("progressMsg").textContent = "Transfer paused — Retake could not be reached to check what arrived. Tap Resume once it is running again.";
       } else if (received >= Number(pending.size)) {
         localStorage.removeItem("retakePendingTransfer");
+        S.uploadResume = null;
         $("progressPanel").classList.remove("on");
       } else {
         const pct = Number(pending.size) ? received / Number(pending.size) * 100 : 0;
         $("progressFill").style.width = `${pct}%`;
-        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)} · choose the same file to resume`;
-        $("progressMsg").textContent = `Transfer interrupted · ${fmtBytes(received)} of ${fmtBytes(pending.size)} is already on the laptop. Nothing was lost — choose the same file again and it continues from there.`;
+        $("selectedFile").textContent = `${pending.name} · ${fmtBytes(pending.size)}`;
+        $("progressMsg").textContent = `Paused at ${fmtBytes(received)} of ${fmtBytes(pending.size)} — nothing was lost. Tap Resume and pick the same file to carry on from there.`;
       }
-      setUploadActions(false, true);
+      setUploadActions(!!S.uploadResume, !!S.uploadResume);
     }
     const st = await api("/status");
     S.errSeq = st.err_seq;
